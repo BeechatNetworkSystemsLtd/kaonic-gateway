@@ -1,0 +1,26 @@
+[package]
+name = "kaonic-gateway"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kaonic-vpn      = { path = "../kaonic-vpn", features = ["run"] }
+kaonic-settings = { path = "../kaonic-settings" }
+kaonic-ctrl     = { git = "https://github.com/BeechatNetworkSystemsLtd/kaonic-radio" }
+rns-vpn = { git = "https://github.com/BeechatNetworkSystemsLtd/rns-vpn-rs" }
+reticulum = { git = "https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs", version = "0.1.*" }
+
+axum    = "0.7"
+clap    = { version = "4", features = ["derive"] }
+ed25519-dalek = { version = "2", features = ["pem", "pkcs8"] }
+rand = "0.8"
+env_logger = "0.11"
+log = "0.4"
+nix = "0.23"
+pem = "3"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+toml = "0.8"
+x25519-dalek = "2"
+

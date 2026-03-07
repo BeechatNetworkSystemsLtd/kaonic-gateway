@@ -1,0 +1,21 @@
+# kaonic-gateway configuration
+
+# VPN subnet (CIDR). Each peer's VPN IP is derived from their Reticulum destination hash.
+network = "10.20.0.0/16"
+
+# Reticulum destination hashes of VPN peers to connect to.
+peers = [
+  # "fb08aff16ec6f5ccf0d3eb179028e9c3",
+]
+
+# How often to re-announce our VPN destination on the network (seconds).
+announce_freq_secs = 1
+
+# kaonic-ctrl connection settings (used when running without --udp-port)
+[kaonic_ctrl_config]
+# Local UDP socket address for the kaonic-ctrl client.
+listen_addr = "0.0.0.0:3001"
+# Address of the kaonic-ctrl server daemon (kaonic-commd or equivalent).
+server_addr = "192.168.10.1:3000"
+# Radio module index to use for Reticulum traffic.
+module = 0
