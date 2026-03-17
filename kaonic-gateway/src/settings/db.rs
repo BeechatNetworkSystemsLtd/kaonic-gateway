@@ -1,20 +1,20 @@
 use std::net::SocketAddr;
 use std::str::FromStr;
 
+use rand::RngCore;
 use rusqlite::{Connection, Result, params};
+use serde_json;
 
 use kaonic_vpn::{GatewayConfig, KaonicCtrlConfig};
 
 const DEFAULT_NETWORK: &str = "10.20.0.0/16";
 const DEFAULT_ANNOUNCE_FREQ_SECS: u32 = 1;
 
-/// SQLite-backed persistent settings store.
 pub struct Database {
     conn: Connection,
 }
 
 impl Database {
-    /// Open (or create) the database at `path` and run schema migrations.
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
         let db = Self { conn };
@@ -35,15 +35,9 @@ impl Database {
     }
 
     fn get(&self, key: &str) -> Result<Option<String>> {
-        let mut stmt = self
-            .conn
-            .prepare_cached("SELECT value FROM settings WHERE key = ?1")?;
+        let mut stmt = self.conn.prepare_cached("SELECT value FROM settings WHERE key = ?1")?;
         let mut rows = stmt.query(params![key])?;
-        if let Some(row) = rows.next()? {
-            Ok(Some(row.get(0)?))
-        } else {
-            Ok(None)
-        }
+        Ok(if let Some(row) = rows.next()? { Some(row.get(0)?) } else { None })
     }
 
     fn set(&self, key: &str, value: &str) -> Result<()> {
@@ -54,69 +48,76 @@ impl Database {
         Ok(())
     }
 
-    /// Load the full gateway config from the database.
-    /// Missing settings fall back to sensible defaults.
+    pub fn load_or_create_seed(&self) -> Result<String> {
+        self.load_or_create_named_seed("identity_seed")
+    }
+
+    pub fn load_or_create_named_seed(&self, key: &str) -> Result<String> {
+        if let Some(seed) = self.get(key)? {
+            return Ok(seed);
+        }
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        let seed = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        self.set(key, &seed)?;
+        log::info!("generated new seed for '{key}'");
+        Ok(seed)
+    }
+
     pub fn load_config(&self) -> Result<GatewayConfig> {
-        let network_str = self
-            .get("network")?
-            .unwrap_or_else(|| DEFAULT_NETWORK.to_string());
+        let network_str = self.get("network")?.unwrap_or_else(|| DEFAULT_NETWORK.to_string());
         let network = cidr::Ipv4Cidr::from_str(&network_str).map_err(|e| {
-            rusqlite::Error::InvalidParameterName(format!(
-                "invalid network '{network_str}': {e}"
-            ))
+            rusqlite::Error::InvalidParameterName(format!("invalid network '{network_str}': {e}"))
         })?;
 
-        let announce_freq_secs = self
-            .get("announce_freq_secs")?
+        let announce_freq_secs = self.get("announce_freq_secs")?
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(DEFAULT_ANNOUNCE_FREQ_SECS);
 
         let peers = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT destination_hash FROM peers ORDER BY destination_hash")?;
+            let mut stmt = self.conn.prepare("SELECT destination_hash FROM peers ORDER BY destination_hash")?;
             let rows = stmt.query_map([], |row| row.get(0))?;
             rows.collect::<Result<Vec<String>>>()?
         };
 
-        let kaonic_ctrl_config = {
-            let listen = self.get("kaonic_ctrl_listen_addr")?;
-            let server = self.get("kaonic_ctrl_server_addr")?;
-            let module = self.get("kaonic_ctrl_module")?;
-            match (listen, server) {
-                (Some(l), Some(s)) => {
-                    let listen_addr = SocketAddr::from_str(&l).map_err(|e| {
-                        rusqlite::Error::InvalidParameterName(format!(
-                            "invalid kaonic_ctrl_listen_addr '{l}': {e}"
-                        ))
-                    })?;
-                    let server_addr = SocketAddr::from_str(&s).map_err(|e| {
-                        rusqlite::Error::InvalidParameterName(format!(
-                            "invalid kaonic_ctrl_server_addr '{s}': {e}"
-                        ))
-                    })?;
-                    let module_idx = module
-                        .and_then(|m| m.parse::<usize>().ok())
-                        .unwrap_or(0);
-                    Some(KaonicCtrlConfig {
-                        listen_addr,
-                        server_addr,
-                        module: module_idx,
-                    })
-                }
-                _ => None,
+        let mut kaonic_ctrl_configs = Vec::new();
+        for module_idx in 0usize..2 {
+            let suffix = format!("_{module_idx}");
+            // Try suffixed keys first, then fall back to legacy unsuffixed keys for module 0
+            let listen = self.get(&format!("kaonic_ctrl_listen_addr{suffix}"))?.or_else(|| {
+                if module_idx == 0 { self.get("kaonic_ctrl_listen_addr").ok()? } else { None }
+            });
+            let server = self.get(&format!("kaonic_ctrl_server_addr{suffix}"))?.or_else(|| {
+                if module_idx == 0 { self.get("kaonic_ctrl_server_addr").ok()? } else { None }
+            });
+            if let (Some(l), Some(s)) = (listen, server) {
+                let listen_addr = SocketAddr::from_str(&l).map_err(|e| {
+                    rusqlite::Error::InvalidParameterName(format!("invalid listen_addr '{l}': {e}"))
+                })?;
+                let server_addr = SocketAddr::from_str(&s).map_err(|e| {
+                    rusqlite::Error::InvalidParameterName(format!("invalid server_addr '{s}': {e}"))
+                })?;
+                let radio_config_key = format!("kaonic_ctrl_radio_config{suffix}");
+                let modulation_key   = format!("kaonic_ctrl_modulation{suffix}");
+                let radio_config = self.get(&radio_config_key)?
+                    .or_else(|| if module_idx == 0 { self.get("kaonic_ctrl_radio_config").ok()? } else { None })
+                    .and_then(|v| serde_json::from_str(&v).ok());
+                let modulation = self.get(&modulation_key)?
+                    .or_else(|| if module_idx == 0 { self.get("kaonic_ctrl_modulation").ok()? } else { None })
+                    .and_then(|v| serde_json::from_str(&v).ok());
+                kaonic_ctrl_configs.push(KaonicCtrlConfig {
+                    listen_addr,
+                    server_addr,
+                    module: module_idx,
+                    radio_config,
+                    modulation,
+                });
             }
-        };
+        }
 
-        Ok(GatewayConfig {
-            network,
-            peers,
-            announce_freq_secs,
-            kaonic_ctrl_config,
-        })
+        Ok(GatewayConfig { network, peers, announce_freq_secs, kaonic_ctrl_configs })
     }
 
-    /// Persist the full gateway config to the database.
     pub fn save_config(&self, config: &GatewayConfig) -> Result<()> {
         self.set("network", &config.network.to_string())?;
         self.set("announce_freq_secs", &config.announce_freq_secs.to_string())?;
@@ -129,12 +130,24 @@ impl Database {
             )?;
         }
 
-        if let Some(ctrl) = &config.kaonic_ctrl_config {
-            self.set("kaonic_ctrl_listen_addr", &ctrl.listen_addr.to_string())?;
-            self.set("kaonic_ctrl_server_addr", &ctrl.server_addr.to_string())?;
-            self.set("kaonic_ctrl_module", &ctrl.module.to_string())?;
+        for ctrl in &config.kaonic_ctrl_configs {
+            self.save_module_config(ctrl)?;
         }
 
+        Ok(())
+    }
+
+    /// Save a single module's radio config (keyed by `ctrl.module` index).
+    pub fn save_module_config(&self, ctrl: &KaonicCtrlConfig) -> Result<()> {
+        let suffix = format!("_{}", ctrl.module);
+        self.set(&format!("kaonic_ctrl_listen_addr{suffix}"), &ctrl.listen_addr.to_string())?;
+        self.set(&format!("kaonic_ctrl_server_addr{suffix}"), &ctrl.server_addr.to_string())?;
+        if let Some(rc) = &ctrl.radio_config {
+            self.set(&format!("kaonic_ctrl_radio_config{suffix}"), &serde_json::to_string(rc).unwrap())?;
+        }
+        if let Some(m) = &ctrl.modulation {
+            self.set(&format!("kaonic_ctrl_modulation{suffix}"), &serde_json::to_string(m).unwrap())?;
+        }
         Ok(())
     }
 }

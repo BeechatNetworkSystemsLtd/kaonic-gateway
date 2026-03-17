@@ -1,0 +1,13 @@
+[package]
+name = "kaonic-reticulum"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kaonic-ctrl  = { git = "https://github.com/BeechatNetworkSystemsLtd/kaonic-radio" }
+kaonic-frame = { git = "https://github.com/BeechatNetworkSystemsLtd/kaonic-radio" }
+reticulum    = { git = "https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs", version = "0.1.*" }
+tokio-util   = "0.7"
+radio-common = { git = "https://github.com/BeechatNetworkSystemsLtd/kaonic-radio" }
+tokio        = { version = "1", features = ["full"] }
+log          = "0.4"

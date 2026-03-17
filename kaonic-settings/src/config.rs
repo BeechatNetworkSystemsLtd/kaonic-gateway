@@ -37,8 +37,8 @@ pub struct KaonicCtrlConfig {
 impl Default for KaonicCtrlConfig {
     fn default() -> Self {
         Self {
-            listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 3001),
-            server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 10, 1)), 3000),
+            listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0), // OS picks port
+            server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 10, 1)), 9090),
             module: 0,
             radio_config: None,
             modulation: None,

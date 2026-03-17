@@ -4,14 +4,24 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 
-[dependencies]
-kaonic-settings = { path = "../kaonic-settings" }
+[lib]
+name = "kaonic_dashboard"
+path = "src/lib.rs"
 
-axum = "0.7"
-cidr = { version = "0.2", features = ["serde"] }
-maud = { version = "0.26", features = ["axum"] }
-serde = { version = "1", features = ["derive"] }
-clap = { version = "4", features = ["derive", "env"] }
-env_logger = "0.11"
-log = "0.4"
+[[bin]]
+name = "kaonic-dashboard"
+path = "src/main.rs"
+
+[dependencies]
+axum  = "0.7"
+maud  = { version = "0.26", features = ["axum"] }
+log   = "0.4"
 tokio = { version = "1", features = ["full"] }
+
+# Only needed for the standalone binary
+clap       = { version = "4", features = ["derive", "env"], optional = true }
+env_logger = { version = "0.11", optional = true }
+
+[features]
+default = ["bin"]
+bin = ["clap", "env_logger"]

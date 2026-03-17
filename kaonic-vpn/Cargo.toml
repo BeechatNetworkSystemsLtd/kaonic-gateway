@@ -5,19 +5,17 @@ edition = "2021"
 rust-version = "1.85"
 
 [features]
-run = ["dep:rns-vpn", "dep:reticulum", "dep:kaonic-ctrl", "dep:kaonic-frame",
-       "dep:kaonic-net", "dep:tokio-util", "dep:cidr-v3"]
+run = ["dep:rns-vpn", "dep:reticulum", "dep:kaonic-reticulum",
+       "dep:tokio-util", "dep:cidr-v3"]
 
 [dependencies]
-rns-vpn      = { git = "https://github.com/BeechatNetworkSystemsLtd/rns-vpn-rs", optional = true }
-reticulum    = { git = "https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs", version = "0.1.*", optional = true }
-kaonic-ctrl  = { git = "https://github.com/BeechatNetworkSystemsLtd/kaonic-radio", optional = true }
-kaonic-frame = { git = "https://github.com/BeechatNetworkSystemsLtd/kaonic-radio", optional = true }
-kaonic-net   = { git = "https://github.com/BeechatNetworkSystemsLtd/kaonic-radio", optional = true }
-cidr-v3      = { package = "cidr", version = "0.3", features = ["serde"], optional = true }
-radio-common = { git = "https://github.com/BeechatNetworkSystemsLtd/kaonic-radio" }
-kaonic-settings = { path = "../kaonic-settings" }
-tokio-util   = { version = "0.7", optional = true }
+rns-vpn          = { git = "https://github.com/BeechatNetworkSystemsLtd/rns-vpn-rs", optional = true }
+reticulum        = { git = "https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs", version = "0.1.*", optional = true }
+kaonic-reticulum = { path = "../kaonic-reticulum", optional = true }
+cidr-v3          = { package = "cidr", version = "0.3", features = ["serde"], optional = true }
+cidr             = { version = "0.2", features = ["serde"] }
+radio-common     = { git = "https://github.com/BeechatNetworkSystemsLtd/kaonic-radio" }
+tokio-util       = { version = "0.7", optional = true }
 
 log   = "0.4"
 serde = { version = "1", features = ["derive"] }

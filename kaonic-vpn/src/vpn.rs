@@ -2,20 +2,19 @@ use std::sync::Arc;
 
 use reticulum::identity::PrivateIdentity;
 use reticulum::transport::{Transport, TransportConfig};
-use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{FrameRecord, GatewayConfig, KaonicCtrlConfig};
-use crate::interface::KaonicCtrlInterface;
+use crate::config::{GatewayConfig, KaonicCtrlConfig};
+use kaonic_reticulum::KaonicCtrlInterface;
 
-/// Set up the Reticulum transport, spawn the kaonic-ctrl interface, and run the VPN client.
-pub async fn run(
-    config: GatewayConfig,
-    id: PrivateIdentity,
+/// Connect to the kaonic-ctrl daemon, attach the Reticulum interface, and
+/// return the ready transport wrapped in an `Arc<Mutex<>>` for sharing.
+pub async fn setup_transport(
+    id: &PrivateIdentity,
     ctrl_config: KaonicCtrlConfig,
-    frame_tx: Option<mpsc::UnboundedSender<FrameRecord>>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let transport = Transport::new(TransportConfig::new("kaonic-gateway", &id, true));
+) -> Result<Arc<Mutex<Transport>>, Box<dyn std::error::Error + Send + Sync>> {
+    let transport = Transport::new(TransportConfig::new("kaonic-gateway", id, true));
 
     log::info!(
         "spawning kaonic-ctrl interface: listen={}, server={}",
@@ -23,17 +22,33 @@ pub async fn run(
         ctrl_config.server_addr
     );
     let cancel = CancellationToken::new();
-    let mut iface = KaonicCtrlInterface::connect(&ctrl_config, cancel).await
-        .map_err(|e| format!("kaonic-ctrl connect error: {e:?}"))?;
-    iface.frame_tx = frame_tx;
+    let iface = KaonicCtrlInterface::connect::<1400, 5>(
+        ctrl_config.listen_addr,
+        ctrl_config.server_addr,
+        ctrl_config.module,
+        cancel,
+    )
+    .await
+    .map_err(|e| format!("kaonic-ctrl connect error: {e:?}"))?;
+
     transport
         .iface_manager()
         .lock()
         .await
         .spawn(iface, KaonicCtrlInterface::spawn);
 
+    Ok(Arc::new(Mutex::new(transport)))
+}
+
+/// Start the VPN client on an already-configured transport.
+pub async fn run_vpn(
+    transport: Arc<Mutex<Transport>>,
+    config: GatewayConfig,
+    id: PrivateIdentity,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let network_str = config.network.to_string();
-    let network = network_str.parse::<cidr_v3::Ipv4Cidr>()
+    let network = network_str
+        .parse::<cidr_v3::Ipv4Cidr>()
         .map_err(|e| format!("invalid network cidr: {e}"))?;
 
     let vpn_config = rns_vpn::Config {
@@ -43,8 +58,8 @@ pub async fn run(
         allow_all: true,
     };
 
-    let transport = Arc::new(tokio::sync::Mutex::new(transport));
-    let client = rns_vpn::Client::run(vpn_config, transport, id).await
+    let client = rns_vpn::Client::run(vpn_config, transport, id)
+        .await
         .map_err(|e| format!("VPN client error: {e:?}"))?;
     client.await_finished().await;
     Ok(())

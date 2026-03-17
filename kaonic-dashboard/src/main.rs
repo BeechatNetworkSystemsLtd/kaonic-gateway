@@ -1,16 +1,12 @@
-//! kaonic-dashboard: web configuration portal for kaonic-gateway
-
-mod frames;
-mod pages;
+//! kaonic-dashboard: standalone web portal for kaonic-gateway.
+//!
+//! When run standalone it serves only the dashboard UI pages.
+//! In production, use `kaonic-gateway` which embeds the dashboard
+//! alongside the JSON API on the same port.
 
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 
-use axum::{Router, routing::get};
 use clap::Parser;
-use pages::SharedSettings;
-
-use kaonic_settings::settings::Settings;
 
 /// kaonic-dashboard: web portal for editing Kaonic Gateway settings.
 #[derive(Parser)]
@@ -19,9 +15,6 @@ struct Command {
     /// Address to bind the dashboard HTTP server
     #[arg(long, default_value = "0.0.0.0:3000")]
     addr: SocketAddr,
-    /// Path to the kaonic-gateway SQLite database
-    #[arg(long, env = "KAONIC_GATEWAY_DB_PATH", default_value = "kaonic-gateway.db")]
-    db_path: String,
 }
 
 #[tokio::main]
@@ -32,19 +25,7 @@ async fn main() {
         .init();
 
     let cmd = Command::parse();
-
-    let settings: SharedSettings = Arc::new(Mutex::new(
-        Settings::open(&cmd.db_path).unwrap_or_else(|err| {
-            eprintln!("failed to open settings database '{}': {err}", cmd.db_path);
-            std::process::exit(1);
-        }),
-    ));
-
-    let app = Router::new()
-        .route("/", get(frames::get_dashboard))
-        .route("/frames/json", get(frames::get_frames_json))
-        .route("/settings", get(pages::get_settings).post(pages::post_settings))
-        .with_state(settings);
+    let app = kaonic_dashboard::router();
 
     let listener = tokio::net::TcpListener::bind(cmd.addr)
         .await

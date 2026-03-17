@@ -1,0 +1,12 @@
+[package]
+name = "kaonic-atak-bridge"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+
+[dependencies]
+reticulum  = { git = "https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs", version = "0.1.*" }
+rand_core  = { version = "0.6", features = ["getrandom"] }
+tokio      = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+log        = "0.4"

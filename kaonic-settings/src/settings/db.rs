@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::str::FromStr;
 
+use rand::RngCore;
 use rusqlite::{Connection, Result, params};
 
 use crate::config::{FrameRecord, GatewayConfig, KaonicCtrlConfig};
@@ -67,6 +68,20 @@ impl Database {
             params![key],
         )?;
         Ok(())
+    }
+
+    /// Return the stored Reticulum identity seed, generating and persisting a new one
+    /// if none exists yet. The seed is a 64-char lowercase hex string (32 random bytes).
+    pub fn load_or_create_seed(&self) -> Result<String> {
+        if let Some(seed) = self.get("identity_seed")? {
+            return Ok(seed);
+        }
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        let seed = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        self.set("identity_seed", &seed)?;
+        log::info!("generated new Reticulum identity seed");
+        Ok(seed)
     }
 
     /// Load the full gateway config from the database.

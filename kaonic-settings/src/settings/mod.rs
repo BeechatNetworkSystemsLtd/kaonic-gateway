@@ -29,6 +29,12 @@ impl Settings {
         self.db.save_config(config)
     }
 
+    /// Return the Reticulum identity seed stored in the DB, creating one if absent.
+    /// Pass the returned string to `PrivateIdentity::new_from_name()`.
+    pub fn load_or_create_seed(&self) -> Result<String> {
+        self.db.load_or_create_seed()
+    }
+
     /// Log a received frame; keeps at most `keep` rows in the DB.
     pub fn log_frame(&self, record: &FrameRecord, keep: usize) -> Result<()> {
         self.db.log_frame(record, keep)
