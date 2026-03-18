@@ -108,14 +108,30 @@ impl AtakBridge {
 
         let udp_rx = Arc::new(UdpSocket::from_std(rx_sock.into())?);
 
-        // ── UDP send socket ───────────────────────────────────────────────
-        let tx_sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-        tx_sock.set_nonblocking(true)?;
-        tx_sock.set_multicast_loop_v4(false)?;
-        tx_sock.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into())?;
-        let udp_tx = Arc::new(UdpSocket::from_std(tx_sock.into())?);
-
+        // ── UDP send sockets — one per non-loopback IPv4 interface ──────
+        // Setting IP_MULTICAST_IF tells the OS which interface to egress on.
+        // We create one socket per interface so the packet goes out on all of them.
         let mcast_target: std::net::SocketAddr = SocketAddrV4::new(MCAST_GROUP, port).into();
+        let udp_tx_sockets: Arc<Vec<UdpSocket>> = Arc::new(
+            if_addrs::get_if_addrs()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|i| match i.addr.ip() {
+                    IpAddr::V4(a) if !a.is_loopback() => Some(a),
+                    _ => None,
+                })
+                .filter_map(|local_ip| {
+                    let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).ok()?;
+                    s.set_nonblocking(true).ok()?;
+                    s.set_multicast_loop_v4(false).ok()?;
+                    s.set_multicast_if_v4(&local_ip).ok()?;
+                    s.bind(&SocketAddrV4::new(local_ip, 0).into()).ok()?;
+                    let sock = UdpSocket::from_std(s.into()).ok()?;
+                    log::info!("atak-bridge:{port}: tx socket on {local_ip}");
+                    Some(sock)
+                })
+                .collect(),
+        );
 
         log::info!("atak-bridge:{port}: ready, dest={dest_hash}");
 
@@ -141,12 +157,11 @@ impl AtakBridge {
         };
 
         // ── Task 2: Reticulum → UDP ───────────────────────────────────────
-        // Data can arrive on either in-links (peer→us) or out-links (us→peer).
-        // Subscribe to both event streams and forward any payload to UDP multicast.
         let rns_to_udp = {
             let transport = self.transport.clone();
             let metrics = self.metrics.clone();
             let cancel = cancel.clone();
+            let sockets = udp_tx_sockets.clone();
             tokio::spawn(async move {
                 let mut in_rx = transport.lock().await.out_link_events();
                 loop {
@@ -156,11 +171,12 @@ impl AtakBridge {
                             if let LinkEvent::Data(payload) = ev.event {
                                 let data = payload.as_slice();
                                 log::info!("atak-bridge:{port}: rns -> udp {}B (in-link={})", data.len(), ev.id);
-                                if let Err(e) = udp_tx.send_to(data, mcast_target).await {
-                                    log::warn!("atak-bridge:{port}: udp send error: {e}");
-                                } else {
-                                    metrics.tx_packets.fetch_add(1, Ordering::Relaxed);
+                                for sock in sockets.iter() {
+                                    if let Err(e) = sock.send_to(data, mcast_target).await {
+                                        log::warn!("atak-bridge:{port}: udp send error: {e}");
+                                    }
                                 }
+                                metrics.tx_packets.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     }
