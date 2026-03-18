@@ -1,7 +1,8 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
-use kaonic_vpn::{GatewayConfig, KaonicCtrlConfig};
+use kaonic_gateway::config::GatewayConfig;
+use kaonic_gateway::radio::RadioModuleConfig;
 use serde::Serialize;
 
 use super::AppState;
@@ -38,33 +39,35 @@ pub async fn put_settings(
 pub async fn get_radio(
     State(state): State<AppState>,
     Path(module): Path<usize>,
-) -> Result<Json<Option<KaonicCtrlConfig>>, StatusCode> {
+) -> Result<Json<RadioModuleConfig>, StatusCode> {
     let s = state.settings.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     s.load_config()
-        .map(|c| Json(c.kaonic_ctrl_configs.into_iter().find(|m| m.module == module)))
         .map_err(|err| {
             log::error!("failed to load radio settings: {err}");
             StatusCode::INTERNAL_SERVER_ERROR
         })
+        .and_then(|c| {
+            c.radio.module_configs.get(module)
+                .cloned()
+                .map(Json)
+                .ok_or(StatusCode::NOT_FOUND)
+        })
 }
 
-/// `PUT /api/settings/radio/:module` — save config for one RF module and
-/// forward the new parameters to the live interface (module 0 only for now).
+/// `PUT /api/settings/radio/:module` — save config for one RF module and apply to hardware.
 pub async fn put_radio(
     State(state): State<AppState>,
     Path(module): Path<usize>,
-    Json(mut radio_config): Json<KaonicCtrlConfig>,
+    Json(cfg): Json<RadioModuleConfig>,
 ) -> StatusCode {
-    radio_config.module = module;
-
     log::info!(
         "put_radio: module={} radio_config={:?} modulation={:?}",
-        module, radio_config.radio_config, radio_config.modulation
+        module, cfg.radio_config, cfg.modulation
     );
 
     let save_result = {
         let s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
-        s.save_module_config(&radio_config)
+        s.save_module_config(module, &cfg)
     };
     if let Err(err) = save_result {
         log::error!("failed to save radio settings for module {module}: {err}");
@@ -72,22 +75,14 @@ pub async fn put_radio(
     }
     log::info!("put_radio: module={module} saved to DB");
 
-    // Forward to live interface for this module if connected.
-    if let Some(senders) = state.radio_senders.get(&module) {
-        if let Some(rc) = radio_config.radio_config {
-            match senders.radio_config_tx.send(rc).await {
-                Ok(_) => log::info!("put_radio: radio_config sent to module {module}"),
-                Err(e) => log::error!("put_radio: failed to send radio_config to module {module}: {e}"),
-            }
-        }
-        if let Some(m) = radio_config.modulation {
-            match senders.modulation_tx.send(m).await {
-                Ok(_) => log::info!("put_radio: modulation sent to module {module}"),
-                Err(e) => log::error!("put_radio: failed to send modulation to module {module}: {e}"),
-            }
-        }
-    } else {
-        log::warn!("put_radio: no live interface for module {module}");
+    let mut client = state.radio_client.lock().await;
+    match client.set_radio_config(module, cfg.radio_config).await {
+        Ok(_) => log::info!("put_radio: radio_config applied to module {module}"),
+        Err(e) => log::error!("put_radio: set_radio_config failed for module {module}: {e:?}"),
+    }
+    match client.set_modulation(module, cfg.modulation).await {
+        Ok(_) => log::info!("put_radio: modulation applied to module {module}"),
+        Err(e) => log::error!("put_radio: set_modulation failed for module {module}: {e:?}"),
     }
 
     StatusCode::NO_CONTENT
@@ -115,7 +110,7 @@ pub struct StatusResponse {
     vpn_hash: String,
     atak_bridges: Vec<AtakBridgeStatus>,
     system: SystemStatus,
-    radio_modules: Vec<KaonicCtrlConfig>,
+    radio_modules: Vec<RadioModuleConfig>,
 }
 
 /// `GET /api/status` — live gateway status: ATAK counters, system resources, VPN hash, radio config.
@@ -131,7 +126,7 @@ pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
 
     let radio_modules = state.settings.lock().ok()
         .and_then(|s| s.load_config().ok())
-        .map(|c| c.kaonic_ctrl_configs)
+        .map(|c| c.radio.module_configs.to_vec())
         .unwrap_or_default();
 
     Json(StatusResponse {

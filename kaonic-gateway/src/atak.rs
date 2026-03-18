@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use rand::rngs::OsRng;
-use reticulum::destination::DestinationName;
 use reticulum::destination::link::LinkEvent;
+use reticulum::destination::DestinationName;
 use reticulum::identity::PrivateIdentity;
 use reticulum::transport::Transport;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -46,16 +46,27 @@ impl AtakBridge {
         port: u16,
         metrics: Arc<BridgeMetrics>,
     ) -> Self {
-        Self { transport, identity, port, metrics }
+        Self {
+            transport,
+            identity,
+            port,
+            metrics,
+        }
     }
 
-    pub async fn run(self, cancel: CancellationToken) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn run(
+        self,
+        cancel: CancellationToken,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let port = self.port;
         let port_tag = port.to_be_bytes();
         let dest_name = format!("atak.{port}");
 
         // Register Reticulum destination
-        let destination = self.transport.lock().await
+        let destination = self
+            .transport
+            .lock()
+            .await
             .add_destination(self.identity, DestinationName::new("kaonic", &dest_name))
             .await;
 
@@ -81,13 +92,17 @@ impl AtakBridge {
             .unwrap_or_default()
             .into_iter()
             .find_map(|i| match i.addr.ip() {
-                IpAddr::V4(a) if a.octets()[0] == 192 && a.octets()[1] == 168 && a.octets()[2] == 10 => Some(a),
+                IpAddr::V4(a)
+                    if a.octets()[0] == 192 && a.octets()[1] == 168 && a.octets()[2] == 10 =>
+                {
+                    Some(a)
+                }
                 _ => None,
             })
             .unwrap_or(Ipv4Addr::UNSPECIFIED); // fallback — may fail but won't abort
 
         match rx_sock.join_multicast_v4(&MCAST_GROUP, &local_addr) {
-            Ok(_)  => log::info!("atak-bridge:{port}: joined multicast via {local_addr}"),
+            Ok(_) => log::info!("atak-bridge:{port}: joined multicast via {local_addr}"),
             Err(e) => log::warn!("atak-bridge:{port}: multicast join on {local_addr} failed: {e}"),
         }
 
@@ -107,8 +122,8 @@ impl AtakBridge {
         // ── Task 1: UDP → Reticulum ───────────────────────────────────────
         let udp_to_rns = {
             let transport = self.transport.clone();
-            let metrics   = self.metrics.clone();
-            let cancel    = cancel.clone();
+            let metrics = self.metrics.clone();
+            let cancel = cancel.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 65535];
                 loop {
@@ -116,10 +131,9 @@ impl AtakBridge {
                         _ = cancel.cancelled() => break,
                         Ok((len, src)) = udp_rx.recv_from(&mut buf) => {
                             let data = &buf[..len];
-                            log::info!("atak-bridge:{port}: udp→rns {len}B from {src}");
+                            log::info!("atak-bridge:{port}: udp -> rns {len}B from {src}");
                             metrics.rx_packets.fetch_add(1, Ordering::Relaxed);
-                            let mut t = transport.lock().await;
-                            t.send_to_in_links(&dest_hash, data).await;
+                            let _ = transport.lock().await.send_to_in_links(&dest_hash, data).await;
                         }
                     }
                 }
@@ -127,22 +141,21 @@ impl AtakBridge {
         };
 
         // ── Task 2: Reticulum → UDP ───────────────────────────────────────
-        // Data arrives over established links, so we subscribe to in_link_events
-        // and forward LinkEvent::Data payloads onto the local multicast group.
+        // Data can arrive on either in-links (peer→us) or out-links (us→peer).
+        // Subscribe to both event streams and forward any payload to UDP multicast.
         let rns_to_udp = {
             let transport = self.transport.clone();
-            let metrics   = self.metrics.clone();
-            let cancel    = cancel.clone();
+            let metrics = self.metrics.clone();
+            let cancel = cancel.clone();
             tokio::spawn(async move {
-                let mut link_rx = transport.lock().await.out_link_events();
+                let mut in_rx = transport.lock().await.out_link_events();
                 loop {
                     tokio::select! {
                         _ = cancel.cancelled() => break,
-                        Ok(ev) = link_rx.recv() => {
-                            // if ev.address_hash != dest_hash { continue; }
+                        Ok(ev) = in_rx.recv() => {
                             if let LinkEvent::Data(payload) = ev.event {
                                 let data = payload.as_slice();
-                                log::info!("atak-bridge:{port}: rns→udp {}B (link={})", data.len(), ev.id);
+                                log::info!("atak-bridge:{port}: rns -> udp {}B (in-link={})", data.len(), ev.id);
                                 if let Err(e) = udp_tx.send_to(data, mcast_target).await {
                                     log::warn!("atak-bridge:{port}: udp send error: {e}");
                                 } else {
@@ -158,7 +171,7 @@ impl AtakBridge {
         // ── Task 3: auto-link peers announcing same port ──────────────────
         let auto_link = {
             let transport = self.transport.clone();
-            let cancel    = cancel.clone();
+            let cancel = cancel.clone();
             tokio::spawn(async move {
                 let mut ann_rx = transport.lock().await.recv_announces().await;
                 loop {
@@ -173,7 +186,7 @@ impl AtakBridge {
                             if t.find_out_link(&peer.address_hash).await.is_some() {
                                 continue;
                             }
-                            log::info!("atak-bridge:{port}: auto-link → {}", peer.address_hash);
+                            log::info!("atak-bridge:{port}: auto-link -> {}", peer.address_hash);
                             t.link(peer).await;
                         }
                     }
@@ -184,7 +197,7 @@ impl AtakBridge {
         // ── Task 4: periodic re-announce ─────────────────────────────────
         let reannounce = {
             let transport = self.transport.clone();
-            let cancel    = cancel.clone();
+            let cancel = cancel.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(tokio::time::Duration::from_secs(10));
                 loop {
@@ -200,42 +213,7 @@ impl AtakBridge {
             })
         };
 
-        // ── Task 5: log link Activated / Closed events ───────────────────
-        let link_logger = {
-            let transport = self.transport.clone();
-            let cancel    = cancel.clone();
-            tokio::spawn(async move {
-                let mut in_rx  = transport.lock().await.in_link_events();
-                let mut out_rx = transport.lock().await.out_link_events();
-                loop {
-                    tokio::select! {
-                        _ = cancel.cancelled() => break,
-                        Ok(ev) = in_rx.recv() => {
-                            if ev.address_hash != dest_hash { continue; }
-                            match ev.event {
-                                LinkEvent::Activated =>
-                                    log::info!("atak-bridge:{port}: incoming link established (id={})", ev.id),
-                                LinkEvent::Closed =>
-                                    log::info!("atak-bridge:{port}: incoming link closed (id={})", ev.id),
-                                _ => {}
-                            }
-                        }
-                        Ok(ev) = out_rx.recv() => {
-                            if ev.address_hash != dest_hash { continue; }
-                            match ev.event {
-                                LinkEvent::Activated =>
-                                    log::info!("atak-bridge:{port}: outgoing link established (id={})", ev.id),
-                                LinkEvent::Closed =>
-                                    log::info!("atak-bridge:{port}: outgoing link closed (id={})", ev.id),
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-            })
-        };
-
-        let _ = tokio::join!(udp_to_rns, rns_to_udp, auto_link, reannounce, link_logger);
+        let _ = tokio::join!(udp_to_rns, rns_to_udp, auto_link, reannounce);
         log::info!("atak-bridge:{port}: stopped");
         Ok(())
     }

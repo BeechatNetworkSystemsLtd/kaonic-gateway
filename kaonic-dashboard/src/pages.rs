@@ -154,9 +154,9 @@ var MODULE_DEFAULTS = [
 ];
 
 function loadAllModules(cfg) {
-  var configs = (cfg && cfg.kaonic_ctrl_configs) || [];
+  var configs = (cfg && cfg.radio && cfg.radio.module_configs) || [];
   moduleData = [null, null];
-  configs.forEach(function(m) { if (m.module === 0 || m.module === 1) moduleData[m.module] = m; });
+  configs.forEach(function(m, idx) { if (idx < 2) moduleData[idx] = m; });
   updateModuleRows();
 }
 function updateModuleRows() {
@@ -225,12 +225,14 @@ function buildModuleConfig() {
   var channel  = parseInt(v('radio_channel').value) || 0;
   var bw       = v('radio_bandwidth_filter').value === 'wide' ? 'Wide' : 'Narrow';
 
+  var default_rc = (MODULE_DEFAULTS[currentModule] || {}).radio_config;
+  var existing_rc = (existing && existing.radio_config) || default_rc;
   var radio_config = freq_khz > 0 ? {
     freq: freq_khz * 1000,
     channel_spacing: ch_khz * 1000,
     channel: channel,
     bandwidth_filter: bw
-  } : null;
+  } : existing_rc;
 
   var mod_type = v('modulation_type').value;
   var modulation = 'Off';
@@ -252,9 +254,6 @@ function buildModuleConfig() {
   }
 
   return {
-    listen_addr: existing.listen_addr || '0.0.0.0:0',
-    server_addr: existing.server_addr || '192.168.10.1:9090',
-    module: currentModule,
     radio_config: radio_config,
     modulation: modulation
   };
@@ -304,7 +303,10 @@ function saveSettings(e) {
           network: v('network').value.trim(),
           announce_freq_secs: parseInt(v('announce_freq_secs').value) || 1,
           peers: v('peers').value.split('\n').map(function(s){return s.trim();}).filter(Boolean),
-          kaonic_ctrl_configs: (existing && existing.kaonic_ctrl_configs) || moduleData.filter(Boolean)
+          radio: { module_configs: [
+            moduleData[0] || MODULE_DEFAULTS[0],
+            moduleData[1] || MODULE_DEFAULTS[1]
+          ]}
         })
       });
     })

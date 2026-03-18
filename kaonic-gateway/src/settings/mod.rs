@@ -3,7 +3,8 @@ mod db;
 use db::Database;
 use rusqlite::Result;
 
-use kaonic_vpn::{GatewayConfig, KaonicCtrlConfig};
+use crate::config::GatewayConfig;
+use crate::radio::RadioModuleConfig;
 
 pub struct Settings {
     db: Database,
@@ -30,7 +31,7 @@ impl Settings {
         self.db.save_config(config)
     }
 
-    pub fn save_module_config(&self, ctrl: &KaonicCtrlConfig) -> Result<()> {
-        self.db.save_module_config(ctrl)
+    pub fn save_module_config(&self, module: usize, cfg: &RadioModuleConfig) -> Result<()> {
+        self.db.save_module_config(module, cfg)
     }
 }

@@ -20,25 +20,31 @@ pub struct AtakBridge {
 }
 
 impl AtakBridge {
-    pub fn new(
-        transport: Arc<Mutex<Transport>>,
-        identity: PrivateIdentity,
-        udp_port: u16,
-    ) -> Self {
-        Self { transport, identity, udp_port }
+    pub fn new(transport: Arc<Mutex<Transport>>, identity: PrivateIdentity, udp_port: u16) -> Self {
+        Self {
+            transport,
+            identity,
+            udp_port,
+        }
     }
 
     pub async fn run(
         self,
         cancel: CancellationToken,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let destination = self.transport.lock().await
+        let destination = self
+            .transport
+            .lock()
+            .await
             .add_destination(self.identity, DestinationName::new("kaonic", "atak"))
             .await;
 
         let dest_hash = destination.lock().await.desc.address_hash;
 
-        let announce = destination.lock().await.announce(OsRng, None)
+        let announce = destination
+            .lock()
+            .await
+            .announce(OsRng, None)
             .map_err(|e| format!("announce error: {e:?}"))?;
         self.transport.lock().await.send_packet(announce).await;
         log::info!("atak-bridge: announced destination {dest_hash}");
@@ -93,9 +99,8 @@ impl AtakBridge {
                         Ok((len, src)) = udp.recv_from(&mut buf) => {
                             let data = &buf[..len];
                             log::debug!(
-                                "atak-bridge: udp→rns {} bytes from {src} | {}",
+                                "atak-bridge: udp -> rns {} bytes from {src}",
                                 len,
-                                hex_preview(data),
                             );
                             transport.lock().await
                                 .send_to_in_links(&dest_hash, data)
@@ -136,7 +141,11 @@ impl AtakBridge {
 /// Format up to the first 16 bytes of `data` as a hex string for log previews.
 fn hex_preview(data: &[u8]) -> String {
     let n = data.len().min(16);
-    let hex: String = data[..n].iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+    let hex: String = data[..n]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     if data.len() > 16 {
         format!("{hex} …")
     } else {

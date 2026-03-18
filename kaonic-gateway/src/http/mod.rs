@@ -7,7 +7,7 @@ use axum::{Router, routing::get};
 
 use kaonic_gateway::atak::BridgeMetrics;
 use kaonic_gateway::settings::Settings;
-use kaonic_vpn::RadioSenders;
+use kaonic_gateway::radio::SharedRadioClient;
 
 /// Shared settings handle passed to all API handlers.
 pub type SharedSettings = Arc<Mutex<Settings>>;
@@ -18,7 +18,7 @@ pub struct AppState {
     pub settings: SharedSettings,
     pub atak_metrics: Vec<Arc<BridgeMetrics>>,
     pub vpn_hash: String,
-    pub radio_senders: Arc<RadioSenders>,
+    pub radio_client: SharedRadioClient,
 }
 
 /// Start the combined HTTP server (JSON API + dashboard UI). Runs until the process exits.

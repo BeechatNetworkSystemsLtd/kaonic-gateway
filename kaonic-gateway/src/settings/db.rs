@@ -1,11 +1,11 @@
-use std::net::SocketAddr;
 use std::str::FromStr;
 
 use rand::RngCore;
 use rusqlite::{Connection, Result, params};
 use serde_json;
 
-use kaonic_vpn::{GatewayConfig, KaonicCtrlConfig};
+use crate::config::GatewayConfig;
+use crate::radio::{HardwareRadioConfig, RadioModuleConfig};
 
 const DEFAULT_NETWORK: &str = "10.20.0.0/16";
 const DEFAULT_ANNOUNCE_FREQ_SECS: u32 = 1;
@@ -80,44 +80,23 @@ impl Database {
             rows.collect::<Result<Vec<String>>>()?
         };
 
-        let default_ctrl = KaonicCtrlConfig::default();
-        let mut kaonic_ctrl_configs = Vec::new();
-        for module_idx in 0usize..2 {
-            let suffix = format!("_{module_idx}");
-            // Load listen/server — fall back to legacy unsuffixed keys for module 0, then to defaults.
-            let listen_str = self.get(&format!("kaonic_ctrl_listen_addr{suffix}"))?.or_else(|| {
-                if module_idx == 0 { self.get("kaonic_ctrl_listen_addr").ok()? } else { None }
-            });
-            let server_str = self.get(&format!("kaonic_ctrl_server_addr{suffix}"))?.or_else(|| {
-                if module_idx == 0 { self.get("kaonic_ctrl_server_addr").ok()? } else { None }
-            });
-            let listen_addr = listen_str.and_then(|s| SocketAddr::from_str(&s).ok())
-                .unwrap_or(default_ctrl.listen_addr);
-            let server_addr = server_str.and_then(|s| SocketAddr::from_str(&s).ok())
-                .unwrap_or(default_ctrl.server_addr);
+        let defaults = HardwareRadioConfig::default();
+        let module_configs = std::array::from_fn(|i| {
+            let suffix = format!("_{i}");
+            let radio_config = self.get(&format!("kaonic_ctrl_radio_config{suffix}"))
+                .ok().flatten()
+                .or_else(|| if i == 0 { self.get("kaonic_ctrl_radio_config").ok()? } else { None })
+                .and_then(|v| serde_json::from_str(&v).ok())
+                .unwrap_or_else(|| defaults.module_configs[i].radio_config.clone());
+            let modulation = self.get(&format!("kaonic_ctrl_modulation{suffix}"))
+                .ok().flatten()
+                .or_else(|| if i == 0 { self.get("kaonic_ctrl_modulation").ok()? } else { None })
+                .and_then(|v| serde_json::from_str(&v).ok())
+                .unwrap_or_else(|| defaults.module_configs[i].modulation.clone());
+            RadioModuleConfig { radio_config, modulation }
+        });
 
-            let radio_config_key = format!("kaonic_ctrl_radio_config{suffix}");
-            let modulation_key   = format!("kaonic_ctrl_modulation{suffix}");
-            let radio_config = self.get(&radio_config_key)?
-                .or_else(|| if module_idx == 0 { self.get("kaonic_ctrl_radio_config").ok()? } else { None })
-                .and_then(|v| serde_json::from_str(&v).ok());
-            let modulation = self.get(&modulation_key)?
-                .or_else(|| if module_idx == 0 { self.get("kaonic_ctrl_modulation").ok()? } else { None })
-                .and_then(|v| serde_json::from_str(&v).ok());
-
-            // Always include module 0; include module 1 only if it has radio settings saved.
-            if module_idx == 0 || radio_config.is_some() || modulation.is_some() {
-                kaonic_ctrl_configs.push(KaonicCtrlConfig {
-                    listen_addr,
-                    server_addr,
-                    module: module_idx,
-                    radio_config,
-                    modulation,
-                });
-            }
-        }
-
-        Ok(GatewayConfig { network, peers, announce_freq_secs, kaonic_ctrl_configs })
+        Ok(GatewayConfig { network, peers, announce_freq_secs, radio: HardwareRadioConfig { module_configs } })
     }
 
     pub fn save_config(&self, config: &GatewayConfig) -> Result<()> {
@@ -132,24 +111,24 @@ impl Database {
             )?;
         }
 
-        for ctrl in &config.kaonic_ctrl_configs {
-            self.save_module_config(ctrl)?;
+        for (i, module_cfg) in config.radio.module_configs.iter().enumerate() {
+            self.save_module_config(i, module_cfg)?;
         }
 
         Ok(())
     }
 
-    /// Save a single module's radio config (keyed by `ctrl.module` index).
-    pub fn save_module_config(&self, ctrl: &KaonicCtrlConfig) -> Result<()> {
-        let suffix = format!("_{}", ctrl.module);
-        self.set(&format!("kaonic_ctrl_listen_addr{suffix}"), &ctrl.listen_addr.to_string())?;
-        self.set(&format!("kaonic_ctrl_server_addr{suffix}"), &ctrl.server_addr.to_string())?;
-        if let Some(rc) = &ctrl.radio_config {
-            self.set(&format!("kaonic_ctrl_radio_config{suffix}"), &serde_json::to_string(rc).unwrap())?;
-        }
-        if let Some(m) = &ctrl.modulation {
-            self.set(&format!("kaonic_ctrl_modulation{suffix}"), &serde_json::to_string(m).unwrap())?;
-        }
+    /// Save a single module's radio+modulation config by module index.
+    pub fn save_module_config(&self, module: usize, cfg: &RadioModuleConfig) -> Result<()> {
+        let suffix = format!("_{module}");
+        self.set(
+            &format!("kaonic_ctrl_radio_config{suffix}"),
+            &serde_json::to_string(&cfg.radio_config).unwrap(),
+        )?;
+        self.set(
+            &format!("kaonic_ctrl_modulation{suffix}"),
+            &serde_json::to_string(&cfg.modulation).unwrap(),
+        )?;
         Ok(())
     }
 }
