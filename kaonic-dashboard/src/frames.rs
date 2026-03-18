@@ -49,10 +49,10 @@ function fmtMod(mod) {
   }
   return JSON.stringify(mod);
 }
-function fmtOneRadio(r) {
+function fmtOneRadio(r, idx) {
   if (!r) return '';
   const names = ['A', 'B'];
-  const label = names[r.module] || ('Module ' + r.module);
+  const label = names[idx] ?? idx;
   const rc = r.radio_config;
   const freq = rc ? fmtFreq(rc.freq) : '—';
   const ch   = rc ? (rc.channel ?? '—') : '—';
