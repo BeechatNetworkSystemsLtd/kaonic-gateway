@@ -19,7 +19,6 @@ use tokio;
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_DB_PATH: &str = "kaonic-gateway.db";
-const ATAK_PORTS: &[u16] = &[6969, 17012];
 
 /// kaonic-gateway: VPN over Reticulum using the kaonic radio hardware.
 #[derive(Parser)]
@@ -104,7 +103,7 @@ async fn main() -> Result<(), process::ExitCode> {
     let cancel = CancellationToken::new();
 
     let mut atak_metrics = Vec::new();
-    for &port in ATAK_PORTS {
+    for &(port, _) in kaonic_gateway::atak::ATAK_PORTS {
         let seed = settings
             .lock()
             .unwrap()
