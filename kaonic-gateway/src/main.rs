@@ -9,7 +9,7 @@ use clap::Parser;
 use env_logger;
 use kaonic_gateway::atak::{AtakBridge, BridgeMetrics};
 use kaonic_gateway::settings::Settings;
-use kaonic_vpn::KaonicCtrlConfig;
+use kaonic_vpn::{KaonicCtrlConfig, RadioSenders};
 use http::{AppState, SharedSettings};
 use log;
 use reticulum::identity::PrivateIdentity;
@@ -51,9 +51,16 @@ async fn main() -> Result<(), process::ExitCode> {
     });
 
     env_logger::Builder::new()
-        .parse_filters("warn,kaonic_gateway=trace,kaonic_vpn=trace,kaonic_reticulum=trace,rns_vpn=trace,reticulum=trace")
+        .parse_filters("warn,kaonic_gateway=trace,kaonic_vpn=warn,kaonic_reticulum=trace,rns_vpn=warn,reticulum=error")
         .parse_default_env()  // RUST_LOG overrides the above
         .init();
+
+    // Read device serial number
+    let serial = std::fs::read_to_string("/etc/kaonic/kaonic_serial")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    log::info!("device serial: {serial}");
+    kaonic_dashboard::set_serial(serial);
 
     // Load or generate a persistent Reticulum identity from the DB
     let seed = settings.lock().unwrap().load_or_create_seed().unwrap_or_else(|err| {
@@ -64,21 +71,24 @@ async fn main() -> Result<(), process::ExitCode> {
     let vpn_hash = id.address_hash().to_hex_string();
     log::info!("Reticulum identity ready: {vpn_hash}");
 
-    let mut ctrl_config: KaonicCtrlConfig = config.kaonic_ctrl_configs.first().cloned()
-        .unwrap_or_else(|| {
-            log::info!("no radio module config in database, using defaults");
-            KaonicCtrlConfig::default()
-        });
-    if let Some(server_addr) = cmd.kaonic_ctrl_server {
-        ctrl_config.server_addr = server_addr;
+    let mut ctrl_configs = config.kaonic_ctrl_configs.clone();
+    if ctrl_configs.is_empty() {
+        log::info!("no radio module config in database, using defaults");
+        ctrl_configs.push(KaonicCtrlConfig::default());
     }
+    if let Some(server_addr) = cmd.kaonic_ctrl_server {
+        for c in &mut ctrl_configs { c.server_addr = server_addr; }
+    }
+    // Use module 0 for TX/RX only.
+    ctrl_configs.retain(|c| c.module == 0);
 
-    let transport = kaonic_vpn::setup_transport(&id, ctrl_config)
+    let (transport, radio_senders) = kaonic_vpn::setup_transport(&id, ctrl_configs)
         .await
         .map_err(|err| {
             log::error!("transport setup error: {err:?}");
             process::ExitCode::FAILURE
         })?;
+    let radio_senders = Arc::new(radio_senders);
 
     let mut atak_metrics = Vec::new();
     for &port in ATAK_PORTS {
@@ -94,8 +104,8 @@ async fn main() -> Result<(), process::ExitCode> {
         let bridge = AtakBridge::new(transport.clone(), atak_identity, port, metrics);
         let cancel = CancellationToken::new();
         tokio::spawn(async move {
-            if let Err(err) = bridge.run(cancel).await {
-                log::error!("atak-bridge:{port} error: {err:?}");
+            if let Err(e) = bridge.run(cancel).await {
+                log::error!("atak-bridge:{port} exited with error: {e}");
             }
         });
     }
@@ -104,6 +114,7 @@ async fn main() -> Result<(), process::ExitCode> {
         settings: settings.clone(),
         atak_metrics,
         vpn_hash,
+        radio_senders,
     }, cmd.http_addr));
 
     kaonic_vpn::run_vpn(transport, config, id).await.map_err(|err| {

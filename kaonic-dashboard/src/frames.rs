@@ -1,14 +1,18 @@
 use axum::response::IntoResponse;
 use maud::{html, Markup, PreEscaped, DOCTYPE};
 
+use crate::serial;
+
 const CSS: &str = r#"
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:system-ui,sans-serif;background:#0a0c14;color:#e2e8f0;min-height:100vh}
 a{color:#6ee7f7;text-decoration:none}a:hover{text-decoration:underline}
 header{background:#111320;border-bottom:1px solid #1e2235;padding:.85rem 2rem;display:flex;align-items:center;gap:2rem}
 header h1{font-size:1.1rem;font-weight:700;color:#6ee7f7;letter-spacing:.04em}
+header nav{flex:1}
 header nav a{color:#64748b;font-size:.88rem;margin-right:1.4rem;transition:color .15s}
 header nav a:hover,header nav a.active{color:#e2e8f0}
+.serial-badge{font-size:.78rem;color:#64748b;background:#1a1d2e;border:1px solid #2d3147;border-radius:6px;padding:.2rem .7rem;white-space:nowrap}
 main{max-width:900px;margin:2.5rem auto;padding:0 1.5rem}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1rem;margin-bottom:1.5rem}
 .card{background:#111320;border:1px solid #1e2235;border-radius:10px;padding:1.4rem 1.6rem}
@@ -126,6 +130,7 @@ fn layout(title: &str, body: Markup) -> Markup {
                         a href="/settings" { "Settings" }
                         a href="/update" { "Update" }
                     }
+                    span .serial-badge { "S/N: " (serial()) }
                 }
                 main { (body) }
             }

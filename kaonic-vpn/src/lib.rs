@@ -9,5 +9,5 @@ pub use radio_common::frequency::{Hertz, BandwidthFilter};
 #[cfg(feature = "run")]
 pub use kaonic_reticulum::KaonicCtrlInterface;
 #[cfg(feature = "run")]
-pub use vpn::{setup_transport, run_vpn};
+pub use vpn::{setup_transport, run_vpn, RadioSenders, ModuleSenders};
 

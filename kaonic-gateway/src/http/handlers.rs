@@ -48,21 +48,49 @@ pub async fn get_radio(
         })
 }
 
-/// `PUT /api/settings/radio/:module` — save config for one RF module.
+/// `PUT /api/settings/radio/:module` — save config for one RF module and
+/// forward the new parameters to the live interface (module 0 only for now).
 pub async fn put_radio(
     State(state): State<AppState>,
     Path(module): Path<usize>,
     Json(mut radio_config): Json<KaonicCtrlConfig>,
 ) -> StatusCode {
     radio_config.module = module;
-    let s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
-    match s.save_module_config(&radio_config) {
-        Ok(_) => StatusCode::NO_CONTENT,
-        Err(err) => {
-            log::error!("failed to save radio settings for module {module}: {err}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
+
+    log::info!(
+        "put_radio: module={} radio_config={:?} modulation={:?}",
+        module, radio_config.radio_config, radio_config.modulation
+    );
+
+    let save_result = {
+        let s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+        s.save_module_config(&radio_config)
+    };
+    if let Err(err) = save_result {
+        log::error!("failed to save radio settings for module {module}: {err}");
+        return StatusCode::INTERNAL_SERVER_ERROR;
     }
+    log::info!("put_radio: module={module} saved to DB");
+
+    // Forward to live interface for this module if connected.
+    if let Some(senders) = state.radio_senders.get(&module) {
+        if let Some(rc) = radio_config.radio_config {
+            match senders.radio_config_tx.send(rc).await {
+                Ok(_) => log::info!("put_radio: radio_config sent to module {module}"),
+                Err(e) => log::error!("put_radio: failed to send radio_config to module {module}: {e}"),
+            }
+        }
+        if let Some(m) = radio_config.modulation {
+            match senders.modulation_tx.send(m).await {
+                Ok(_) => log::info!("put_radio: modulation sent to module {module}"),
+                Err(e) => log::error!("put_radio: failed to send modulation to module {module}: {e}"),
+            }
+        }
+    } else {
+        log::warn!("put_radio: no live interface for module {module}");
+    }
+
+    StatusCode::NO_CONTENT
 }
 
 // ── /api/status ─────────────────────────────────────────────────────────────

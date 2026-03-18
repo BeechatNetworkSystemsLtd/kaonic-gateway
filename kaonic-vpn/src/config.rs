@@ -6,10 +6,19 @@ use serde::{Deserialize, Serialize};
 
 fn default_announce_freq_secs() -> u32 { 1 }
 
+fn default_listen_addr() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+}
+fn default_server_addr() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 10, 1)), 9090)
+}
+
 /// Radio interface connection settings.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct KaonicCtrlConfig {
+    #[serde(default = "default_listen_addr")]
     pub listen_addr: SocketAddr,
+    #[serde(default = "default_server_addr")]
     pub server_addr: SocketAddr,
     #[serde(default)]
     pub module: usize,
@@ -20,8 +29,8 @@ pub struct KaonicCtrlConfig {
 impl Default for KaonicCtrlConfig {
     fn default() -> Self {
         Self {
-            listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-            server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 10, 1)), 9090),
+            listen_addr: default_listen_addr(),
+            server_addr: default_server_addr(),
             module: 0,
             radio_config: None,
             modulation: None,

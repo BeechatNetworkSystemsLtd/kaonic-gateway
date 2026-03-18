@@ -80,31 +80,33 @@ impl Database {
             rows.collect::<Result<Vec<String>>>()?
         };
 
+        let default_ctrl = KaonicCtrlConfig::default();
         let mut kaonic_ctrl_configs = Vec::new();
         for module_idx in 0usize..2 {
             let suffix = format!("_{module_idx}");
-            // Try suffixed keys first, then fall back to legacy unsuffixed keys for module 0
-            let listen = self.get(&format!("kaonic_ctrl_listen_addr{suffix}"))?.or_else(|| {
+            // Load listen/server — fall back to legacy unsuffixed keys for module 0, then to defaults.
+            let listen_str = self.get(&format!("kaonic_ctrl_listen_addr{suffix}"))?.or_else(|| {
                 if module_idx == 0 { self.get("kaonic_ctrl_listen_addr").ok()? } else { None }
             });
-            let server = self.get(&format!("kaonic_ctrl_server_addr{suffix}"))?.or_else(|| {
+            let server_str = self.get(&format!("kaonic_ctrl_server_addr{suffix}"))?.or_else(|| {
                 if module_idx == 0 { self.get("kaonic_ctrl_server_addr").ok()? } else { None }
             });
-            if let (Some(l), Some(s)) = (listen, server) {
-                let listen_addr = SocketAddr::from_str(&l).map_err(|e| {
-                    rusqlite::Error::InvalidParameterName(format!("invalid listen_addr '{l}': {e}"))
-                })?;
-                let server_addr = SocketAddr::from_str(&s).map_err(|e| {
-                    rusqlite::Error::InvalidParameterName(format!("invalid server_addr '{s}': {e}"))
-                })?;
-                let radio_config_key = format!("kaonic_ctrl_radio_config{suffix}");
-                let modulation_key   = format!("kaonic_ctrl_modulation{suffix}");
-                let radio_config = self.get(&radio_config_key)?
-                    .or_else(|| if module_idx == 0 { self.get("kaonic_ctrl_radio_config").ok()? } else { None })
-                    .and_then(|v| serde_json::from_str(&v).ok());
-                let modulation = self.get(&modulation_key)?
-                    .or_else(|| if module_idx == 0 { self.get("kaonic_ctrl_modulation").ok()? } else { None })
-                    .and_then(|v| serde_json::from_str(&v).ok());
+            let listen_addr = listen_str.and_then(|s| SocketAddr::from_str(&s).ok())
+                .unwrap_or(default_ctrl.listen_addr);
+            let server_addr = server_str.and_then(|s| SocketAddr::from_str(&s).ok())
+                .unwrap_or(default_ctrl.server_addr);
+
+            let radio_config_key = format!("kaonic_ctrl_radio_config{suffix}");
+            let modulation_key   = format!("kaonic_ctrl_modulation{suffix}");
+            let radio_config = self.get(&radio_config_key)?
+                .or_else(|| if module_idx == 0 { self.get("kaonic_ctrl_radio_config").ok()? } else { None })
+                .and_then(|v| serde_json::from_str(&v).ok());
+            let modulation = self.get(&modulation_key)?
+                .or_else(|| if module_idx == 0 { self.get("kaonic_ctrl_modulation").ok()? } else { None })
+                .and_then(|v| serde_json::from_str(&v).ok());
+
+            // Always include module 0; include module 1 only if it has radio settings saved.
+            if module_idx == 0 || radio_config.is_some() || modulation.is_some() {
                 kaonic_ctrl_configs.push(KaonicCtrlConfig {
                     listen_addr,
                     server_addr,

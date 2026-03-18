@@ -1,14 +1,18 @@
 use axum::response::IntoResponse;
 use maud::{html, Markup, PreEscaped, DOCTYPE};
 
+use crate::serial;
+
 const CSS: &str = r#"
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:system-ui,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}
 a{color:#7c85f5;text-decoration:none}a:hover{text-decoration:underline}
 header{background:#1a1d27;border-bottom:1px solid #2d3147;padding:.85rem 2rem;display:flex;align-items:center;gap:2rem}
 header h1{font-size:1.1rem;font-weight:700;color:#7c85f5;letter-spacing:.02em}
+header nav{flex:1}
 header nav a{color:#94a3b8;font-size:.88rem;margin-right:1.2rem}
 header nav a:hover{color:#e2e8f0}
+.serial-badge{font-size:.78rem;color:#64748b;background:#111320;border:1px solid #2d3147;border-radius:6px;padding:.2rem .7rem;white-space:nowrap}
 main{max-width:740px;margin:2rem auto;padding:0 1.25rem}
 .card{background:#1a1d27;border:1px solid #2d3147;border-radius:8px;padding:1.5rem;margin-bottom:1.5rem}
 .card-title{font-size:.78rem;font-weight:700;color:#7c85f5;text-transform:uppercase;letter-spacing:.08em;margin-bottom:1.1rem}
@@ -70,16 +74,18 @@ var currentBand = 'subghz';
 function v(id) { return document.getElementById(id); }
 
 // ── band toggle ──────────────────────────────────────────────────────────────
-function setBand(band) {
+function setBand(band, userInitiated) {
   currentBand = band;
   document.querySelectorAll('.band-btn').forEach(function(b) {
     b.classList.toggle('active', b.dataset.band === band);
   });
   var fi = v('radio_freq_khz');
   if (band === 'subghz') {
-    fi.min = 100000; fi.max = 1100000; fi.placeholder = 'e.g. 869000';
+    fi.min = 100000; fi.max = 1100000; fi.placeholder = 'e.g. 869535';
+    if (userInitiated) fi.value = 869535;
   } else {
-    fi.min = 2400000; fi.max = 2500000; fi.placeholder = 'e.g. 2442000';
+    fi.min = 2400000; fi.max = 2500000; fi.placeholder = 'e.g. 2450000';
+    if (userInitiated) fi.value = 2450000;
   }
 }
 
@@ -137,6 +143,16 @@ function moduleSummary(radio) {
 
 var moduleData = [null, null];
 
+// Default values shown when a module has no saved config yet.
+var MODULE_DEFAULTS = [
+  // Module 0 — Sub-GHz
+  { radio_config: { freq: 869535000, channel_spacing: 200000, channel: 10, bandwidth_filter: 'Narrow' },
+    modulation: { Ofdm: { mcs: 'BpskC1_2_4x', opt: 'Option1', pdt: 3, tx_power: 14 } } },
+  // Module 1 — 2.4 GHz
+  { radio_config: { freq: 2450000000, channel_spacing: 200000, channel: 0, bandwidth_filter: 'Narrow' },
+    modulation: { Ofdm: { mcs: 'BpskC1_2_4x', opt: 'Option1', pdt: 3, tx_power: 14 } } }
+];
+
 function loadAllModules(cfg) {
   var configs = (cfg && cfg.kaonic_ctrl_configs) || [];
   moduleData = [null, null];
@@ -157,7 +173,7 @@ function openModal(idx) {
   currentModule = idx;
   v('modal-title').textContent = 'RF215 Module ' + MODULE_NAMES[idx] + ' Configuration';
   v('modal-flash').className = 'modal-flash';
-  populateModalFields(moduleData[idx]);
+  populateModalFields(moduleData[idx] || MODULE_DEFAULTS[idx]);
   v('modal-backdrop').classList.add('open');
 }
 function closeModal() {
@@ -332,6 +348,7 @@ fn layout(body: Markup) -> Markup {
                         a href="/settings" { "Settings" }
                         a href="/update" { "Update" }
                     }
+                    span .serial-badge { "S/N: " (serial()) }
                 }
                 main { (body) }
                 script { (PreEscaped(JS)) }
@@ -403,8 +420,8 @@ pub async fn get_settings() -> impl IntoResponse {
 
                     // ── Band toggle ──────────────────────────────────────────
                     div .band-toggle {
-                        button type="button" .band-btn data-band="subghz" onclick="setBand('subghz')" { "Sub-GHz" }
-                        button type="button" .band-btn data-band="2400"   onclick="setBand('2400')"   { "2.4 GHz" }
+                        button type="button" .band-btn data-band="subghz" onclick="setBand('subghz',true)" { "Sub-GHz" }
+                        button type="button" .band-btn data-band="2400"   onclick="setBand('2400',true)"   { "2.4 GHz" }
                     }
 
                     p .card-title style="margin-bottom:.9rem" { "RF Configuration" }
