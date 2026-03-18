@@ -28,6 +28,7 @@ main{max-width:740px;margin:2rem auto;padding:0 1.25rem}
 .flash.show{display:block}
 .flash-ok{background:#14532d;border:1px solid #16a34a;color:#86efac}
 .flash-err{background:#450a0a;border:1px solid #dc2626;color:#fca5a5}
+.flash-info{background:#1e2235;border:1px solid #3d4262;color:#94a3b8}
 .hint{font-size:.78rem;color:#64748b;margin-top:-.5rem;margin-bottom:.75rem}
 .mod-section{display:none}.mod-section.active{display:block}
 .slider-row{display:flex;align-items:center;gap:.75rem}
@@ -329,6 +330,7 @@ fn layout(body: Markup) -> Markup {
                     nav {
                         a href="/" { "Dashboard" }
                         a href="/settings" { "Settings" }
+                        a href="/update" { "Update" }
                     }
                 }
                 main { (body) }
@@ -524,6 +526,120 @@ pub async fn get_settings() -> impl IntoResponse {
                 }
             }
         }
+    };
+
+    layout(content)
+}
+
+const UPDATE_JS: &str = r#"
+const UPDATE_API = 'http://' + location.hostname + ':8682';
+
+async function loadVersions() {
+    for (const target of ['commd', 'gateway']) {
+        const el = document.getElementById(target + '_version');
+        if (!el) continue;
+        try {
+            const r = await fetch(UPDATE_API + '/api/update/' + target + '/version');
+            if (!r.ok) { el.textContent = 'unavailable (HTTP ' + r.status + ')'; continue; }
+            const d = await r.json();
+            const hashStr = d.hash ? ' (' + d.hash.slice(0,12) + '...)' : '';
+            el.textContent = d.version ? d.version + hashStr : 'not installed';
+        } catch(e) {
+            el.textContent = 'unavailable';
+        }
+    }
+}
+
+async function doUpload(target) {
+    const input = document.getElementById(target + '_file');
+    const status = document.getElementById(target + '_status');
+    if (!input.files.length) {
+        showStatus(status, 'No file selected.', false);
+        return;
+    }
+    const file = input.files[0];
+    if (!file.name.endsWith('.zip')) {
+        showStatus(status, 'Only .zip files are accepted.', false);
+        return;
+    }
+    const btn = document.getElementById(target + '_btn');
+    btn.disabled = true;
+    showStatus(status, 'Uploading…', null);
+
+    const form = new FormData();
+    form.append('file', file);
+    try {
+        const r = await fetch(UPDATE_API + '/api/update/' + target + '/upload', {
+            method: 'POST',
+            body: form,
+        });
+        const d = await r.json();
+        showStatus(status, d.detail || (r.ok ? 'Success' : 'Error'), r.ok);
+        if (r.ok) { input.value = ''; loadVersions(); }
+    } catch(e) {
+        showStatus(status, 'Request failed: ' + e.message, false);
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+function showStatus(el, msg, ok) {
+    el.textContent = msg;
+    el.className = 'flash show ' + (ok === null ? 'flash-info' : (ok ? 'flash-ok' : 'flash-err'));
+}
+
+window.addEventListener('DOMContentLoaded', loadVersions);
+"#;
+
+/// `GET /update` — OTA update page.
+pub async fn get_update() -> impl IntoResponse {
+    let content = html! {
+        h2 style="font-size:1.25rem;font-weight:700;margin-bottom:1.5rem" { "Software Update" }
+
+        // kaonic-commd card
+        div .card {
+            div .card-title { "kaonic-commd" }
+            p style="font-size:.85rem;color:#94a3b8;margin-bottom:1rem" {
+                "Radio control daemon. Installed: "
+                span id="commd_version" style="color:#e2e8f0" { "loading…" }
+            }
+            div .field {
+                label { "Update package (.zip)" }
+                input type="file" id="commd_file" accept=".zip"
+                    style="background:#0f1117;border:1px solid #2d3147;border-radius:4px;padding:.45rem .7rem;color:#e2e8f0;width:100%";
+                small { "ZIP must contain: kaonic-commd, kaonic-commd.sha256, kaonic-commd.version, kaonic-commd.sig" }
+            }
+            div .actions {
+                button id="commd_btn" .btn.btn-primary type="button"
+                    onclick="doUpload('commd')" { "Upload & Install" }
+            }
+            div id="commd_status" .flash {}
+        }
+
+        // kaonic-gateway card
+        div .card {
+            div .card-title { "kaonic-gateway" }
+            p style="font-size:.85rem;color:#94a3b8;margin-bottom:1rem" {
+                "Gateway service. Installed: "
+                span id="gateway_version" style="color:#e2e8f0" { "loading…" }
+            }
+            div .field {
+                label { "Update package (.zip)" }
+                input type="file" id="gateway_file" accept=".zip"
+                    style="background:#0f1117;border:1px solid #2d3147;border-radius:4px;padding:.45rem .7rem;color:#e2e8f0;width:100%";
+                small { "ZIP must contain: kaonic-gateway, kaonic-gateway.sha256, kaonic-gateway.version, kaonic-gateway.sig" }
+            }
+            div .hint style="color:#f97316;font-size:.82rem;margin-bottom:.75rem" {
+                "⚠ The gateway service will restart after update. Dashboard will be briefly unavailable."
+            }
+            div .actions {
+                button id="gateway_btn" .btn.btn-primary type="button"
+                    onclick="doUpload('gateway')" { "Upload & Install" }
+            }
+            div id="gateway_status" .flash {}
+        }
+
+        script { (PreEscaped(UPDATE_JS)) }
     };
 
     layout(content)

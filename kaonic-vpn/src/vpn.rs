@@ -31,6 +31,17 @@ pub async fn setup_transport(
     .await
     .map_err(|e| format!("kaonic-ctrl connect error: {e:?}"))?;
 
+    // Queue initial radio settings into the channel before spawning so the
+    // interface picks them up on startup and programs the hardware immediately.
+    if let Some(radio_config) = ctrl_config.radio_config {
+        log::info!("applying saved radio config on boot (module {})", ctrl_config.module);
+        let _ = iface.radio_config_tx.try_send(radio_config);
+    }
+    if let Some(modulation) = ctrl_config.modulation {
+        log::info!("applying saved modulation on boot (module {})", ctrl_config.module);
+        let _ = iface.modulation_tx.try_send(modulation);
+    }
+
     transport
         .iface_manager()
         .lock()

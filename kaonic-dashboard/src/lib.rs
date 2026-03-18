@@ -12,4 +12,5 @@ pub fn router() -> Router {
     Router::new()
         .route("/", get(frames::get_dashboard))
         .route("/settings", get(pages::get_settings))
+        .route("/update", get(pages::get_update))
 }

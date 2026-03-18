@@ -1,5 +1,5 @@
 [workspace]
 resolver = "2"
-members = ["kaonic-dashboard", "kaonic-gateway", "kaonic-vpn", "kaonic-reticulum"]
+members = ["kaonic-dashboard", "kaonic-gateway", "kaonic-vpn", "kaonic-reticulum", "kaonic-update"]
 exclude = ["kaonic-settings", "kaonic-atak-bridge"]
 

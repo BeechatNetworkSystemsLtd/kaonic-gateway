@@ -54,9 +54,15 @@ function fmtOneRadio(r) {
   const ch   = rc ? (rc.channel ?? '—') : '—';
   const bw   = rc ? (rc.bandwidth_filter ?? '—') : '—';
   const mod  = fmtMod(r.modulation);
-  return `<div class="bridge-row" style="align-items:flex-start;flex-direction:column;gap:.4rem;padding:.75rem 0">
-    <span class="bridge-port">Module ${label}</span>
-    <span style="font-size:.82rem;color:#94a3b8">${freq}  ·  ch ${ch}  ·  ${bw}  ·  ${mod}</span>
+  const freqHz = rc ? rc.freq : 0;
+  const band = freqHz >= 2_000_000_000 ? '2.4 GHz' : 'Sub-GHz';
+  const bandColor = freqHz >= 2_000_000_000 ? '#7c85f5' : '#4ade80';
+  return `<div class="bridge-row" style="align-items:center;padding:.75rem 0">
+    <div style="flex:1;display:flex;flex-direction:column;gap:.4rem">
+      <span class="bridge-port">Module ${label}</span>
+      <span style="font-size:.82rem;color:#94a3b8">${freq}  ·  ch ${ch}  ·  ${bw}  ·  ${mod}</span>
+    </div>
+    <span style="font-size:1.15rem;font-weight:700;color:${bandColor};letter-spacing:.01em">${band}</span>
   </div>`;
 }
 function fmtRadio(modules) {
@@ -118,6 +124,7 @@ fn layout(title: &str, body: Markup) -> Markup {
                     nav {
                         a href="/" class="active" { "Dashboard" }
                         a href="/settings" { "Settings" }
+                        a href="/update" { "Update" }
                     }
                 }
                 main { (body) }
