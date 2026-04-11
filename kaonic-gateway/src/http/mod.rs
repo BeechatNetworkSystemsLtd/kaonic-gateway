@@ -1,35 +1,84 @@
 mod handlers;
+mod update;
+mod ws;
 
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 
-use axum::{Router, routing::get};
+use axum::extract::Path;
+use axum::http::header;
+use axum::response::IntoResponse;
+use axum::{
+    routing::{get, post},
+    Router,
+};
+use leptos::config::LeptosOptions;
+use leptos::prelude::*;
+use leptos_axum::{generate_route_list, LeptosRoutes};
+use rust_embed::Embed;
 
-use kaonic_gateway::atak::BridgeMetrics;
-use kaonic_gateway::settings::Settings;
-use kaonic_gateway::radio::SharedRadioClient;
+pub use kaonic_gateway::state::{AppState, SharedSettings};
 
-/// Shared settings handle passed to all API handlers.
-pub type SharedSettings = Arc<Mutex<Settings>>;
+#[derive(Embed)]
+#[folder = "assets/"]
+struct Assets;
 
-/// Shared application state for all HTTP handlers.
-#[derive(Clone)]
-pub struct AppState {
-    pub settings: SharedSettings,
-    pub atak_metrics: Vec<Arc<BridgeMetrics>>,
-    pub vpn_hash: String,
-    pub radio_client: SharedRadioClient,
-}
-
-/// Start the combined HTTP server (JSON API + dashboard UI). Runs until the process exits.
+/// Start the HTTP server: Leptos SSR pages + REST/WebSocket API. Runs forever.
 pub async fn serve(state: AppState, addr: SocketAddr) {
-    let api = Router::new()
-        .route("/api/settings",                get(handlers::get_settings).put(handlers::put_settings))
-        .route("/api/settings/radio/:module",  get(handlers::get_radio).put(handlers::put_radio))
-        .route("/api/status",                  get(handlers::get_status))
-        .with_state(state);
+    let leptos_options = LeptosOptions::builder()
+        .output_name("kaonic-gateway")
+        .site_root(".")
+        .site_pkg_dir("pkg")
+        .site_addr(addr)
+        .build();
 
-    let app = api.merge(kaonic_dashboard::router());
+    let routes = generate_route_list(kaonic_gateway::app::App);
+
+    // REST/WebSocket API + embedded static assets
+    let api = Router::new()
+        .route(
+            "/api/audio/{output}",
+            get(handlers::get_audio).put(handlers::put_audio),
+        )
+        .route(
+            "/api/settings",
+            get(handlers::get_settings).put(handlers::put_settings),
+        )
+        .route(
+            "/api/settings/radio/{module}",
+            get(handlers::get_radio).put(handlers::put_radio),
+        )
+        .route("/api/status", get(handlers::get_status))
+        .route("/api/info", get(handlers::get_info))
+        .route("/api/update/{target}/version", get(update::get_version))
+        .route("/api/update/{target}/upload", post(update::upload_update))
+        .route("/network/wifi/mode", post(handlers::post_wifi_mode))
+        .route("/network/wifi/connect", post(handlers::post_wifi_connect))
+        .route("/api/ws/status", get(ws::ws_status))
+        .route("/assets/{*path}", get(serve_asset))
+        // Convenience short-paths kept for compatibility
+        .route("/style.css", get(serve_style_css))
+        .route("/kaonic-logo.svg", get(serve_logo_svg))
+        .with_state(state.clone());
+
+    // Leptos SSR routes — inject AppState as leptos context for server functions
+    let leptos_app = {
+        let leptos_options = leptos_options.clone();
+        let state = state.clone();
+        Router::new()
+            .leptos_routes_with_context(
+                &leptos_options,
+                routes,
+                move || provide_context(state.clone()),
+                {
+                    let leptos_options = leptos_options.clone();
+                    move || kaonic_gateway::app::shell(leptos_options.clone())
+                },
+            )
+            .fallback(file_and_error_handler)
+            .with_state(leptos_options)
+    };
+
+    let app = api.merge(leptos_app);
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -37,4 +86,45 @@ pub async fn serve(state: AppState, addr: SocketAddr) {
 
     log::info!("HTTP server listening on http://{addr}");
     axum::serve(listener, app).await.expect("HTTP server error");
+}
+
+// ── Asset handlers ────────────────────────────────────────────────────────────
+
+async fn serve_asset(Path(path): Path<String>) -> impl IntoResponse {
+    serve_embedded(&path)
+}
+
+async fn serve_style_css() -> impl IntoResponse {
+    serve_embedded("style.css")
+}
+
+async fn serve_logo_svg() -> impl IntoResponse {
+    serve_embedded("kaonic-logo.svg")
+}
+
+fn serve_embedded(path: &str) -> axum::response::Response {
+    match Assets::get(path) {
+        Some(content) => {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            (
+                [(header::CONTENT_TYPE, mime.as_ref().to_string())],
+                content.data.into_owned(),
+            )
+                .into_response()
+        }
+        None => axum::http::StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn file_and_error_handler(
+    uri: axum::http::Uri,
+    axum::extract::State(options): axum::extract::State<LeptosOptions>,
+    req: axum::http::Request<axum::body::Body>,
+) -> axum::response::Response {
+    leptos_axum::file_and_error_handler(|opts: LeptosOptions| kaonic_gateway::app::shell(opts))(
+        uri,
+        axum::extract::State(options),
+        req,
+    )
+    .await
 }

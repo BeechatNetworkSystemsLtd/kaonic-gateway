@@ -40,12 +40,17 @@ impl KaonicCtrlInterface {
             cancel.clone(),
         )
         .await?;
-        Ok(Arc::new(Mutex::new(RadioClient::new(client, cancel).await?)))
+        Ok(Arc::new(Mutex::new(
+            RadioClient::new(client, cancel).await?,
+        )))
     }
 
     /// Create an interface for `module` using an already-connected `RadioClient`.
     pub fn new(radio_client: Arc<Mutex<RadioClient>>, module: usize) -> Self {
-        Self { radio_client, module }
+        Self {
+            radio_client,
+            module,
+        }
     }
 
     /// Spawn the interface tasks. Matches the pattern used by other Reticulum interfaces.

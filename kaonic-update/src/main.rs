@@ -14,10 +14,10 @@ use tower_http::limit::RequestBodyLimitLayer;
 
 mod update;
 
-use update::{Target, apply_update, get_version, validate_on_boot};
+use update::{apply_update, get_version, validate_on_boot, Target};
 
 const META_DIR: &str = "/etc/kaonic";
-const BIN_DIR:  &str = "/usr/bin";
+const BIN_DIR: &str = "/usr/bin";
 const MAX_UPLOAD_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
 
 /// kaonic-update: standalone OTA update server for kaonic packages.
@@ -31,7 +31,7 @@ struct Cmd {
 
 #[derive(Clone)]
 struct AppState {
-    commd:   Arc<Target>,
+    commd: Arc<Target>,
     gateway: Arc<Target>,
 }
 
@@ -41,18 +41,18 @@ unsafe impl Sync for AppState {}
 
 fn make_targets(meta_dir: &str, bin_dir: &str) -> (Arc<Target>, Arc<Target>) {
     let meta = PathBuf::from(meta_dir);
-    let bin  = PathBuf::from(bin_dir);
+    let bin = PathBuf::from(bin_dir);
     (
         Arc::new(Target {
-            name:     "commd",
+            name: "commd",
             bin_path: bin.join("kaonic-commd"),
-            service:  "kaonic-commd.service",
+            service: "kaonic-commd.service",
             meta_dir: meta.clone(),
         }),
         Arc::new(Target {
-            name:     "gateway",
+            name: "gateway",
             bin_path: bin.join("kaonic-gateway"),
-            service:  "kaonic-gateway.service",
+            service: "kaonic-gateway.service",
             meta_dir: meta,
         }),
     )
@@ -77,7 +77,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/api/update/:target/version", get(handle_version))
-        .route("/api/update/:target/upload",  post(handle_upload))
+        .route("/api/update/:target/upload", post(handle_upload))
         .layer(CorsLayer::permissive())
         .layer(RequestBodyLimitLayer::new(MAX_UPLOAD_BYTES))
         .with_state(state);
@@ -97,7 +97,7 @@ async fn handle_version(
 ) -> impl IntoResponse {
     match resolve_target(&state, &target) {
         Some(t) => Json(get_version(&t)).into_response(),
-        None    => (StatusCode::NOT_FOUND, "unknown target").into_response(),
+        None => (StatusCode::NOT_FOUND, "unknown target").into_response(),
     }
 }
 
@@ -108,29 +108,42 @@ async fn handle_upload(
 ) -> impl IntoResponse {
     let t = match resolve_target(&state, &target) {
         Some(t) => t,
-        None    => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"detail":"unknown target"}))).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"detail":"unknown target"})),
+            )
+                .into_response()
+        }
     };
 
     // Read the first multipart field as the ZIP bytes
     let zip_bytes: Bytes = loop {
         match multipart.next_field().await {
-            Ok(Some(field)) => {
-                match field.bytes().await {
-                    Ok(b) => break b,
-                    Err(e) => return (
+            Ok(Some(field)) => match field.bytes().await {
+                Ok(b) => break b,
+                Err(e) => {
+                    return (
                         StatusCode::BAD_REQUEST,
                         Json(serde_json::json!({"detail": format!("read error: {e}")})),
-                    ).into_response(),
+                    )
+                        .into_response()
                 }
+            },
+            Ok(None) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"detail": "no file uploaded"})),
+                )
+                    .into_response()
             }
-            Ok(None) => return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"detail": "no file uploaded"})),
-            ).into_response(),
-            Err(e) => return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"detail": format!("multipart error: {e}")})),
-            ).into_response(),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"detail": format!("multipart error: {e}")})),
+                )
+                    .into_response()
+            }
         }
     };
 
@@ -140,15 +153,19 @@ async fn handle_upload(
         .unwrap_or_else(|e| Err(format!("task panic: {e}")));
 
     match result {
-        Ok(msg)  => Json(serde_json::json!({"detail": msg})).into_response(),
-        Err(msg) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"detail": msg}))).into_response(),
+        Ok(msg) => Json(serde_json::json!({"detail": msg})).into_response(),
+        Err(msg) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"detail": msg})),
+        )
+            .into_response(),
     }
 }
 
 fn resolve_target(state: &AppState, name: &str) -> Option<Arc<Target>> {
     match name {
-        "commd"   => Some(state.commd.clone()),
+        "commd" => Some(state.commd.clone()),
         "gateway" => Some(state.gateway.clone()),
-        _         => None,
+        _ => None,
     }
 }

@@ -1,23 +1,43 @@
-use axum::extract::{Path, State};
+use axum::extract::{Form, Path, State};
 use axum::http::StatusCode;
 use axum::Json;
+use kaonic_gateway::app_types::RxFrameDto;
+use kaonic_gateway::audio::{AudioControlSnapshot, AudioControlState, AudioError, AudioOutput};
 use kaonic_gateway::config::GatewayConfig;
+use kaonic_gateway::network::{NetworkError, WifiMode};
 use kaonic_gateway::radio::RadioModuleConfig;
-use serde::Serialize;
+use kaonic_gateway::system_metrics::{
+    read_cpu_percent_async, read_fs_mb, read_mem_mb, read_os_details,
+};
+use serde::{Deserialize, Serialize};
 
 use super::AppState;
+
+// ── /api/info ────────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct InfoResponse {
+    pub serial: String,
+}
+
+pub async fn get_info(State(state): State<AppState>) -> Json<InfoResponse> {
+    Json(InfoResponse {
+        serial: state.serial.clone(),
+    })
+}
 
 /// `GET /api/settings` — return the full gateway config.
 pub async fn get_settings(
     State(state): State<AppState>,
 ) -> Result<Json<GatewayConfig>, StatusCode> {
-    let s = state.settings.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    s.load_config()
-        .map(Json)
-        .map_err(|err| {
-            log::error!("failed to load settings: {err}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })
+    let s = state
+        .settings
+        .lock()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    s.load_config().map(Json).map_err(|err| {
+        log::error!("failed to load settings: {err}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 /// `PUT /api/settings` — replace the full gateway config.
@@ -40,14 +60,19 @@ pub async fn get_radio(
     State(state): State<AppState>,
     Path(module): Path<usize>,
 ) -> Result<Json<RadioModuleConfig>, StatusCode> {
-    let s = state.settings.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let s = state
+        .settings
+        .lock()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     s.load_config()
         .map_err(|err| {
             log::error!("failed to load radio settings: {err}");
             StatusCode::INTERNAL_SERVER_ERROR
         })
         .and_then(|c| {
-            c.radio.module_configs.get(module)
+            c.radio
+                .module_configs
+                .get(module)
                 .cloned()
                 .map(Json)
                 .ok_or(StatusCode::NOT_FOUND)
@@ -62,7 +87,9 @@ pub async fn put_radio(
 ) -> StatusCode {
     log::info!(
         "put_radio: module={} radio_config={:?} modulation={:?}",
-        module, cfg.radio_config, cfg.modulation
+        module,
+        cfg.radio_config,
+        cfg.modulation
     );
 
     let save_result = {
@@ -75,17 +102,135 @@ pub async fn put_radio(
     }
     log::info!("put_radio: module={module} saved to DB");
 
-    let mut client = state.radio_client.lock().await;
-    match client.set_radio_config(module, cfg.radio_config).await {
-        Ok(_) => log::info!("put_radio: radio_config applied to module {module}"),
-        Err(e) => log::error!("put_radio: set_radio_config failed for module {module}: {e:?}"),
-    }
-    match client.set_modulation(module, cfg.modulation).await {
-        Ok(_) => log::info!("put_radio: modulation applied to module {module}"),
-        Err(e) => log::error!("put_radio: set_modulation failed for module {module}: {e:?}"),
+    if let Some(client) = state.radio_client.clone() {
+        let mut client = client.lock().await;
+        match client.set_radio_config(module, cfg.radio_config).await {
+            Ok(_) => log::info!("put_radio: radio_config applied to module {module}"),
+            Err(e) => {
+                log::error!("put_radio: set_radio_config failed for module {module}: {e:?}")
+            }
+        }
+        match client.set_modulation(module, cfg.modulation).await {
+            Ok(_) => log::info!("put_radio: modulation applied to module {module}"),
+            Err(e) => log::error!("put_radio: set_modulation failed for module {module}: {e:?}"),
+        }
+    } else {
+        log::info!("put_radio: running without radio backend, saved config only");
     }
 
     StatusCode::NO_CONTENT
+}
+
+// ── /api/audio ────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct PutAudioRequest {
+    pub volume: u8,
+    pub muted: bool,
+}
+
+pub async fn get_audio(
+    State(state): State<AppState>,
+    Path(output): Path<String>,
+) -> Result<Json<AudioControlSnapshot>, StatusCode> {
+    let output = AudioOutput::parse(&output).ok_or(StatusCode::NOT_FOUND)?;
+
+    state.audio.read(output).await.map(Json).map_err(|err| {
+        log::error!("failed to read {output:?} audio state: {err}");
+        map_audio_error(&err)
+    })
+}
+
+pub async fn put_audio(
+    State(state): State<AppState>,
+    Path(output): Path<String>,
+    Json(request): Json<PutAudioRequest>,
+) -> Result<Json<AudioControlSnapshot>, StatusCode> {
+    let output = AudioOutput::parse(&output).ok_or(StatusCode::NOT_FOUND)?;
+    let next = AudioControlState {
+        volume: request.volume,
+        muted: request.muted,
+    };
+
+    state
+        .audio
+        .write(output, next)
+        .await
+        .map(Json)
+        .map_err(|err| {
+            log::error!("failed to update {output:?} audio state: {err}");
+            map_audio_error(&err)
+        })
+}
+
+fn map_audio_error(err: &AudioError) -> StatusCode {
+    match err {
+        AudioError::InvalidVolume(_) => StatusCode::BAD_REQUEST,
+        AudioError::StatePoisoned(_)
+        | AudioError::TaskJoin(_)
+        | AudioError::CommandIo { .. }
+        | AudioError::CommandFailed { .. }
+        | AudioError::UnexpectedOutput(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+// ── /network/wifi actions ─────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct WifiModeForm {
+    pub mode: String,
+}
+
+#[derive(Deserialize)]
+pub struct WifiConnectForm {
+    pub ssid: String,
+    pub psk: String,
+}
+
+pub async fn post_wifi_mode(
+    State(state): State<AppState>,
+    Form(form): Form<WifiModeForm>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let mode = WifiMode::parse(&form.mode).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            NetworkError::InvalidMode(form.mode).to_string(),
+        )
+    })?;
+
+    state
+        .network
+        .set_wifi_mode(mode)
+        .await
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(map_network_error)
+}
+
+pub async fn post_wifi_connect(
+    State(state): State<AppState>,
+    Form(form): Form<WifiConnectForm>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    state
+        .network
+        .connect_wifi(&form.ssid, &form.psk)
+        .await
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(map_network_error)
+}
+
+fn map_network_error(err: NetworkError) -> (StatusCode, String) {
+    let status = match err {
+        NetworkError::InvalidMode(_)
+        | NetworkError::InvalidSsid
+        | NetworkError::InvalidPsk
+        | NetworkError::MissingStaConfig => StatusCode::BAD_REQUEST,
+        NetworkError::StatePoisoned
+        | NetworkError::TaskJoin(_)
+        | NetworkError::ModeFileWrite(_)
+        | NetworkError::CommandIo { .. }
+        | NetworkError::CommandFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, err.to_string())
 }
 
 // ── /api/status ─────────────────────────────────────────────────────────────
@@ -103,6 +248,9 @@ pub struct SystemStatus {
     cpu_percent: f32,
     ram_used_mb: u64,
     ram_total_mb: u64,
+    fs_free_mb: u64,
+    fs_total_mb: u64,
+    os_details: String,
 }
 
 #[derive(Serialize)]
@@ -111,82 +259,61 @@ pub struct StatusResponse {
     atak_bridges: Vec<AtakBridgeStatus>,
     system: SystemStatus,
     radio_modules: Vec<RadioModuleConfig>,
+    rx_frames: [Vec<RxFrameDto>; 2],
 }
 
 /// `GET /api/status` — live gateway status: ATAK counters, system resources, VPN hash, radio config.
 pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
+    Json(build_status(&state).await)
+}
+
+/// Build a `StatusResponse` from shared application state. Used by both the REST handler
+/// and the WebSocket streamer.
+pub async fn build_status(state: &AppState) -> StatusResponse {
     use std::sync::atomic::Ordering;
 
-    let atak_bridges = state.atak_metrics.iter().map(|m| AtakBridgeStatus {
-        port: m.port,
-        dest_hash: m.dest_hash.get().cloned().unwrap_or_default(),
-        rx_packets: m.rx_packets.load(Ordering::Relaxed),
-        tx_packets: m.tx_packets.load(Ordering::Relaxed),
-    }).collect();
+    let atak_bridges = state
+        .atak_metrics
+        .iter()
+        .map(|m| AtakBridgeStatus {
+            port: m.port,
+            dest_hash: m.dest_hash.get().cloned().unwrap_or_default(),
+            rx_packets: m.rx_packets.load(Ordering::Relaxed),
+            tx_packets: m.tx_packets.load(Ordering::Relaxed),
+        })
+        .collect();
 
-    let radio_modules = state.settings.lock().ok()
+    let radio_modules = state
+        .settings
+        .lock()
+        .ok()
         .and_then(|s| s.load_config().ok())
         .map(|c| c.radio.module_configs.to_vec())
         .unwrap_or_default();
 
-    Json(StatusResponse {
+    let rx_frames = [
+        state.rx_buffers[0].lock().await.iter().cloned().collect(),
+        state.rx_buffers[1].lock().await.iter().cloned().collect(),
+    ];
+
+    StatusResponse {
         vpn_hash: state.vpn_hash.clone(),
         atak_bridges,
-        system: read_system_status(),
+        system: read_system_status_async().await,
         radio_modules,
-    })
-}
-
-fn read_system_status() -> SystemStatus {
-    let mut s = read_mem_status();
-    s.cpu_percent = read_cpu_percent();
-    s
-}
-
-fn read_mem_status() -> SystemStatus {
-    let Ok(data) = std::fs::read_to_string("/proc/meminfo") else {
-        return SystemStatus { cpu_percent: 0.0, ram_used_mb: 0, ram_total_mb: 0 };
-    };
-    let mut total = 0u64;
-    let mut available = 0u64;
-    for line in data.lines() {
-        if let Some(rest) = line.strip_prefix("MemTotal:") {
-            total = rest.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0);
-        } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            available = rest.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0);
-        }
+        rx_frames,
     }
+}
+
+async fn read_system_status_async() -> SystemStatus {
+    let (ram_used_mb, ram_total_mb) = read_mem_mb();
+    let (fs_free_mb, fs_total_mb) = read_fs_mb();
     SystemStatus {
-        cpu_percent: 0.0,
-        ram_total_mb: total / 1024,
-        ram_used_mb: total.saturating_sub(available) / 1024,
+        cpu_percent: read_cpu_percent_async().await,
+        ram_used_mb,
+        ram_total_mb,
+        fs_free_mb,
+        fs_total_mb,
+        os_details: read_os_details(),
     }
 }
-
-fn read_cpu_percent() -> f32 {
-    // Read /proc/stat twice with a short sleep to calculate CPU usage delta.
-    // We do a single-sample approximation using idle vs total from one read,
-    // which is sufficient for a dashboard display.
-    fn parse_stat() -> Option<(u64, u64)> {
-        let data = std::fs::read_to_string("/proc/stat").ok()?;
-        let line = data.lines().next()?; // "cpu  ..."
-        let vals: Vec<u64> = line.split_whitespace()
-            .skip(1)
-            .filter_map(|v| v.parse().ok())
-            .collect();
-        if vals.len() < 4 { return None; }
-        let total: u64 = vals.iter().sum();
-        let idle = vals[3];
-        Some((idle, total))
-    }
-
-    let Some((idle1, total1)) = parse_stat() else { return 0.0 };
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    let Some((idle2, total2)) = parse_stat() else { return 0.0 };
-
-    let total_diff = total2.saturating_sub(total1) as f32;
-    let idle_diff  = idle2.saturating_sub(idle1) as f32;
-    if total_diff == 0.0 { return 0.0; }
-    ((total_diff - idle_diff) / total_diff * 100.0 * 10.0).round() / 10.0
-}
-

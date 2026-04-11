@@ -12,7 +12,9 @@ pub struct Settings {
 
 impl Settings {
     pub fn open(path: &str) -> Result<Self> {
-        Ok(Self { db: Database::open(path)? })
+        Ok(Self {
+            db: Database::open(path)?,
+        })
     }
 
     pub fn load_or_create_seed(&self) -> Result<String> {

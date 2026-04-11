@@ -5,4 +5,3 @@ pub mod vpn;
 pub use kaonic_reticulum::{KaonicCtrlInterface, RadioClient};
 #[cfg(feature = "run")]
 pub use vpn::run_vpn;
-

@@ -18,10 +18,18 @@ pub struct Target {
 }
 
 impl Target {
-    fn version_path(&self) -> PathBuf { self.meta_dir.join(format!("{}.version", self.bin_name())) }
-    fn hash_path(&self)    -> PathBuf { self.meta_dir.join(format!("{}.sha256", self.bin_name())) }
-    fn backup_path(&self)  -> PathBuf { self.meta_dir.join(format!("{}.bak",    self.bin_name())) }
-    fn cert_path(&self)    -> PathBuf { self.meta_dir.join("beechat-ota.pub.pem") }
+    fn version_path(&self) -> PathBuf {
+        self.meta_dir.join(format!("{}.version", self.bin_name()))
+    }
+    fn hash_path(&self) -> PathBuf {
+        self.meta_dir.join(format!("{}.sha256", self.bin_name()))
+    }
+    fn backup_path(&self) -> PathBuf {
+        self.meta_dir.join(format!("{}.bak", self.bin_name()))
+    }
+    fn cert_path(&self) -> PathBuf {
+        self.meta_dir.join("beechat-ota.pub.pem")
+    }
 
     fn bin_name(&self) -> &str {
         self.bin_path.file_name().unwrap().to_str().unwrap()
@@ -38,7 +46,7 @@ pub struct VersionInfo {
 pub fn get_version(target: &Target) -> VersionInfo {
     VersionInfo {
         version: read_trimmed(&target.version_path()),
-        hash:    read_trimmed(&target.hash_path()),
+        hash: read_trimmed(&target.hash_path()),
     }
 }
 
@@ -76,27 +84,36 @@ pub fn apply_update(target: &Target, zip_bytes: &[u8]) -> Result<String, String>
     // Extract ZIP
     let cursor = io::Cursor::new(zip_bytes);
     let mut archive = zip::ZipArchive::new(cursor).map_err(|e| format!("bad ZIP: {e}"))?;
-    archive.extract(tmp_path).map_err(|e| format!("ZIP extract: {e}"))?;
+    archive
+        .extract(tmp_path)
+        .map_err(|e| format!("ZIP extract: {e}"))?;
 
     let bin_name = target.bin_name().to_string();
-    let new_bin   = tmp_path.join(&bin_name);
+    let new_bin = tmp_path.join(&bin_name);
     let hash_file = tmp_path.join(format!("{bin_name}.sha256"));
-    let ver_file  = tmp_path.join(format!("{bin_name}.version"));
-    let sig_file  = tmp_path.join(format!("{bin_name}.sig"));
+    let ver_file = tmp_path.join(format!("{bin_name}.version"));
+    let sig_file = tmp_path.join(format!("{bin_name}.sig"));
 
     // Required files
     for f in [&new_bin, &hash_file, &ver_file, &sig_file] {
         if !f.exists() {
-            return Err(format!("missing {} in OTA package", f.file_name().unwrap().to_string_lossy()));
+            return Err(format!(
+                "missing {} in OTA package",
+                f.file_name().unwrap().to_string_lossy()
+            ));
         }
     }
 
     // SHA-256 check
     let expected_hash = fs::read_to_string(&hash_file)
-        .map_err(|e| format!("read hash file: {e}"))?.trim().to_string();
+        .map_err(|e| format!("read hash file: {e}"))?
+        .trim()
+        .to_string();
     let actual_hash = sha256_file(&new_bin).map_err(|e| format!("hash new binary: {e}"))?;
     if expected_hash != actual_hash {
-        return Err(format!("SHA-256 mismatch: expected {expected_hash}, got {actual_hash}"));
+        return Err(format!(
+            "SHA-256 mismatch: expected {expected_hash}, got {actual_hash}"
+        ));
     }
 
     // Signature verification (skipped if cert absent — dev/test mode)
@@ -104,7 +121,11 @@ pub fn apply_update(target: &Target, zip_bytes: &[u8]) -> Result<String, String>
     if cert.exists() {
         verify_signature(&new_bin, &sig_file, &cert)?;
     } else {
-        log::warn!("[{}] OTA cert not found at {:?} — skipping signature check", target.name, cert);
+        log::warn!(
+            "[{}] OTA cert not found at {:?} — skipping signature check",
+            target.name,
+            cert
+        );
     }
 
     // Stop service, backup, replace
@@ -112,8 +133,7 @@ pub fn apply_update(target: &Target, zip_bytes: &[u8]) -> Result<String, String>
     let _ = systemctl("stop", target.service);
     backup_current(target);
 
-    fs::copy(&new_bin, &target.bin_path)
-        .map_err(|e| format!("copy binary: {e}"))?;
+    fs::copy(&new_bin, &target.bin_path).map_err(|e| format!("copy binary: {e}"))?;
     make_executable(&target.bin_path).map_err(|e| format!("chmod: {e}"))?;
 
     let _ = systemctl("start", target.service);
@@ -139,7 +159,10 @@ pub fn apply_update(target: &Target, zip_bytes: &[u8]) -> Result<String, String>
         log::info!("[{}] {}", target.name, msg);
         Ok(msg)
     } else {
-        log::error!("[{}] new binary failed to start — rolling back", target.name);
+        log::error!(
+            "[{}] new binary failed to start — rolling back",
+            target.name
+        );
         let _ = systemctl("stop", target.service);
         restore_backup(target);
         let _ = systemctl("start", target.service);
@@ -161,9 +184,7 @@ fn read_trimmed(path: &Path) -> Option<String> {
 }
 
 fn systemctl(action: &str, service: &str) -> io::Result<()> {
-    Command::new("systemctl")
-        .args([action, service])
-        .status()?;
+    Command::new("systemctl").args([action, service]).status()?;
     Ok(())
 }
 

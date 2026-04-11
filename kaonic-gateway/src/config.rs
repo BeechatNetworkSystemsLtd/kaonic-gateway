@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::radio::HardwareRadioConfig;
 
-fn default_announce_freq_secs() -> u32 { 1 }
+fn default_announce_freq_secs() -> u32 {
+    1
+}
 
 /// Full application configuration: VPN settings + radio hardware config.
 #[derive(Debug, Clone, Deserialize, Serialize)]

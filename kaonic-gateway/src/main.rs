@@ -1,7 +1,7 @@
-//! kaonic-gateway: Reticulum VPN gateway using kaonic radio hardware
-
+/// kaonic-gateway: Reticulum VPN gateway using kaonic radio hardware
 mod http;
 
+use std::path::Path;
 use std::process;
 use std::sync::Arc;
 
@@ -19,7 +19,6 @@ use tokio;
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_DB_PATH: &str = "kaonic-gateway.db";
-
 /// kaonic-gateway: VPN over Reticulum using the kaonic radio hardware.
 #[derive(Parser)]
 #[command(name = "kaonic-gateway", version)]
@@ -32,8 +31,16 @@ pub struct Command {
     pub http_addr: std::net::SocketAddr,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), process::ExitCode> {
+fn main() -> Result<(), process::ExitCode> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024) // 8 MB — Leptos SSR view trees are deep
+        .build()
+        .expect("tokio runtime")
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<(), process::ExitCode> {
     let cmd = Command::parse();
 
     let db_path =
@@ -59,11 +66,27 @@ async fn main() -> Result<(), process::ExitCode> {
         .parse_default_env()
         .init();
 
+    let webapp_only = should_run_webapp_only();
+
     let serial = std::fs::read_to_string("/etc/kaonic/kaonic_serial")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
     log::info!("device serial: {serial}");
-    kaonic_dashboard::set_serial(serial);
+
+    if webapp_only {
+        log::info!("starting in webapp-only mode; skipping radio and transport initialization");
+        let app_state = AppState::new(
+            settings.clone(),
+            Vec::new(),
+            "webapp-only".into(),
+            None,
+            serial,
+        );
+
+        tokio::spawn(http::serve(app_state, cmd.http_addr));
+        shutdown_signal(CancellationToken::new()).await;
+        return Ok(());
+    }
 
     let seed = settings
         .lock()
@@ -84,9 +107,9 @@ async fn main() -> Result<(), process::ExitCode> {
     let radio_client: SharedRadioClient = connect_radio_client(default_listen, server_addr)
         .await
         .map_err(|e| {
-            log::error!("kaonic-ctrl connect error: {e:?}");
-            process::ExitCode::FAILURE
-        })?;
+        log::error!("kaonic-ctrl connect error: {e:?}");
+        process::ExitCode::FAILURE
+    })?;
 
     let mut transport_cfg = TransportConfig::new("kaonic-gateway", &id, true);
     transport_cfg.set_retransmit(true);
@@ -124,15 +147,81 @@ async fn main() -> Result<(), process::ExitCode> {
         });
     }
 
-    tokio::spawn(http::serve(
-        AppState {
-            settings: settings.clone(),
-            atak_metrics,
-            vpn_hash,
-            radio_client,
-        },
-        cmd.http_addr,
-    ));
+    let app_state = AppState::new(
+        settings.clone(),
+        atak_metrics,
+        vpn_hash,
+        Some(radio_client.clone()),
+        serial,
+    );
+
+    // Spawn rx frame listener — fills per-module ring buffers used by the WS feed.
+    {
+        use kaonic_gateway::app_types::RxFrameDto;
+        use kaonic_gateway::state::RX_BUF_SIZE;
+        use tokio::sync::broadcast::error::RecvError;
+
+        let rx_bufs = app_state.rx_buffers.clone();
+        let mut rx = radio_client.lock().await.module_receive();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(recv) => {
+                        let module = recv.module.min(1);
+                        let data_len = recv.frame.len as usize;
+                        let data = &recv.frame.data[..data_len];
+                        let hex = data
+                            .iter()
+                            .take(8)
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let entry = RxFrameDto {
+                            module,
+                            direction: "rx".into(),
+                            rssi: recv.rssi,
+                            len: recv.frame.len,
+                            hex,
+                            ts,
+                        };
+                        let mut buf = rx_bufs[module].lock().await;
+                        buf.push_front(entry);
+                        buf.truncate(RX_BUF_SIZE);
+                    }
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    // Keepalive — ping kaonic-commd every 30 s so the UDP server never removes us as a
+    // known client (kaonic-commd expires idle clients after 120 s). Without this we
+    // stop receiving ReceiveModule frames after 2 minutes.
+    {
+        let rc = radio_client.clone();
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            interval.tick().await; // skip the immediate first tick
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if let Err(e) = rc.lock().await.ping().await {
+                            log::warn!("keepalive ping failed: {e:?}");
+                        }
+                    }
+                    _ = c.cancelled() => break,
+                }
+            }
+        });
+    }
+
+    tokio::spawn(http::serve(app_state, cmd.http_addr));
 
     shutdown_signal(cancel.clone()).await;
 
@@ -149,6 +238,15 @@ async fn main() -> Result<(), process::ExitCode> {
     // })
     //
     Ok(())
+}
+
+fn should_run_webapp_only() -> bool {
+    if let Ok(value) = std::env::var("KAONIC_GATEWAY_WEBAPP_ONLY") {
+        let value = value.trim().to_ascii_lowercase();
+        return matches!(value.as_str(), "1" | "true" | "yes" | "on");
+    }
+
+    !cfg!(target_os = "linux") || !Path::new("/etc/kaonic/kaonic_serial").exists()
 }
 
 /// Wait for Ctrl-C or SIGTERM, then cancel the token.

@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use rand::RngCore;
-use rusqlite::{Connection, Result, params};
+use rusqlite::{params, Connection, Result};
 use serde_json;
 
 use crate::config::GatewayConfig;
@@ -35,9 +35,15 @@ impl Database {
     }
 
     fn get(&self, key: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare_cached("SELECT value FROM settings WHERE key = ?1")?;
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT value FROM settings WHERE key = ?1")?;
         let mut rows = stmt.query(params![key])?;
-        Ok(if let Some(row) = rows.next()? { Some(row.get(0)?) } else { None })
+        Ok(if let Some(row) = rows.next()? {
+            Some(row.get(0)?)
+        } else {
+            None
+        })
     }
 
     fn set(&self, key: &str, value: &str) -> Result<()> {
@@ -65,17 +71,22 @@ impl Database {
     }
 
     pub fn load_config(&self) -> Result<GatewayConfig> {
-        let network_str = self.get("network")?.unwrap_or_else(|| DEFAULT_NETWORK.to_string());
+        let network_str = self
+            .get("network")?
+            .unwrap_or_else(|| DEFAULT_NETWORK.to_string());
         let network = cidr::Ipv4Cidr::from_str(&network_str).map_err(|e| {
             rusqlite::Error::InvalidParameterName(format!("invalid network '{network_str}': {e}"))
         })?;
 
-        let announce_freq_secs = self.get("announce_freq_secs")?
+        let announce_freq_secs = self
+            .get("announce_freq_secs")?
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(DEFAULT_ANNOUNCE_FREQ_SECS);
 
         let peers = {
-            let mut stmt = self.conn.prepare("SELECT destination_hash FROM peers ORDER BY destination_hash")?;
+            let mut stmt = self
+                .conn
+                .prepare("SELECT destination_hash FROM peers ORDER BY destination_hash")?;
             let rows = stmt.query_map([], |row| row.get(0))?;
             rows.collect::<Result<Vec<String>>>()?
         };
@@ -83,20 +94,44 @@ impl Database {
         let defaults = HardwareRadioConfig::default();
         let module_configs = std::array::from_fn(|i| {
             let suffix = format!("_{i}");
-            let radio_config = self.get(&format!("kaonic_ctrl_radio_config{suffix}"))
-                .ok().flatten()
-                .or_else(|| if i == 0 { self.get("kaonic_ctrl_radio_config").ok()? } else { None })
+            let radio_config = self
+                .get(&format!("kaonic_ctrl_radio_config{suffix}"))
+                .ok()
+                .flatten()
+                .or_else(|| {
+                    if i == 0 {
+                        self.get("kaonic_ctrl_radio_config").ok()?
+                    } else {
+                        None
+                    }
+                })
                 .and_then(|v| serde_json::from_str(&v).ok())
                 .unwrap_or_else(|| defaults.module_configs[i].radio_config.clone());
-            let modulation = self.get(&format!("kaonic_ctrl_modulation{suffix}"))
-                .ok().flatten()
-                .or_else(|| if i == 0 { self.get("kaonic_ctrl_modulation").ok()? } else { None })
+            let modulation = self
+                .get(&format!("kaonic_ctrl_modulation{suffix}"))
+                .ok()
+                .flatten()
+                .or_else(|| {
+                    if i == 0 {
+                        self.get("kaonic_ctrl_modulation").ok()?
+                    } else {
+                        None
+                    }
+                })
                 .and_then(|v| serde_json::from_str(&v).ok())
                 .unwrap_or_else(|| defaults.module_configs[i].modulation.clone());
-            RadioModuleConfig { radio_config, modulation }
+            RadioModuleConfig {
+                radio_config,
+                modulation,
+            }
         });
 
-        Ok(GatewayConfig { network, peers, announce_freq_secs, radio: HardwareRadioConfig { module_configs } })
+        Ok(GatewayConfig {
+            network,
+            peers,
+            announce_freq_secs,
+            radio: HardwareRadioConfig { module_configs },
+        })
     }
 
     pub fn save_config(&self, config: &GatewayConfig) -> Result<()> {

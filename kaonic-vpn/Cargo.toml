@@ -5,11 +5,12 @@ edition = "2021"
 rust-version = "1.85"
 
 [features]
-run = ["dep:rns-vpn", "dep:reticulum", "dep:kaonic-reticulum",
-       "dep:tokio-util", "dep:cidr-v3"]
+# run = ["dep:rns-vpn", "dep:reticulum", "dep:kaonic-reticulum",
+#        "dep:tokio-util", "dep:cidr-v3"]  # disabled: rns-vpn pins tokio 1.44 (incompatible with leptos 0.8)
+run = ["dep:reticulum", "dep:kaonic-reticulum", "dep:tokio-util", "dep:cidr-v3"]
 
 [dependencies]
-rns-vpn          = { git = "https://github.com/BeechatNetworkSystemsLtd/rns-vpn-rs", optional = true }
+# rns-vpn = { git = "https://github.com/BeechatNetworkSystemsLtd/rns-vpn-rs", optional = true }  # disabled: pins tokio 1.44
 reticulum        = { git = "https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs", version = "0.1.*", optional = true }
 kaonic-reticulum = { path = "../kaonic-reticulum", optional = true }
 cidr-v3          = { package = "cidr", version = "0.3", features = ["serde"], optional = true }

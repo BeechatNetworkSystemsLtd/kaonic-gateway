@@ -13,13 +13,14 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 pub const ATAK_PORTS: &[(u16, Ipv4Addr)] = &[
-    (6969,  Ipv4Addr::new(239, 2,  3,  1)),
+    (6969, Ipv4Addr::new(239, 2, 3, 1)),
     (17012, Ipv4Addr::new(224, 10, 10, 1)),
 ];
 
 /// Multicast group for each well-known ATAK port.
 pub fn mcast_group_for_port(port: u16) -> Ipv4Addr {
-    ATAK_PORTS.iter()
+    ATAK_PORTS
+        .iter()
         .find(|(p, _)| *p == port)
         .map(|(_, g)| *g)
         .unwrap_or(Ipv4Addr::new(239, 2, 3, 1))
@@ -113,7 +114,10 @@ impl AtakBridge {
             .unwrap_or(Ipv4Addr::UNSPECIFIED); // fallback — may fail but won't abort
 
         match rx_sock.join_multicast_v4(&mcast_group_for_port(port), &local_addr) {
-            Ok(_) => log::info!("atak-bridge:{port}: joined multicast {} via {local_addr}", mcast_group_for_port(port)),
+            Ok(_) => log::info!(
+                "atak-bridge:{port}: joined multicast {} via {local_addr}",
+                mcast_group_for_port(port)
+            ),
             Err(e) => log::warn!("atak-bridge:{port}: multicast join on {local_addr} failed: {e}"),
         }
 
@@ -122,7 +126,8 @@ impl AtakBridge {
         // ── UDP send sockets — one per non-loopback IPv4 interface ──────
         // Setting IP_MULTICAST_IF tells the OS which interface to egress on.
         // We create one socket per interface so the packet goes out on all of them.
-        let mcast_target: std::net::SocketAddr = SocketAddrV4::new(mcast_group_for_port(port), port).into();
+        let mcast_target: std::net::SocketAddr =
+            SocketAddrV4::new(mcast_group_for_port(port), port).into();
         let udp_tx_sockets: Arc<Vec<UdpSocket>> = Arc::new(
             if_addrs::get_if_addrs()
                 .unwrap_or_default()
