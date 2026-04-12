@@ -88,47 +88,56 @@ const RADIO_WS_JS: &str = r#"
     function formatKBytes(bytes) {
         return (bytes / 1024).toFixed(1);
     }
+    function rssiClass(frame) {
+        if (frame.direction === 'tx') {
+            return 'td-rssi';
+        }
+        var value = Number(frame.rssi);
+        if (!Number.isFinite(value)) {
+            return 'td-rssi';
+        }
+        if (value <= -100) {
+            return 'td-rssi td-rssi-bad';
+        }
+        if (value <= -80) {
+            return 'td-rssi td-rssi-warn';
+        }
+        return 'td-rssi td-rssi-good';
+    }
     ws.onmessage = function(ev) {
         try {
             var d = JSON.parse(ev.data);
             var frames = d.rx_frames || [[], []];
+            var frameStats = d.frame_stats || [{}, {}];
             [0, 1].forEach(function(i) {
                 var tbody = document.getElementById('rx-frames-' + i);
                 var stats = document.getElementById('rx-stats-summary-' + i);
                 var rssi = document.getElementById('rx-stats-rssi-' + i);
                 if (!tbody || !stats || !rssi) return;
                 var list = frames[i] || [];
-                var rxCount = 0;
-                var rxBytes = 0;
-                var txCount = 0;
-                var txBytes = 0;
-                list.forEach(function(f) {
-                    var len = Number(f.len) || 0;
-                    if (f.direction === 'tx') {
-                        txCount += 1;
-                        txBytes += len;
-                    } else {
-                        rxCount += 1;
-                        rxBytes += len;
-                    }
-                });
+                var totals = frameStats[i] || {};
+                var rxCount = Number(totals.rx_frames) || 0;
+                var rxBytes = Number(totals.rx_bytes) || 0;
+                var txCount = Number(totals.tx_frames) || 0;
+                var txBytes = Number(totals.tx_bytes) || 0;
                 stats.textContent = 'RX: ' + rxCount + ' frames, ' + formatKBytes(rxBytes)
                     + ' KB | TX: ' + txCount + ' frames, ' + formatKBytes(txBytes) + ' KB';
-                rssi.textContent = list.length > 0
-                    ? 'Last RSSI: ' + list[list.length - 1].rssi + ' dBm'
+                rssi.textContent = totals.last_rssi !== null && totals.last_rssi !== undefined
+                    ? 'Last RSSI: ' + totals.last_rssi + ' dBm'
                     : 'Last RSSI: —';
                 if (list.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="5" class="frames-empty">No frames received</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="5" class="frames-empty">No frames observed</td></tr>';
                     return;
                 }
                 tbody.innerHTML = list.map(function(f) {
                     var t = new Date(f.ts * 1000).toLocaleTimeString();
                     var dir = f.direction === 'tx' ? '\u2191' : '\u2193';
-                    return '<tr><td class="td-trx">' + dir + '</td>'
+                    var trxClass = f.direction === 'tx' ? 'td-trx td-trx-tx' : 'td-trx td-trx-rx';
+                    return '<tr><td class="' + trxClass + '">' + dir + '</td>'
                          + '<td class="td-time">' + t + '</td>'
-                          + '<td class="td-rssi">' + f.rssi + ' dBm</td>'
-                          + '<td class="td-len">' + f.len + ' B</td>'
-                          + '<td class="td-hex">' + (f.hex || '—') + '</td></tr>';
+                           + '<td class="' + rssiClass(f) + '">' + f.rssi + ' dBm</td>'
+                           + '<td class="td-len">' + f.len + ' B</td>'
+                           + '<td class="td-hex">' + (f.hex || '—') + '</td></tr>';
                 }).join('');
             });
         } catch(e) {}
@@ -382,7 +391,15 @@ fn RadioModuleForm(index: usize, module: RadioModuleConfigDto) -> impl IntoView 
         var bs=document.getElementById('band-sub-{index}'),b2=document.getElementById('band-24-{index}');
         var ms=document.getElementById('ms{index}'),mo=document.getElementById('mo{index}'),mq=document.getElementById('mq{index}');
         var applyBtn=document.getElementById('apply-btn-{index}'),resetBtn=document.getElementById('reset-btn-{index}');
+        var testBtn=document.getElementById('test-btn-{index}');
         var status=document.getElementById('apply-status-{index}');
+        var testModal=document.getElementById('radio-test-modal-{index}');
+        var testForm=document.getElementById('radio-test-form-{index}');
+        var testInput=document.getElementById('radio-test-message-{index}');
+        var testStatus=document.getElementById('radio-test-status-{index}');
+        var testSendBtn=document.getElementById('radio-test-send-{index}');
+        var testCounter=document.getElementById('radio-test-count-{index}');
+        var closeTestButtons=document.querySelectorAll('[data-close-radio-test="{index}"]');
         var bands={{
             sub:{{label:'sub-GHz',freqMin:389.5,freqMax:1020.0,channelMax:255}},
             b24:{{label:'2.4 GHz',freqMin:2400.0,freqMax:2483.5,channelMax:511}}
@@ -490,6 +507,73 @@ fn RadioModuleForm(index: usize, module: RadioModuleConfigDto) -> impl IntoView 
         var qtx=document.getElementById('qtx-mq{index}'),qtxv=document.getElementById('qtxv-mq{index}');
         if(otx){{otx.addEventListener('input',function(){{syncTxValue(otx,otxv);}});syncTxValue(otx,otxv);}}
         if(qtx){{qtx.addEventListener('input',function(){{syncTxValue(qtx,qtxv);}});syncTxValue(qtx,qtxv);}}
+        function setTestStatus(text, className){{
+            if(!testStatus) return;
+            testStatus.textContent=text;
+            testStatus.className=className || '';
+        }}
+        function updateTestCount(){{
+            if(!testInput || !testCounter) return;
+            testCounter.textContent=String(testInput.value.length) + ' / 2047';
+        }}
+        function openTestModal(){{
+            if(!testModal) return;
+            testModal.hidden=false;
+            document.body.classList.add('modal-open');
+            setTestStatus('', '');
+            updateTestCount();
+            if(testInput) testInput.focus();
+        }}
+        function closeTestModal(){{
+            if(!testModal) return;
+            testModal.hidden=true;
+            document.body.classList.remove('modal-open');
+            setTestStatus('', '');
+        }}
+        function sendTestMessage(){{
+            if(!testInput || !testSendBtn) return;
+            var message=testInput.value || '';
+            if(!message.trim()) {{
+                setTestStatus('Message is required.', 'flash-err');
+                return;
+            }}
+            if(message.length > 2047) {{
+                setTestStatus('Message exceeds 2047 characters.', 'flash-err');
+                return;
+            }}
+            testSendBtn.disabled=true;
+            setTestStatus('Sending…', 'flash-ok');
+            fetch('/api/radio/{index}/test', {{
+                method:'POST',
+                headers:{{'Content-Type':'application/json'}},
+                body:JSON.stringify({{message:message}})
+            }}).then(function(r){{
+                if(!r.ok){{
+                    return r.text().then(function(t){{ throw new Error(t || ('HTTP ' + r.status)); }});
+                }}
+                return r.json();
+            }}).then(function(resp){{
+                status.textContent=resp.status || '✓ Test frame sent';
+                status.className='flash-ok';
+                closeTestModal();
+                testInput.value='';
+                updateTestCount();
+            }}).catch(function(err){{
+                setTestStatus('Error: ' + (err.message || err), 'flash-err');
+            }}).finally(function(){{
+                testSendBtn.disabled=false;
+            }});
+        }}
+        if(testBtn){{testBtn.addEventListener('click',openTestModal);}}
+        if(testInput){{testInput.addEventListener('input',updateTestCount); updateTestCount();}}
+        closeTestButtons.forEach(function(btn){{ btn.addEventListener('click', closeTestModal); }});
+        if(testModal){{
+            testModal.addEventListener('click', function(ev){{ if(ev.target===testModal) closeTestModal(); }});
+        }}
+        if(testForm){{
+            testForm.addEventListener('submit', function(ev){{ ev.preventDefault(); sendTestMessage(); }});
+        }}
+        window.addEventListener('keydown', function(ev){{ if(ev.key==='Escape' && testModal && !testModal.hidden) closeTestModal(); }});
         // Apply button
         var MCS=['BpskC1_2_4x','BpskC1_2_2x','QpskC1_2_2x','QpskC1_2','QpskC3_4','QamC1_2','QamC3_4'];
         var BWOPT=['Option1','Option2','Option3','Option4'];
@@ -639,6 +723,11 @@ fn RadioModuleForm(index: usize, module: RadioModuleConfigDto) -> impl IntoView 
             </div>
 
             <div class="form-actions">
+                <div class="radio-form-left">
+                    <button type="button" id=format!("test-btn-{index}") class="btn-secondary">
+                        "Test"
+                    </button>
+                </div>
                 <span id=format!("apply-status-{index}")></span>
                 <button type="button" id=format!("reset-btn-{index}") class="btn-secondary">
                     "Reset"
@@ -646,6 +735,40 @@ fn RadioModuleForm(index: usize, module: RadioModuleConfigDto) -> impl IntoView 
                 <button type="button" id=format!("apply-btn-{index}") class="btn-apply">
                     "Apply"
                 </button>
+            </div>
+            <div class="modal-backdrop" id=format!("radio-test-modal-{index}") hidden>
+                <div class="modal-card">
+                    <div class="modal-header">
+                        <h2 class="modal-title">{format!("Test {}", radio_label(index))}</h2>
+                        <button type="button" class="modal-close" data-close-radio-test=index.to_string()>"×"</button>
+                    </div>
+                    <form id=format!("radio-test-form-{index}") class="modal-form">
+                        <label class="form-label" for=format!("radio-test-message-{index}")>
+                            "Message"
+                        </label>
+                        <textarea
+                            id=format!("radio-test-message-{index}")
+                            class="form-textarea radio-test-textarea"
+                            rows="7"
+                            maxlength="2047"
+                            placeholder="Type a test message to transmit on this radio module"
+                            required
+                        ></textarea>
+                        <div class="radio-test-meta">
+                            <span class="card-body-text">"Max 2047 characters"</span>
+                            <span class="card-body-text" id=format!("radio-test-count-{index}")>"0 / 2047"</span>
+                        </div>
+                        <div id=format!("radio-test-status-{index}")></div>
+                        <div class="modal-actions">
+                            <button type="button" class="btn-secondary" data-close-radio-test=index.to_string()>
+                                "Cancel"
+                            </button>
+                            <button type="submit" class="btn-primary" id=format!("radio-test-send-{index}")>
+                                "Send"
+                            </button>
+                        </div>
+                    </form>
+                </div>
             </div>
             <script>{js}</script>
         </div>

@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicI32, AtomicU64};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::Mutex as TokioMutex;
@@ -14,11 +15,25 @@ pub type SharedAudioService = Arc<AudioService>;
 pub type SharedNetworkService = Arc<NetworkService>;
 pub type SharedSettings = Arc<Mutex<Settings>>;
 pub type RxFrameBuffer = Arc<TokioMutex<VecDeque<RxFrameDto>>>;
+pub type SharedFrameStats = Arc<FrameStats>;
 
-pub const RX_BUF_SIZE: usize = 128;
+pub const RX_BUF_SIZE: usize = 256;
 
 fn empty_rx_buffer() -> RxFrameBuffer {
     Arc::new(TokioMutex::new(VecDeque::new()))
+}
+
+fn empty_frame_stats() -> SharedFrameStats {
+    Arc::new(FrameStats::default())
+}
+
+#[derive(Default)]
+pub struct FrameStats {
+    pub rx_frames: AtomicU64,
+    pub rx_bytes: AtomicU64,
+    pub tx_frames: AtomicU64,
+    pub tx_bytes: AtomicU64,
+    pub last_rssi: AtomicI32,
 }
 
 /// Shared application state — injected as leptos context for server functions.
@@ -31,8 +46,9 @@ pub struct AppState {
     pub vpn_hash: String,
     pub radio_client: Option<SharedRadioClient>,
     pub serial: String,
-    /// Ring buffers of recent received frames, one per module (index 0 = A, 1 = B).
+    /// Ring buffers of recent frame events, one per module (index 0 = A, 1 = B).
     pub rx_buffers: [RxFrameBuffer; 2],
+    pub frame_stats: [SharedFrameStats; 2],
 }
 
 impl AppState {
@@ -52,6 +68,7 @@ impl AppState {
             radio_client,
             serial,
             rx_buffers: [empty_rx_buffer(), empty_rx_buffer()],
+            frame_stats: [empty_frame_stats(), empty_frame_stats()],
         }
     }
 }

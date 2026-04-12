@@ -35,6 +35,19 @@ pub async fn serve(state: AppState, addr: SocketAddr) {
 
     // REST/WebSocket API + embedded static assets
     let api = Router::new()
+        .route("/api/audio/cards", get(handlers::get_audio_cards))
+        .route(
+            "/api/audio/{card}/save",
+            post(handlers::post_audio_card_save),
+        )
+        .route(
+            "/api/audio/{card}/{output}/test",
+            post(handlers::post_audio_control_test),
+        )
+        .route(
+            "/api/audio/{card}/{output}",
+            get(handlers::get_audio_control).put(handlers::put_audio_control),
+        )
         .route(
             "/api/audio/{output}",
             get(handlers::get_audio).put(handlers::put_audio),
@@ -47,8 +60,11 @@ pub async fn serve(state: AppState, addr: SocketAddr) {
             "/api/settings/radio/{module}",
             get(handlers::get_radio).put(handlers::put_radio),
         )
+        .route("/api/radio/{module}/test", post(handlers::post_radio_test))
+        .route("/api/system/reboot", post(handlers::post_system_reboot))
         .route("/api/status", get(handlers::get_status))
         .route("/api/info", get(handlers::get_info))
+        .route("/api/network/snapshot", get(handlers::get_network_snapshot))
         .route("/api/update/{target}/version", get(update::get_version))
         .route("/api/update/{target}/upload", post(update::upload_update))
         .route("/network/wifi/mode", post(handlers::post_wifi_mode))

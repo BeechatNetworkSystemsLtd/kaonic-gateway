@@ -1,3 +1,5 @@
+use crate::app_types::ServiceStatusDto;
+
 pub async fn read_cpu_percent_async() -> f32 {
     let Some((idle1, total1)) = parse_stat() else {
         return 0.0;
@@ -43,7 +45,8 @@ pub fn read_fs_mb() -> (u64, u64) {
     {
         use std::ffi::CString;
 
-        let Ok(path) = CString::new("/") else {
+        let probe_path = user_filesystem_probe_path();
+        let Ok(path) = CString::new(probe_path.to_string_lossy().into_owned()) else {
             return (0, 0);
         };
         let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
@@ -79,6 +82,150 @@ pub fn read_os_details() -> String {
     }
 }
 
+pub fn read_hostname() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "Unknown".into())
+}
+
+pub fn read_cpu_model() -> String {
+    let Ok(data) = std::fs::read_to_string("/proc/cpuinfo") else {
+        return "Unknown".into();
+    };
+
+    for key in ["model name", "Hardware", "Processor", "Model"] {
+        for line in data.lines() {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            if name.trim() == key {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return value.to_string();
+                }
+            }
+        }
+    }
+
+    "Unknown".into()
+}
+
+pub fn read_architecture() -> String {
+    #[cfg(unix)]
+    {
+        let mut uts = std::mem::MaybeUninit::<libc::utsname>::uninit();
+        let rc = unsafe { libc::uname(uts.as_mut_ptr()) };
+        if rc == 0 {
+            let uts = unsafe { uts.assume_init() };
+            let machine = unsafe { std::ffi::CStr::from_ptr(uts.machine.as_ptr()) };
+            let value = machine.to_string_lossy().trim().to_string();
+            if !value.is_empty() {
+                return value;
+            }
+        }
+    }
+
+    std::env::consts::ARCH.into()
+}
+
+pub fn read_cpu_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+}
+
+pub fn read_gateway_services() -> Vec<ServiceStatusDto> {
+    [
+        "kaonic-commd.service",
+        "kaonic-gateway.service",
+        "kaonic-update.service",
+    ]
+    .into_iter()
+    .map(read_service_status)
+    .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn read_service_status(unit: &str) -> ServiceStatusDto {
+    let output = std::process::Command::new("systemctl")
+        .args([
+            "show",
+            "--property=LoadState",
+            "--property=ActiveState",
+            "--property=SubState",
+            "--value",
+            unit,
+        ])
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let mut lines = stdout.lines();
+            let load_state = lines.next().unwrap_or("unknown").trim().to_string();
+            let active_state = lines.next().unwrap_or("unknown").trim().to_string();
+            let sub_state = lines.next().unwrap_or_default().trim().to_string();
+            ServiceStatusDto {
+                unit: unit.into(),
+                status: format_service_status(&load_state, &active_state, &sub_state),
+                load_state,
+                active_state,
+                sub_state,
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let message = if stderr.is_empty() { stdout } else { stderr };
+            ServiceStatusDto {
+                unit: unit.into(),
+                load_state: "unknown".into(),
+                active_state: "error".into(),
+                sub_state: String::new(),
+                status: if message.is_empty() {
+                    "systemctl error".into()
+                } else {
+                    message
+                },
+            }
+        }
+        Err(err) => ServiceStatusDto {
+            unit: unit.into(),
+            load_state: "unknown".into(),
+            active_state: "error".into(),
+            sub_state: String::new(),
+            status: format!("systemctl unavailable: {err}"),
+        },
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_service_status(unit: &str) -> ServiceStatusDto {
+    ServiceStatusDto {
+        unit: unit.into(),
+        load_state: "mock".into(),
+        active_state: "unknown".into(),
+        sub_state: String::new(),
+        status: "Unavailable on this host".into(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn format_service_status(load_state: &str, active_state: &str, sub_state: &str) -> String {
+    if load_state != "loaded" && !load_state.is_empty() {
+        return load_state.to_string();
+    }
+    if active_state.is_empty() && sub_state.is_empty() {
+        return "unknown".into();
+    }
+    if sub_state.is_empty() || sub_state == active_state {
+        return active_state.to_string();
+    }
+    format!("{active_state} ({sub_state})")
+}
+
 fn parse_stat() -> Option<(u64, u64)> {
     let data = std::fs::read_to_string("/proc/stat").ok()?;
     let line = data.lines().next()?;
@@ -91,6 +238,15 @@ fn parse_stat() -> Option<(u64, u64)> {
         return None;
     }
     Some((vals[3], vals.iter().sum()))
+}
+
+#[cfg(unix)]
+fn user_filesystem_probe_path() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.exists())
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("/"))
 }
 
 fn read_os_name() -> String {

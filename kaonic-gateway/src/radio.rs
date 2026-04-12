@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
+use kaonic_ctrl::protocol::RADIO_FRAME_SIZE;
 use kaonic_ctrl::radio::RadioClient;
+use kaonic_frame::frame::Frame;
 use kaonic_reticulum::KaonicCtrlInterface;
 use radio_common::{Hertz, Modulation, RadioConfig, RadioConfigBuilder};
 use reticulum::transport::Transport;
@@ -98,4 +100,39 @@ pub async fn attach_radio_interface(
         .spawn(iface, KaonicCtrlInterface::spawn);
 
     Ok(())
+}
+
+pub async fn transmit_test_frame(
+    radio_client: Option<SharedRadioClient>,
+    module: usize,
+    payload: &[u8],
+) -> Result<(), String> {
+    if module > 1 {
+        return Err(format!("radio module {module} not found"));
+    }
+
+    if payload.is_empty() {
+        return Err("message is required".into());
+    }
+
+    let max_len = RADIO_FRAME_SIZE.min(2047);
+    if payload.len() > max_len {
+        return Err(format!("message exceeds {max_len} bytes"));
+    }
+
+    let Some(radio_client) = radio_client else {
+        return Err("radio backend unavailable".into());
+    };
+
+    let mut frame = Frame::<RADIO_FRAME_SIZE>::new();
+    frame.copy_from_slice(payload);
+
+    let transmit_result = radio_client
+        .lock()
+        .await
+        .transmit(module, &frame)
+        .await
+        .map_err(|err| format!("transmit: {err:?}"));
+
+    transmit_result
 }

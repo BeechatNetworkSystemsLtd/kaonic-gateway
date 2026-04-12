@@ -22,7 +22,7 @@ pub fn Navbar() -> impl IntoView {
                 <A href="/settings" attr:class="nav-link">"Radio"</A>
                 <A href="/network" attr:class="nav-link">"Network"</A>
                 <A href="/media" attr:class="nav-link">"Media"</A>
-                <A href="/update" attr:class="nav-link">"Update"</A>
+                <A href="/system" attr:class="nav-link">"System"</A>
             </nav>
             <div class="topbar-serial">
                 <Suspense fallback=|| ()>

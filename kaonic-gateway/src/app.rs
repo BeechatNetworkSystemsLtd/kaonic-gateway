@@ -8,7 +8,7 @@ use leptos_router::{
 use crate::components::navbar::Navbar;
 use crate::pages::{
     dashboard::DashboardPage, media::MediaPage, network::NetworkPage, radio::SettingsPage,
-    update::UpdatePage,
+    update::SystemPage,
 };
 
 pub fn shell(options: leptos::config::LeptosOptions) -> impl IntoView {
@@ -43,7 +43,8 @@ pub fn App() -> impl IntoView {
                     <Route path=StaticSegment("settings") view=SettingsPage/>
                     <Route path=StaticSegment("network") view=NetworkPage/>
                     <Route path=StaticSegment("media") view=MediaPage/>
-                    <Route path=StaticSegment("update") view=UpdatePage/>
+                    <Route path=StaticSegment("system") view=SystemPage/>
+                    <Route path=StaticSegment("update") view=SystemPage/>
                 </Routes>
             </main>
         </Router>

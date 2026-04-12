@@ -1,9 +1,11 @@
 use leptos::prelude::*;
 
 use crate::app_types::{
-    AtakBridgeStatusDto, GatewayStatusDto, RadioModuleConfigDto, SystemStatusDto,
+    AtakBridgeStatusDto, GatewayStatusDto, RadioModuleConfigDto, ServiceStatusDto, SystemStatusDto,
 };
-use crate::system_metrics::{read_cpu_percent_async, read_fs_mb, read_mem_mb, read_os_details};
+use crate::system_metrics::{
+    read_cpu_percent_async, read_fs_mb, read_gateway_services, read_mem_mb, read_os_details,
+};
 
 fn radio_label(index: usize) -> &'static str {
     match index {
@@ -47,12 +49,14 @@ pub async fn get_gateway_status() -> Result<GatewayStatusDto, ServerFnError> {
         .collect();
 
     let system = read_system_status_async().await;
+    let services = read_gateway_services();
 
     Ok(GatewayStatusDto {
         serial: state.serial.clone(),
         vpn_hash: state.vpn_hash.clone(),
         atak_bridges,
         system,
+        services,
         radio_modules,
     })
 }
@@ -112,14 +116,27 @@ const WS_SCRIPT: &str = r#"
         var ramPct = ramTotal > 0 ? Math.round(ramUsed * 100 / ramTotal) : 0;
         var fsFree = sys.fs_free_mb || 0;
         var fsTotal = sys.fs_total_mb || 0;
+        var fsUsed = Math.max(0, fsTotal - fsFree);
         var fsPct = fsTotal > 0 ? Math.round((fsTotal - fsFree) * 100 / fsTotal) : 0;
         set('os-val', sys.os_details || 'Unknown');
         set('cpu-pct', cpu.toFixed(1) + '%');
         bar('cpu-bar', cpu.toFixed(0));
         set('ram-val', ramUsed + ' / ' + ramTotal + ' MB');
         bar('ram-bar', ramPct);
-        set('fs-val', formatStorageMb(fsFree) + ' / ' + formatStorageMb(fsTotal) + ' free');
+        set('fs-val', formatStorageMb(fsUsed) + ' / ' + formatStorageMb(fsTotal) + ' used');
         bar('fs-bar', fsPct);
+        (s.services || []).forEach(function(svc, i) {
+          set('service-status-' + i, svc.status || 'unknown');
+          var badge = document.getElementById('service-badge-' + i);
+          if (badge) {
+            badge.textContent = serviceBadgeLabel(svc);
+            badge.className = 'badge ' + serviceBadgeClass(svc);
+          }
+        });
+        var activeServices = (s.services || []).filter(function(svc) {
+          return (svc.load_state || '') === 'loaded' && (svc.active_state || '') === 'active';
+        }).length;
+        set('services-count', activeServices + '/' + ((s.services || []).length) + ' active');
         (s.atak_bridges || []).forEach(function(b, i) {
           set('bridge-rx-' + i, '\u2193 ' + b.rx_packets);
           set('bridge-tx-' + i, '\u2191 ' + b.tx_packets);
@@ -136,6 +153,16 @@ const WS_SCRIPT: &str = r#"
   }
   function set(id, val) { var el = document.getElementById(id); if (el) el.textContent = val; }
   function bar(id, pct) { var el = document.getElementById(id); if (el) el.style.width = pct + '%'; }
+  function serviceBadgeClass(svc) {
+    if ((svc.load_state || '') !== 'loaded') { return 'badge-err'; }
+    if ((svc.active_state || '') === 'active') { return 'badge-ok'; }
+    if ((svc.active_state || '') === 'activating' || (svc.active_state || '') === 'reloading') { return 'badge-warn'; }
+    return 'badge-err';
+  }
+  function serviceBadgeLabel(svc) {
+    if ((svc.load_state || '') !== 'loaded') { return svc.load_state || 'missing'; }
+    return svc.active_state || 'unknown';
+  }
   function formatStorageMb(mb) {
     return mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : mb + ' MB';
   }
@@ -150,6 +177,7 @@ fn StatusView(status: GatewayStatusDto) -> impl IntoView {
     view! {
         <div class="status-grid">
             <SystemCard system=status.system/>
+            <ServicesCard services=status.services/>
             <VpnCard vpn_hash=status.vpn_hash serial=status.serial/>
             <AtakCard bridges=status.atak_bridges/>
         </div>
@@ -169,6 +197,7 @@ fn SystemCard(system: SystemStatusDto) -> impl IntoView {
     let ram_total = system.ram_total_mb;
     let fs_free = system.fs_free_mb;
     let fs_total = system.fs_total_mb;
+    let fs_used = fs_total.saturating_sub(fs_free);
     let os_details = system.os_details;
     let ram_pct = if ram_total > 0 {
         ram_used * 100 / ram_total
@@ -180,7 +209,7 @@ fn SystemCard(system: SystemStatusDto) -> impl IntoView {
     } else {
         0
     };
-    let fs_value = format_storage_mb(fs_free) + " / " + &format_storage_mb(fs_total) + " free";
+    let fs_value = format_storage_mb(fs_used) + " / " + &format_storage_mb(fs_total) + " used";
 
     view! {
         <div class="card">
@@ -214,6 +243,65 @@ fn SystemCard(system: SystemStatusDto) -> impl IntoView {
                 <span class="info-value" id="os-val">{os_details}</span>
             </div>
         </div>
+    }
+}
+
+#[component]
+fn ServicesCard(services: Vec<ServiceStatusDto>) -> impl IntoView {
+    let active_count = services
+        .iter()
+        .filter(|service| service.load_state == "loaded" && service.active_state == "active")
+        .count();
+
+    view! {
+        <div class="card">
+            <div class="card-header">
+                <span class="card-title">"Services"</span>
+                <span class="badge" id="services-count">
+                    {format!("{active_count}/{} active", services.len())}
+                </span>
+            </div>
+            {services.into_iter().enumerate().map(|(i, service)| {
+                let badge_class = format!("badge {}", service_badge_class(&service));
+                let badge_label = service_badge_label(&service).to_string();
+                view! {
+                    <div class="service-row">
+                        <div class="service-info">
+                            <span class="service-name">{service.unit.clone()}</span>
+                            <span class="service-status-text" id=format!("service-status-{i}")>
+                                {service.status.clone()}
+                            </span>
+                        </div>
+                        <span
+                            id=format!("service-badge-{i}")
+                            class=badge_class
+                        >
+                            {badge_label}
+                        </span>
+                    </div>
+                }
+            }).collect_view()}
+        </div>
+    }
+}
+
+fn service_badge_class(service: &ServiceStatusDto) -> &'static str {
+    if service.load_state != "loaded" {
+        "badge-err"
+    } else if service.active_state == "active" {
+        "badge-ok"
+    } else if matches!(service.active_state.as_str(), "activating" | "reloading") {
+        "badge-warn"
+    } else {
+        "badge-err"
+    }
+}
+
+fn service_badge_label(service: &ServiceStatusDto) -> &str {
+    if service.load_state != "loaded" {
+        &service.load_state
+    } else {
+        &service.active_state
     }
 }
 

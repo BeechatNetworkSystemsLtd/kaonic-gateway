@@ -18,6 +18,18 @@ pub async fn load_network_snapshot() -> Result<NetworkSnapshotDto, ServerFnError
 
 const NETWORK_JS: &str = r#"
 (function() {
+    function setNodeText(id, text) {
+        var el = document.getElementById(id);
+        if (!el) { return; }
+        el.textContent = text;
+    }
+
+    function setHidden(id, hidden) {
+        var el = document.getElementById(id);
+        if (!el) { return; }
+        el.hidden = !!hidden;
+    }
+
     function setText(id, text, kind) {
         var el = document.getElementById(id);
         if (!el) { return; }
@@ -62,28 +74,104 @@ const NETWORK_JS: &str = r#"
         });
     }
 
-    document.querySelectorAll('[data-wifi-mode]').forEach(function(btn) {
-        btn.addEventListener('click', function() {
-            setText('wifi-action-status', 'Applying WiFi mode...', 'pending');
+    function renderSnapshot(snapshot) {
+        var wifi = snapshot.wifi || {};
+        var isStation = wifi.mode === 'sta';
+        var stationConnected = !!wifi.connected_ssid;
+
+        setNodeText('wifi-mode-badge', isStation ? 'Station' : 'Access Point');
+        setNodeText('network-backend', snapshot.backend || '—');
+        setNodeText('wifi-configured-ssid', wifi.configured_ssid || '—');
+        setNodeText('wifi-status-value', isStation ? (stationConnected ? 'Connected' : 'Disconnected') : 'Active');
+        setNodeText('wifi-ip-address', wifi.wlan0_ip || '—');
+        setNodeText('wifi-connected-ssid', wifi.connected_ssid || '—');
+        setNodeText('wifi-station-link-text', wifi.link_details || 'Disconnected');
+        setNodeText('wifi-station-empty-text', 'Disconnected');
+        setNodeText('interfaces-source', snapshot.interface_source || '—');
+        setNodeText('interfaces-details', snapshot.interface_details || '');
+
+        var apBtn = document.getElementById('wifi-mode-btn-ap');
+        var staBtn = document.getElementById('wifi-mode-btn-sta');
+        if (apBtn) { apBtn.classList.toggle('active', !isStation); }
+        if (staBtn) { staBtn.classList.toggle('active', isStation); }
+
+        setHidden('open-wifi-connect', !isStation);
+        setHidden('wifi-station-fields', !isStation);
+        setHidden('wifi-station-link', !isStation);
+        setHidden('wifi-ap-fields', isStation);
+        setHidden('wifi-ap-mode', isStation);
+        setHidden('wifi-station-link-pre', !isStation || !stationConnected);
+        setHidden('wifi-station-link-empty', !isStation || stationConnected);
+    }
+
+    function loadSnapshot() {
+        return fetch('/api/network/snapshot', {
+            headers: { 'Accept': 'application/json' }
+        }).then(function(resp) {
+            if (!resp.ok) {
+                return resp.text().then(function(text) {
+                    throw new Error(text || ('HTTP ' + resp.status));
+                });
+            }
+            return resp.json();
+        }).then(function(snapshot) {
+            renderSnapshot(snapshot);
+        });
+    }
+
+    document.addEventListener('click', function(ev) {
+        var target = ev.target;
+        if (!(target instanceof Element)) { return; }
+
+        if (target.closest('#network-refresh-btn')) {
+            setText('wifi-action-status', 'Refreshing...', 'pending');
             toggleBusy(true);
-            postForm('/network/wifi/mode', { mode: btn.dataset.wifiMode || '' })
-                .then(function() { window.location.reload(); })
+            loadSnapshot()
+                .then(function() {
+                    setText('wifi-action-status', '', '');
+                })
                 .catch(function(err) {
                     setText('wifi-action-status', String(err.message || err), 'err');
                 })
                 .finally(function() {
                     toggleBusy(false);
                 });
-        });
-    });
+            return;
+        }
 
-    var openBtn = document.getElementById('open-wifi-connect');
-    if (openBtn) {
-        openBtn.addEventListener('click', openModal);
-    }
+        var modeBtn = target.closest('[data-wifi-mode]');
+        if (modeBtn) {
+            if (modeBtn.classList.contains('active')) {
+                return;
+            }
+            var nextMode = modeBtn.dataset.wifiMode === 'sta' ? 'Station' : 'Access Point';
+            if (!window.confirm('Switch WiFi mode to ' + nextMode + '?')) {
+                return;
+            }
+            setText('wifi-action-status', 'Applying WiFi mode...', 'pending');
+            toggleBusy(true);
+            postForm('/network/wifi/mode', { mode: modeBtn.dataset.wifiMode || '' })
+                .then(function() { return loadSnapshot(); })
+                .then(function() {
+                    setText('wifi-action-status', '', '');
+                })
+                .catch(function(err) {
+                    setText('wifi-action-status', String(err.message || err), 'err');
+                })
+                .finally(function() {
+                    toggleBusy(false);
+                });
+            return;
+        }
 
-    document.querySelectorAll('[data-close-connect]').forEach(function(btn) {
-        btn.addEventListener('click', closeModal);
+        if (target.closest('#open-wifi-connect')) {
+            openModal();
+            return;
+        }
+
+        if (target.closest('[data-close-connect]')) {
+            closeModal();
+        }
     });
 
     var modal = document.getElementById('wifi-connect-modal');
@@ -106,7 +194,7 @@ const NETWORK_JS: &str = r#"
                 psk: psk ? psk.value : ''
             }).then(function() {
                 closeModal();
-                window.location.reload();
+                return loadSnapshot();
             }).catch(function(err) {
                 setText('wifi-connect-status', String(err.message || err), 'err');
             }).finally(function() {
@@ -129,7 +217,12 @@ pub fn NetworkPage() -> impl IntoView {
 
     view! {
         <div class="page">
-            <h1 class="page-title">"Network"</h1>
+            <div class="page-header">
+                <h1 class="page-title">"Network"</h1>
+                <button type="button" id="network-refresh-btn" class="btn-secondary" data-network-action>
+                    "Refresh"
+                </button>
+            </div>
             <Suspense fallback=|| view! { <p class="loading">"Loading network details…"</p> }>
                 {move || match snapshot.get() {
                     None => view! { <p class="loading">"Loading…"</p> }.into_any(),
@@ -141,7 +234,6 @@ pub fn NetworkPage() -> impl IntoView {
                     }.into_any(),
                 }}
             </Suspense>
-            <script>{NETWORK_JS}</script>
         </div>
     }
 }
@@ -152,6 +244,7 @@ fn NetworkContent(snapshot: NetworkSnapshotDto) -> impl IntoView {
     let is_station = wifi.mode == "sta";
     let configured_ssid = wifi.configured_ssid.clone().unwrap_or_else(|| "—".into());
     let connected_ssid = wifi.connected_ssid.clone().unwrap_or_else(|| "—".into());
+    let wlan0_ip = wifi.wlan0_ip.clone().unwrap_or_else(|| "—".into());
     let station_connected = wifi.connected_ssid.is_some();
     let mode_label = if is_station {
         "Station"
@@ -169,13 +262,14 @@ fn NetworkContent(snapshot: NetworkSnapshotDto) -> impl IntoView {
             <div class="card network-card">
                 <div class="card-header network-card-header">
                     <span class="card-title">"WiFi"</span>
-                    <span class="badge badge-ok">{mode_label}</span>
+                    <span class="badge badge-ok" id="wifi-mode-badge">{mode_label}</span>
                 </div>
 
                 <div class="network-mode-toggle">
                     <button
                         type="button"
                         class=if wifi.mode == "ap" { "wifi-mode-btn active" } else { "wifi-mode-btn" }
+                        id="wifi-mode-btn-ap"
                         data-network-action
                         data-wifi-mode="ap"
                     >
@@ -184,6 +278,7 @@ fn NetworkContent(snapshot: NetworkSnapshotDto) -> impl IntoView {
                     <button
                         type="button"
                         class=if wifi.mode == "sta" { "wifi-mode-btn active" } else { "wifi-mode-btn" }
+                        id="wifi-mode-btn-sta"
                         data-network-action
                         data-wifi-mode="sta"
                     >
@@ -192,23 +287,14 @@ fn NetworkContent(snapshot: NetworkSnapshotDto) -> impl IntoView {
                 </div>
 
                 <div class="network-actions">
-                    {is_station.then(|| view! {
-                        <button
-                            type="button"
-                            class="btn-primary"
-                            id="open-wifi-connect"
-                            data-network-action
-                        >
-                            "Connect WiFi"
-                        </button>
-                    })}
                     <button
                         type="button"
-                        class="btn-secondary"
-                        onclick="window.location.reload()"
+                        class="btn-primary"
+                        id="open-wifi-connect"
                         data-network-action
+                        hidden=!is_station
                     >
-                        "Refresh"
+                        "Connect WiFi"
                     </button>
                 </div>
 
@@ -216,62 +302,50 @@ fn NetworkContent(snapshot: NetworkSnapshotDto) -> impl IntoView {
 
                 <div class="info-row">
                     <span class="info-label">"Backend"</span>
-                    <span class="info-value">{snapshot.backend}</span>
+                    <span class="info-value" id="network-backend">{snapshot.backend}</span>
                 </div>
-                {if is_station {
-                    view! {
-                        <>
-                            <div class="info-row">
-                                <span class="info-label">"Saved SSID"</span>
-                                <span class="info-value">{configured_ssid}</span>
-                            </div>
-                            <div class="info-row">
-                                <span class="info-label">"Status"</span>
-                                <span class="info-value">{station_status}</span>
-                            </div>
-                            <div class="info-row">
-                                <span class="info-label">"Connected"</span>
-                                <span class="info-value">{connected_ssid}</span>
-                            </div>
-                            {if station_connected {
-                                view! {
-                                    <div class="network-detail-block">
-                                        <div class="network-subtitle">"Station link"</div>
-                                        <pre class="network-pre">{wifi.link_details}</pre>
-                                    </div>
-                                }.into_any()
-                            } else {
-                                view! {
-                                    <div class="network-detail-block">
-                                        <div class="network-subtitle">"Station link"</div>
-                                        <div class="network-empty-state">"Disconnected"</div>
-                                    </div>
-                                }.into_any()
-                            }}
-                        </>
-                    }.into_any()
-                } else {
-                    view! {
-                        <>
-                            <div class="info-row">
-                                <span class="info-label">"Status"</span>
-                                <span class="info-value">"Active"</span>
-                            </div>
-                            <div class="network-detail-block">
-                                <div class="network-subtitle">"Mode"</div>
-                                <div class="network-empty-state">"Access Point mode enabled"</div>
-                            </div>
-                        </>
-                    }.into_any()
-                }}
+                <div class="info-row">
+                    <span class="info-label">"Status"</span>
+                    <span class="info-value" id="wifi-status-value">
+                        {if is_station { station_status } else { "Active" }}
+                    </span>
+                </div>
+                <div class="info-row">
+                    <span class="info-label">"wlan0 IP"</span>
+                    <span class="info-value" id="wifi-ip-address">{wlan0_ip}</span>
+                </div>
+                <div id="wifi-station-fields" hidden=!is_station>
+                    <div class="info-row">
+                        <span class="info-label">"Saved SSID"</span>
+                        <span class="info-value" id="wifi-configured-ssid">{configured_ssid}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">"Connected"</span>
+                        <span class="info-value" id="wifi-connected-ssid">{connected_ssid}</span>
+                    </div>
+                </div>
+                <div id="wifi-ap-fields" hidden=is_station></div>
+                <div class="network-detail-block" id="wifi-station-link" hidden=!is_station>
+                    <div class="network-subtitle">"Station link"</div>
+                    <pre class="network-pre" id="wifi-station-link-pre" hidden=!station_connected>
+                        <span id="wifi-station-link-text">{wifi.link_details}</span>
+                    </pre>
+                    <div class="network-empty-state" id="wifi-station-link-empty" hidden=station_connected>
+                        <span id="wifi-station-empty-text">"Disconnected"</span>
+                    </div>
+                </div>
+                <div class="network-detail-block" id="wifi-ap-mode" hidden=is_station>
+                    <div class="network-subtitle">"Mode"</div>
+                    <div class="network-empty-state">"Access Point mode enabled"</div>
+                </div>
             </div>
 
             <div class="card network-card">
                 <div class="card-header network-card-header">
                     <span class="card-title">"Interfaces"</span>
-                    <span class="badge">{snapshot.interface_source}</span>
+                    <span class="badge" id="interfaces-source">{snapshot.interface_source}</span>
                 </div>
-                <pre class="network-pre network-dump">{snapshot.interface_details}</pre>
+                <pre class="network-pre network-dump" id="interfaces-details">{snapshot.interface_details}</pre>
             </div>
         </div>
 
@@ -309,6 +383,7 @@ fn NetworkContent(snapshot: NetworkSnapshotDto) -> impl IntoView {
                 </form>
             </div>
         </div>
+        <script>{NETWORK_JS}</script>
     }
     .into_any()
 }

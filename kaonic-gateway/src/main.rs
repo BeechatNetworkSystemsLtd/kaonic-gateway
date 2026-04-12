@@ -19,6 +19,22 @@ use tokio;
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_DB_PATH: &str = "kaonic-gateway.db";
+
+fn frame_preview(data: &[u8]) -> String {
+    data.iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn unix_timestamp_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 /// kaonic-gateway: VPN over Reticulum using the kaonic radio hardware.
 #[derive(Parser)]
 #[command(name = "kaonic-gateway", version)]
@@ -155,45 +171,71 @@ async fn async_main() -> Result<(), process::ExitCode> {
         serial,
     );
 
-    // Spawn rx frame listener — fills per-module ring buffers used by the WS feed.
+    // Spawn frame listener — fills per-module ring buffers used by the WS feed.
     {
         use kaonic_gateway::app_types::RxFrameDto;
         use kaonic_gateway::state::RX_BUF_SIZE;
+        use std::sync::atomic::Ordering;
         use tokio::sync::broadcast::error::RecvError;
 
         let rx_bufs = app_state.rx_buffers.clone();
+        let frame_stats = app_state.frame_stats.clone();
         let mut rx = radio_client.lock().await.module_receive();
+        let mut tx = radio_client.lock().await.module_transmit();
         tokio::spawn(async move {
             loop {
-                match rx.recv().await {
-                    Ok(recv) => {
-                        let module = recv.module.min(1);
-                        let data_len = recv.frame.len as usize;
-                        let data = &recv.frame.data[..data_len];
-                        let hex = data
-                            .iter()
-                            .take(8)
-                            .map(|b| format!("{b:02x}"))
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        let ts = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        let entry = RxFrameDto {
-                            module,
-                            direction: "rx".into(),
-                            rssi: recv.rssi,
-                            len: recv.frame.len,
-                            hex,
-                            ts,
-                        };
-                        let mut buf = rx_bufs[module].lock().await;
-                        buf.push_front(entry);
-                        buf.truncate(RX_BUF_SIZE);
+                tokio::select! {
+                    recv = rx.recv() => match recv {
+                        Ok(recv) => {
+                            let module = recv.module.min(1);
+                            let entry = RxFrameDto {
+                                module,
+                                direction: "rx".into(),
+                                rssi: recv.rssi,
+                                len: recv.frame.len,
+                                hex: frame_preview(recv.frame.as_slice()),
+                                ts: unix_timestamp_secs(),
+                            };
+                            frame_stats[module]
+                                .rx_frames
+                                .fetch_add(1, Ordering::Relaxed);
+                            frame_stats[module]
+                                .rx_bytes
+                                .fetch_add(recv.frame.len as u64, Ordering::Relaxed);
+                            frame_stats[module]
+                                .last_rssi
+                                .store(recv.rssi as i32, Ordering::Relaxed);
+                            let mut buf = rx_bufs[module].lock().await;
+                            buf.push_front(entry);
+                            buf.truncate(RX_BUF_SIZE);
+                        }
+                        Err(RecvError::Lagged(_)) => continue,
+                        Err(_) => break,
+                    },
+                    sent = tx.recv() => match sent {
+                        Ok(sent) => {
+                            let module = sent.module.min(1);
+                            let entry = RxFrameDto {
+                                module,
+                                direction: "tx".into(),
+                                rssi: 0,
+                                len: sent.frame.len,
+                                hex: frame_preview(sent.frame.as_slice()),
+                                ts: unix_timestamp_secs(),
+                            };
+                            frame_stats[module]
+                                .tx_frames
+                                .fetch_add(1, Ordering::Relaxed);
+                            frame_stats[module]
+                                .tx_bytes
+                                .fetch_add(sent.frame.len as u64, Ordering::Relaxed);
+                            let mut buf = rx_bufs[module].lock().await;
+                            buf.push_front(entry);
+                            buf.truncate(RX_BUF_SIZE);
+                        }
+                        Err(RecvError::Lagged(_)) => continue,
+                        Err(_) => break,
                     }
-                    Err(RecvError::Lagged(_)) => continue,
-                    Err(_) => break,
                 }
             }
         });

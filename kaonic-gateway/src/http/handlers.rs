@@ -1,15 +1,19 @@
 use axum::extract::{Form, Path, State};
 use axum::http::StatusCode;
 use axum::Json;
-use kaonic_gateway::app_types::RxFrameDto;
-use kaonic_gateway::audio::{AudioControlSnapshot, AudioControlState, AudioError, AudioOutput};
+use kaonic_gateway::app_types::{FrameStatsDto, NetworkSnapshotDto, RxFrameDto, ServiceStatusDto};
+use kaonic_gateway::audio::{
+    AudioCardSnapshot, AudioControlSnapshot, AudioControlState, AudioError, AudioOutput,
+};
 use kaonic_gateway::config::GatewayConfig;
 use kaonic_gateway::network::{NetworkError, WifiMode};
-use kaonic_gateway::radio::RadioModuleConfig;
+use kaonic_gateway::radio::{transmit_test_frame, RadioModuleConfig};
 use kaonic_gateway::system_metrics::{
-    read_cpu_percent_async, read_fs_mb, read_mem_mb, read_os_details,
+    read_cpu_percent_async, read_fs_mb, read_gateway_services, read_mem_mb, read_os_details,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
+use std::process::Command;
 
 use super::AppState;
 
@@ -121,12 +125,72 @@ pub async fn put_radio(
     StatusCode::NO_CONTENT
 }
 
+pub async fn post_radio_test(
+    State(state): State<AppState>,
+    Path(module): Path<usize>,
+    Json(request): Json<RadioTestRequest>,
+) -> Result<Json<RadioTestResponse>, (StatusCode, String)> {
+    if module > 1 {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("radio module {module} not found"),
+        ));
+    }
+
+    let message = request.message.trim().to_string();
+    if message.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "message is required".into()));
+    }
+    if message.chars().count() > 2047 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "message exceeds 2047 characters".into(),
+        ));
+    }
+
+    transmit_test_frame(state.radio_client.clone(), module, message.as_bytes())
+        .await
+        .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err))?;
+
+    Ok(Json(RadioTestResponse {
+        status: format!(
+            "Sent test frame on {}",
+            if module == 0 { "Radio A" } else { "Radio B" }
+        ),
+    }))
+}
+
+pub async fn post_system_reboot() -> Result<Json<SystemActionResponse>, (StatusCode, String)> {
+    let status = request_system_reboot().map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    Ok(Json(SystemActionResponse { status }))
+}
+
 // ── /api/audio ────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 pub struct PutAudioRequest {
     pub volume: u8,
     pub muted: bool,
+}
+
+#[derive(Deserialize)]
+pub struct RadioTestRequest {
+    pub message: String,
+}
+
+#[derive(Serialize)]
+pub struct AudioSaveResponse {
+    pub status: String,
+}
+
+#[derive(Serialize)]
+pub struct RadioTestResponse {
+    pub status: String,
+}
+
+#[derive(Serialize)]
+pub struct SystemActionResponse {
+    pub status: String,
 }
 
 pub async fn get_audio(
@@ -139,6 +203,32 @@ pub async fn get_audio(
         log::error!("failed to read {output:?} audio state: {err}");
         map_audio_error(&err)
     })
+}
+
+pub async fn get_audio_cards(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<AudioCardSnapshot>>, StatusCode> {
+    state.audio.list_cards().await.map(Json).map_err(|err| {
+        log::error!("failed to list audio cards: {err}");
+        map_audio_error(&err)
+    })
+}
+
+pub async fn get_audio_control(
+    State(state): State<AppState>,
+    Path((card_id, output)): Path<(usize, String)>,
+) -> Result<Json<AudioControlSnapshot>, StatusCode> {
+    let output = AudioOutput::parse(&output).ok_or(StatusCode::NOT_FOUND)?;
+
+    state
+        .audio
+        .read_control(card_id, output)
+        .await
+        .map(Json)
+        .map_err(|err| {
+            log::error!("failed to read card {card_id} {output:?} audio state: {err}");
+            map_audio_error(&err)
+        })
 }
 
 pub async fn put_audio(
@@ -163,15 +253,96 @@ pub async fn put_audio(
         })
 }
 
+pub async fn put_audio_control(
+    State(state): State<AppState>,
+    Path((card_id, output)): Path<(usize, String)>,
+    Json(request): Json<PutAudioRequest>,
+) -> Result<Json<AudioControlSnapshot>, StatusCode> {
+    let output = AudioOutput::parse(&output).ok_or(StatusCode::NOT_FOUND)?;
+    let next = AudioControlState {
+        volume: request.volume,
+        muted: request.muted,
+    };
+
+    state
+        .audio
+        .write_control(card_id, output, next)
+        .await
+        .map(Json)
+        .map_err(|err| {
+            log::error!("failed to update card {card_id} {output:?} audio state: {err}");
+            map_audio_error(&err)
+        })
+}
+
+pub async fn post_audio_control_test(
+    State(state): State<AppState>,
+    Path((card_id, output)): Path<(usize, String)>,
+) -> Result<Json<AudioControlSnapshot>, StatusCode> {
+    let output = AudioOutput::parse(&output).ok_or(StatusCode::NOT_FOUND)?;
+
+    state
+        .audio
+        .test_control(card_id, output)
+        .await
+        .map(Json)
+        .map_err(|err| {
+            log::error!("failed to play test sample on card {card_id} {output:?}: {err}");
+            map_audio_error(&err)
+        })
+}
+
+pub async fn post_audio_card_save(
+    State(state): State<AppState>,
+    Path(card_id): Path<usize>,
+) -> Result<Json<AudioSaveResponse>, StatusCode> {
+    state
+        .audio
+        .save_card(card_id)
+        .await
+        .map(|status| Json(AudioSaveResponse { status }))
+        .map_err(|err| {
+            log::error!("failed to persist audio settings for card {card_id}: {err}");
+            map_audio_error(&err)
+        })
+}
+
 fn map_audio_error(err: &AudioError) -> StatusCode {
     match err {
         AudioError::InvalidVolume(_) => StatusCode::BAD_REQUEST,
+        AudioError::NotFound(_) => StatusCode::NOT_FOUND,
         AudioError::StatePoisoned(_)
         | AudioError::TaskJoin(_)
         | AudioError::CommandIo { .. }
         | AudioError::CommandFailed { .. }
         | AudioError::UnexpectedOutput(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
+}
+
+#[cfg(target_os = "linux")]
+fn request_system_reboot() -> Result<String, String> {
+    let output = Command::new("systemctl")
+        .args(["--no-block", "reboot"])
+        .output()
+        .map_err(|err| format!("failed to execute systemctl reboot: {err}"))?;
+
+    if output.status.success() {
+        return Ok("Reboot requested".into());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let message = if stderr.is_empty() { stdout } else { stderr };
+    Err(if message.is_empty() {
+        "systemctl reboot failed".into()
+    } else {
+        message
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn request_system_reboot() -> Result<String, String> {
+    Ok("Mock reboot requested".into())
 }
 
 // ── /network/wifi actions ─────────────────────────────────────────────────────
@@ -218,6 +389,17 @@ pub async fn post_wifi_connect(
         .map_err(map_network_error)
 }
 
+pub async fn get_network_snapshot(
+    State(state): State<AppState>,
+) -> Result<Json<NetworkSnapshotDto>, (StatusCode, String)> {
+    state
+        .network
+        .snapshot()
+        .await
+        .map(Json)
+        .map_err(map_network_error)
+}
+
 fn map_network_error(err: NetworkError) -> (StatusCode, String) {
     let status = match err {
         NetworkError::InvalidMode(_)
@@ -258,8 +440,10 @@ pub struct StatusResponse {
     vpn_hash: String,
     atak_bridges: Vec<AtakBridgeStatus>,
     system: SystemStatus,
+    services: Vec<ServiceStatusDto>,
     radio_modules: Vec<RadioModuleConfig>,
     rx_frames: [Vec<RxFrameDto>; 2],
+    frame_stats: [FrameStatsDto; 2],
 }
 
 /// `GET /api/status` — live gateway status: ATAK counters, system resources, VPN hash, radio config.
@@ -295,13 +479,39 @@ pub async fn build_status(state: &AppState) -> StatusResponse {
         state.rx_buffers[0].lock().await.iter().cloned().collect(),
         state.rx_buffers[1].lock().await.iter().cloned().collect(),
     ];
+    let frame_stats = [
+        FrameStatsDto {
+            rx_frames: state.frame_stats[0].rx_frames.load(Ordering::Relaxed),
+            rx_bytes: state.frame_stats[0].rx_bytes.load(Ordering::Relaxed),
+            tx_frames: state.frame_stats[0].tx_frames.load(Ordering::Relaxed),
+            tx_bytes: state.frame_stats[0].tx_bytes.load(Ordering::Relaxed),
+            last_rssi: if state.frame_stats[0].rx_frames.load(Ordering::Relaxed) > 0 {
+                Some(state.frame_stats[0].last_rssi.load(Ordering::Relaxed) as i8)
+            } else {
+                None
+            },
+        },
+        FrameStatsDto {
+            rx_frames: state.frame_stats[1].rx_frames.load(Ordering::Relaxed),
+            rx_bytes: state.frame_stats[1].rx_bytes.load(Ordering::Relaxed),
+            tx_frames: state.frame_stats[1].tx_frames.load(Ordering::Relaxed),
+            tx_bytes: state.frame_stats[1].tx_bytes.load(Ordering::Relaxed),
+            last_rssi: if state.frame_stats[1].rx_frames.load(Ordering::Relaxed) > 0 {
+                Some(state.frame_stats[1].last_rssi.load(Ordering::Relaxed) as i8)
+            } else {
+                None
+            },
+        },
+    ];
 
     StatusResponse {
         vpn_hash: state.vpn_hash.clone(),
         atak_bridges,
         system: read_system_status_async().await,
+        services: read_gateway_services(),
         radio_modules,
         rx_frames,
+        frame_stats,
     }
 }
 

@@ -34,6 +34,15 @@ pub struct RxFrameDto {
     pub ts: u64,     // unix timestamp (seconds)
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FrameStatsDto {
+    pub rx_frames: u64,
+    pub rx_bytes: u64,
+    pub tx_frames: u64,
+    pub tx_bytes: u64,
+    pub last_rssi: Option<i8>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AtakBridgeStatusDto {
     pub port: u16,
@@ -52,12 +61,22 @@ pub struct SystemStatusDto {
     pub os_details: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServiceStatusDto {
+    pub unit: String,
+    pub load_state: String,
+    pub active_state: String,
+    pub sub_state: String,
+    pub status: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayStatusDto {
     pub serial: String,
     pub vpn_hash: String,
     pub atak_bridges: Vec<AtakBridgeStatusDto>,
     pub system: SystemStatusDto,
+    pub services: Vec<ServiceStatusDto>,
     pub radio_modules: Vec<RadioModuleConfigDto>,
 }
 
@@ -68,6 +87,7 @@ impl Default for GatewayStatusDto {
             vpn_hash: String::new(),
             atak_bridges: vec![],
             system: SystemStatusDto::default(),
+            services: vec![],
             radio_modules: vec![],
         }
     }
@@ -80,6 +100,7 @@ pub struct WifiStatusDto {
     pub mode: String,
     pub configured_ssid: Option<String>,
     pub connected_ssid: Option<String>,
+    pub wlan0_ip: Option<String>,
     pub hostapd_status: String,
     pub wpa_supplicant_status: String,
     pub link_details: String,
@@ -91,6 +112,7 @@ impl Default for WifiStatusDto {
             mode: "ap".into(),
             configured_ssid: None,
             connected_ssid: None,
+            wlan0_ip: None,
             hostapd_status: String::new(),
             wpa_supplicant_status: String::new(),
             link_details: String::new(),

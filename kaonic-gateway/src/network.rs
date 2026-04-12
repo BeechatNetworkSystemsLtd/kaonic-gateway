@@ -1,8 +1,8 @@
-use std::sync::Mutex;
-
 use thiserror::Error;
 
 use crate::app_types::{NetworkSnapshotDto, WifiStatusDto};
+#[cfg(not(target_os = "linux"))]
+use std::sync::Mutex;
 
 #[cfg(target_os = "linux")]
 use std::fs;
@@ -69,9 +69,11 @@ pub enum NetworkError {
 
 #[derive(Debug)]
 pub struct NetworkService {
+    #[cfg(not(target_os = "linux"))]
     mock: Mutex<MockNetworkState>,
 }
 
+#[cfg(not(target_os = "linux"))]
 #[derive(Debug, Clone)]
 struct MockNetworkState {
     mode: WifiMode,
@@ -79,6 +81,7 @@ struct MockNetworkState {
     connected_ssid: Option<String>,
 }
 
+#[cfg(not(target_os = "linux"))]
 impl Default for MockNetworkState {
     fn default() -> Self {
         Self {
@@ -92,6 +95,7 @@ impl Default for MockNetworkState {
 impl Default for NetworkService {
     fn default() -> Self {
         Self {
+            #[cfg(not(target_os = "linux"))]
             mock: Mutex::new(MockNetworkState::default()),
         }
     }
@@ -159,6 +163,11 @@ impl NetworkService {
                 mode: state.mode.as_str().into(),
                 configured_ssid: state.configured_ssid.clone(),
                 connected_ssid: state.connected_ssid.clone(),
+                wlan0_ip: match state.mode {
+                    WifiMode::Ap => Some("192.168.4.1".into()),
+                    WifiMode::Sta if state.connected_ssid.is_some() => Some("192.168.1.42".into()),
+                    WifiMode::Sta => None,
+                },
                 hostapd_status: if state.mode == WifiMode::Ap {
                     "active".into()
                 } else {
@@ -246,6 +255,7 @@ fn read_interface_details_linux() -> Result<(String, String), NetworkError> {
 fn read_wifi_status_linux() -> Result<WifiStatusDto, NetworkError> {
     let mode = read_current_mode_linux();
     let configured_ssid = read_configured_ssid(&wpa_conf_path());
+    let wlan0_ip = read_wifi_ip_linux()?;
     let hostapd_status =
         read_service_status_linux("hostapd.service").unwrap_or_else(|_| "unknown".into());
     let wpa_supplicant_status = if wpa_pid_file_path().exists() {
@@ -262,6 +272,7 @@ fn read_wifi_status_linux() -> Result<WifiStatusDto, NetworkError> {
         mode: mode.as_str().into(),
         configured_ssid,
         connected_ssid,
+        wlan0_ip,
         hostapd_status,
         wpa_supplicant_status,
         link_details,
@@ -333,6 +344,45 @@ fn read_station_link_linux() -> Result<(Option<String>, String), NetworkError> {
     });
 
     Ok((connected_ssid, output))
+}
+
+#[cfg(target_os = "linux")]
+fn read_wifi_ip_linux() -> Result<Option<String>, NetworkError> {
+    let iface = wifi_iface_name();
+    match run_command(
+        &format!("ip -4 addr show dev {iface}"),
+        "ip",
+        &["-4", "addr", "show", "dev", iface],
+    ) {
+        Ok(output) => Ok(parse_ipv4_from_ip_addr(&output)),
+        Err(_) => run_command(
+            &format!("ifconfig {iface}"),
+            "ifconfig",
+            &[iface],
+        )
+        .map(|output| parse_ipv4_from_ifconfig(&output))
+        .or(Ok(None)),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_ipv4_from_ip_addr(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("inet ")?;
+        Some(value.split('/').next()?.trim().to_string())
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_ipv4_from_ifconfig(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("inet ") {
+            return Some(value.split_whitespace().next()?.trim().to_string());
+        }
+        let start = trimmed.find("inet ")? + 5;
+        Some(trimmed[start..].split_whitespace().next()?.trim().to_string())
+    })
 }
 
 #[cfg(target_os = "linux")]
