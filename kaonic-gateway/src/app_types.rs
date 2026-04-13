@@ -72,6 +72,16 @@ pub struct ServiceStatusDto {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NetworkPortStatusDto {
+    pub name: String,
+    pub protocol: String,
+    pub port: u16,
+    pub service: String,
+    pub status: String,
+    pub details: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReticulumLinkDto {
     pub id: String,
     pub destination: String,
@@ -105,6 +115,7 @@ pub struct GatewayStatusDto {
     pub serial: String,
     pub vpn_hash: String,
     pub atak_bridges: Vec<AtakBridgeStatusDto>,
+    pub network_ports: Vec<NetworkPortStatusDto>,
     pub system: SystemStatusDto,
     pub services: Vec<ServiceStatusDto>,
     pub radio_modules: Vec<RadioModuleConfigDto>,
@@ -118,6 +129,7 @@ impl Default for GatewayStatusDto {
             serial: String::new(),
             vpn_hash: String::new(),
             atak_bridges: vec![],
+            network_ports: vec![],
             system: SystemStatusDto::default(),
             services: vec![],
             radio_modules: vec![],

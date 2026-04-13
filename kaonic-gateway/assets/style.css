@@ -398,8 +398,20 @@ code.info-value,
 }
 
 .service-restart-btn {
-  padding: 7px 12px;
-  font-size: 12px;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  font-size: 16px;
+  line-height: 1;
+  font-weight: 700;
+}
+
+.service-restart-btn:hover {
+  filter: brightness(1.12);
 }
 
 /* ─── Forms ───────────────────────────────────────────────────────────────── */
@@ -1399,20 +1411,26 @@ select.field-input {
 
 .reticulum-summary {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 16px;
   margin-bottom: 18px;
 }
 
 .reticulum-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
   gap: 18px;
   margin-bottom: 18px;
 }
 
 .reticulum-card {
   min-width: 0;
+}
+
+.reticulum-summary .stat-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .reticulum-card--events {
@@ -1422,6 +1440,12 @@ select.field-input {
 .reticulum-table-wrap {
   overflow: auto;
   max-height: 420px;
+}
+
+.td-hash {
+  letter-spacing: .05em;
+  overflow-wrap: anywhere;
+  word-break: normal;
 }
 
 @media (max-width: 1100px) {

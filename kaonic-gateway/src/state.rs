@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI32, AtomicU64};
 use std::sync::{Arc, Mutex};
 
@@ -6,12 +7,12 @@ use tokio::sync::Mutex as TokioMutex;
 
 use kaonic_vpn::VpnRuntime;
 
-use crate::app_types::RxFrameDto;
+use crate::app_types::{NetworkPortStatusDto, RxFrameDto, ServiceStatusDto};
 use crate::atak::BridgeMetrics;
 use crate::audio::AudioService;
 use crate::gateway_reticulum::SharedGatewayReticulum;
 use crate::network::NetworkService;
-use crate::radio::SharedRadioClient;
+use crate::radio::{SharedRadioClient, SharedTxObserver};
 use crate::settings::Settings;
 
 pub type SharedAudioService = Arc<AudioService>;
@@ -48,6 +49,9 @@ pub struct AppState {
     pub atak_metrics: Vec<Arc<BridgeMetrics>>,
     pub vpn_hash: String,
     pub vpn: Option<Arc<VpnRuntime>>,
+    pub kaonic_ctrl_server_addr: SocketAddr,
+    pub http_addr: SocketAddr,
+    pub radio_tx_observer: Option<SharedTxObserver>,
     pub radio_client: Option<SharedRadioClient>,
     pub reticulum: SharedGatewayReticulum,
     pub serial: String,
@@ -62,6 +66,9 @@ impl AppState {
         atak_metrics: Vec<Arc<BridgeMetrics>>,
         vpn_hash: String,
         vpn: Option<Arc<VpnRuntime>>,
+        kaonic_ctrl_server_addr: SocketAddr,
+        http_addr: SocketAddr,
+        radio_tx_observer: Option<SharedTxObserver>,
         radio_client: Option<SharedRadioClient>,
         reticulum: SharedGatewayReticulum,
         serial: String,
@@ -73,6 +80,9 @@ impl AppState {
             atak_metrics,
             vpn_hash,
             vpn,
+            kaonic_ctrl_server_addr,
+            http_addr,
+            radio_tx_observer,
             radio_client,
             reticulum,
             serial,
@@ -80,4 +90,92 @@ impl AppState {
             frame_stats: [empty_frame_stats(), empty_frame_stats()],
         }
     }
+
+    pub fn network_ports(&self, services: &[ServiceStatusDto]) -> Vec<NetworkPortStatusDto> {
+        let commd_active = service_active(services, "kaonic-commd.service");
+        let gateway_active = service_active(services, "kaonic-gateway.service");
+        let commd_status = service_label(services, "kaonic-commd.service");
+        let gateway_status = service_label(services, "kaonic-gateway.service");
+
+        let mut ports = vec![
+            NetworkPortStatusDto {
+                name: "kaonic-commd gRPC".into(),
+                protocol: "TCP".into(),
+                port: 50051,
+                service: "kaonic-commd.service".into(),
+                status: if commd_active {
+                    "listening".into()
+                } else {
+                    commd_status.clone()
+                },
+                details: "Radio daemon gRPC API".into(),
+            },
+            NetworkPortStatusDto {
+                name: "kaonic-commd control".into(),
+                protocol: "UDP".into(),
+                port: self.kaonic_ctrl_server_addr.port(),
+                service: "kaonic-commd.service".into(),
+                status: if commd_active {
+                    "reachable".into()
+                } else {
+                    commd_status.clone()
+                },
+                details: self.kaonic_ctrl_server_addr.ip().to_string(),
+            },
+            NetworkPortStatusDto {
+                name: "kaonic-gateway HTTP".into(),
+                protocol: "TCP".into(),
+                port: self.http_addr.port(),
+                service: "kaonic-gateway.service".into(),
+                status: if gateway_active {
+                    "listening".into()
+                } else {
+                    gateway_status.clone()
+                },
+                details: "Dashboard, API, WebSocket".into(),
+            },
+        ];
+
+        for bridge in &self.atak_metrics {
+            ports.push(NetworkPortStatusDto {
+                name: format!("ATAK Bridge {}", bridge.port),
+                protocol: "UDP".into(),
+                port: bridge.port,
+                service: "kaonic-gateway.service".into(),
+                status: if gateway_active && bridge.dest_hash.get().is_some() {
+                    "linked".into()
+                } else if gateway_active {
+                    "listening".into()
+                } else {
+                    gateway_status.clone()
+                },
+                details: format!("Multicast bridge :{}", bridge.port),
+            });
+        }
+
+        ports.sort_by(|a, b| a.port.cmp(&b.port).then_with(|| a.protocol.cmp(&b.protocol)));
+        ports
+    }
+}
+
+fn service_active(services: &[ServiceStatusDto], unit: &str) -> bool {
+    services
+        .iter()
+        .find(|service| service.unit == unit)
+        .map(|service| service.load_state == "loaded" && service.active_state == "active")
+        .unwrap_or(false)
+}
+
+fn service_label(services: &[ServiceStatusDto], unit: &str) -> String {
+    services
+        .iter()
+        .find(|service| service.unit == unit)
+        .map(|service| {
+            if service.load_state != "loaded" {
+                service.load_state.clone()
+            } else {
+                service.active_state.clone()
+            }
+        })
+        .unwrap_or_else(|| "unknown".into())
 }

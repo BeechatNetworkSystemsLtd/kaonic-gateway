@@ -3,7 +3,8 @@ use axum::http::StatusCode;
 use axum::Json;
 use kaonic_vpn::VpnSnapshot;
 use kaonic_gateway::app_types::{
-    FrameStatsDto, NetworkSnapshotDto, ReticulumSnapshotDto, RxFrameDto, ServiceStatusDto,
+    FrameStatsDto, NetworkPortStatusDto, NetworkSnapshotDto, ReticulumSnapshotDto, RxFrameDto,
+    ServiceStatusDto,
 };
 use kaonic_gateway::audio::{
     AudioCardSnapshot, AudioControlSnapshot, AudioControlState, AudioError, AudioOutput,
@@ -152,7 +153,12 @@ pub async fn post_radio_test(
         ));
     }
 
-    transmit_test_frame(state.radio_client.clone(), module, message.as_bytes())
+    transmit_test_frame(
+        state.radio_client.clone(),
+        state.radio_tx_observer.clone(),
+        module,
+        message.as_bytes(),
+    )
         .await
         .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err))?;
 
@@ -486,6 +492,7 @@ pub struct SystemStatus {
 pub struct StatusResponse {
     vpn_hash: String,
     atak_bridges: Vec<AtakBridgeStatus>,
+    network_ports: Vec<NetworkPortStatusDto>,
     system: SystemStatus,
     services: Vec<ServiceStatusDto>,
     radio_modules: Vec<RadioModuleConfig>,
@@ -523,6 +530,8 @@ pub async fn build_status(state: &AppState) -> StatusResponse {
         .and_then(|s| s.load_config().ok())
         .map(|c| c.radio.module_configs.to_vec())
         .unwrap_or_default();
+    let services = read_gateway_services();
+    let network_ports = state.network_ports(&services);
 
     let rx_frames = [
         state.rx_buffers[0].lock().await.iter().cloned().collect(),
@@ -561,8 +570,9 @@ pub async fn build_status(state: &AppState) -> StatusResponse {
     StatusResponse {
         vpn_hash: state.vpn_hash.clone(),
         atak_bridges,
+        network_ports,
         system: read_system_status_async().await,
-        services: read_gateway_services(),
+        services,
         radio_modules,
         reticulum,
         vpn,

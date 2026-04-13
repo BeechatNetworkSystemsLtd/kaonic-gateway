@@ -1,7 +1,8 @@
 use leptos::prelude::*;
 
 use crate::app_types::{
-    AtakBridgeStatusDto, GatewayStatusDto, RadioModuleConfigDto, ServiceStatusDto, SystemStatusDto,
+    AtakBridgeStatusDto, GatewayStatusDto, NetworkPortStatusDto, RadioModuleConfigDto,
+    ServiceStatusDto, SystemStatusDto,
 };
 use crate::system_metrics::{
     read_cpu_percent_async, read_fs_mb, read_gateway_services, read_mem_mb, read_os_details,
@@ -50,11 +51,13 @@ pub async fn get_gateway_status() -> Result<GatewayStatusDto, ServerFnError> {
 
     let system = read_system_status_async().await;
     let services = read_gateway_services();
+    let network_ports = state.network_ports(&services);
 
     Ok(GatewayStatusDto {
         serial: state.serial.clone(),
         vpn_hash: state.vpn_hash.clone(),
         atak_bridges,
+        network_ports,
         system,
         services,
         radio_modules,
@@ -143,6 +146,7 @@ const WS_SCRIPT: &str = r#"
           return (svc.load_state || '') === 'loaded' && (svc.active_state || '') === 'active';
         }).length;
         set('services-count', activeServices + '/' + ((s.services || []).length) + ' active');
+        renderNetworkPorts(s.network_ports || []);
         (s.atak_bridges || []).forEach(function(b, i) {
           set('bridge-rx-' + i, '\u2193 ' + b.rx_packets);
           set('bridge-tx-' + i, '\u2191 ' + b.tx_packets);
@@ -193,6 +197,30 @@ const WS_SCRIPT: &str = r#"
   function formatStorageMb(mb) {
     return mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : mb + ' MB';
   }
+  function portBadgeClass(port) {
+    var status = String((port && port.status) || '').toLowerCase();
+    if (status === 'linked' || status === 'listening' || status === 'reachable' || status === 'active') { return 'badge-ok'; }
+    if (status === 'waiting' || status === 'activating' || status === 'reloading') { return 'badge-warn'; }
+    return 'badge-err';
+  }
+  function renderNetworkPorts(ports) {
+    var tbody = document.getElementById('network-ports');
+    if (!tbody) { return; }
+    set('network-ports-count', String((ports || []).length) + ' tracked');
+    if (!ports || ports.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="5" class="frames-empty">No network ports tracked</td></tr>';
+      return;
+    }
+    tbody.innerHTML = ports.map(function(port) {
+      return '<tr>'
+        + '<td class="td-time">' + (port.name || '—') + '</td>'
+        + '<td class="td-len">' + (port.protocol || '—') + '</td>'
+        + '<td class="td-len">' + String(port.port || 0) + '</td>'
+        + '<td class="td-time">' + (port.details || '—') + '</td>'
+        + '<td><span class="badge ' + portBadgeClass(port) + '">' + (port.status || 'unknown') + '</span></td>'
+        + '</tr>';
+    }).join('');
+  }
   document.addEventListener('click', function(ev) {
     var target = ev.target;
     if (!(target instanceof Element)) { return; }
@@ -220,12 +248,16 @@ const WS_SCRIPT: &str = r#"
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ unit: selectedService })
       }).then(function(resp) {
-        if (!resp.ok) {
-          return resp.text().then(function(text) {
-            throw new Error(text || ('HTTP ' + resp.status));
-          });
-        }
-        return resp.json();
+        return resp.text().then(function(text) {
+          var payload = null;
+          if (text) {
+            try { payload = JSON.parse(text); } catch (_) {}
+          }
+          if (!resp.ok) {
+            throw new Error((payload && payload.status) || text || ('HTTP ' + resp.status));
+          }
+          return payload;
+        });
       }).then(function() {
         closeRestartModal();
       }).catch(function(err) {
@@ -252,6 +284,7 @@ fn StatusView(status: GatewayStatusDto) -> impl IntoView {
         <div class="status-grid">
             <SystemCard system=status.system/>
             <ServicesCard services=status.services/>
+            <NetworkPortsCard ports=status.network_ports/>
             <VpnCard vpn_hash=status.vpn_hash serial=status.serial/>
             <AtakCard bridges=status.atak_bridges/>
         </div>
@@ -381,8 +414,10 @@ fn ServicesCard(services: Vec<ServiceStatusDto>) -> impl IntoView {
                                 type="button"
                                 class="btn-secondary service-restart-btn"
                                 data-service-restart=service.unit.clone()
+                                title="Restart service"
+                                aria-label=format!("Restart {}", service.unit)
                             >
-                                "Restart"
+                                "↻"
                             </button>
                         </div>
                     </div>
@@ -434,6 +469,53 @@ fn VpnCard(vpn_hash: String, serial: String) -> impl IntoView {
             <div class="info-row">
                 <span class="info-label">"VPN Hash"</span>
                 <code class="info-value hash">{vpn_hash}</code>
+            </div>
+        </div>
+    }
+}
+
+#[component]
+fn NetworkPortsCard(ports: Vec<NetworkPortStatusDto>) -> impl IntoView {
+    view! {
+        <div class="card">
+            <div class="card-header">
+                <span class="card-title">"Network Ports"</span>
+                <span class="badge" id="network-ports-count">{format!("{} tracked", ports.len())}</span>
+            </div>
+            <div class="reticulum-table-wrap">
+                <table class="frames-table">
+                    <thead>
+                        <tr>
+                            <th>"Name"</th>
+                            <th>"Proto"</th>
+                            <th>"Port"</th>
+                            <th>"Details"</th>
+                            <th>"State"</th>
+                        </tr>
+                    </thead>
+                    <tbody id="network-ports">
+                        {if ports.is_empty() {
+                            view! { <tr><td colspan="5" class="frames-empty">"No network ports tracked"</td></tr> }.into_any()
+                        } else {
+                            ports.into_iter().map(|port| {
+                                let badge_class = match port.status.as_str() {
+                                    "linked" | "listening" | "reachable" | "active" => "badge badge-ok",
+                                    "waiting" | "activating" | "reloading" => "badge badge-warn",
+                                    _ => "badge badge-err",
+                                };
+                                view! {
+                                    <tr>
+                                        <td class="td-time">{port.name}</td>
+                                        <td class="td-len">{port.protocol}</td>
+                                        <td class="td-len">{port.port}</td>
+                                        <td class="td-time">{port.details}</td>
+                                        <td><span class=badge_class>{port.status}</span></td>
+                                    </tr>
+                                }
+                            }).collect_view().into_any()
+                        }}
+                    </tbody>
+                </table>
             </div>
         </div>
     }

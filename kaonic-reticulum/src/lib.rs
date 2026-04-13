@@ -17,6 +17,8 @@ use tokio_util::sync::CancellationToken;
 
 pub use kaonic_ctrl::radio::RadioClient;
 
+pub type TxObserver = Arc<dyn Fn(usize, &[u8]) + Send + Sync>;
+
 /// Reticulum interface that forwards packets through the kaonic radio hardware
 /// via the kaonic-ctrl UDP control protocol.
 ///
@@ -26,6 +28,7 @@ pub use kaonic_ctrl::radio::RadioClient;
 pub struct KaonicCtrlInterface {
     radio_client: Arc<Mutex<RadioClient>>,
     module: usize,
+    tx_observer: Option<TxObserver>,
 }
 
 const TX_ECHO_WINDOW: Duration = Duration::from_millis(500);
@@ -102,18 +105,27 @@ impl KaonicCtrlInterface {
     }
 
     /// Create an interface for `module` using an already-connected `RadioClient`.
-    pub fn new(radio_client: Arc<Mutex<RadioClient>>, module: usize) -> Self {
+    pub fn new(
+        radio_client: Arc<Mutex<RadioClient>>,
+        module: usize,
+        tx_observer: Option<TxObserver>,
+    ) -> Self {
         Self {
             radio_client,
             module,
+            tx_observer,
         }
     }
 
     /// Spawn the interface tasks. Matches the pattern used by other Reticulum interfaces.
     pub async fn spawn(context: InterfaceContext<Self>) {
-        let (radio_client, module) = {
+        let (radio_client, module, tx_observer) = {
             let inner = context.inner.lock().unwrap();
-            (inner.radio_client.clone(), inner.module)
+            (
+                inner.radio_client.clone(),
+                inner.module,
+                inner.tx_observer.clone(),
+            )
         };
 
         let iface_address = context.channel.address;
@@ -162,6 +174,7 @@ impl KaonicCtrlInterface {
             let cancel = cancel.clone();
             let radio_client = radio_client.clone();
             let recent_tx = recent_tx.clone();
+            let tx_observer = tx_observer.clone();
 
             tokio::spawn(async move {
                 const BUF_SIZE: usize = reticulum::packet::PACKET_MDU * 2;
@@ -183,6 +196,8 @@ impl KaonicCtrlInterface {
                                     .await
                                 {
                                     log::warn!("kaonic_ctrl: tx error: {err:?}");
+                                } else if let Some(observer) = &tx_observer {
+                                    observer(module, bytes);
                                 }
                             }
                         }

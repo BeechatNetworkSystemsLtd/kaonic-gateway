@@ -1,5 +1,4 @@
 use leptos::prelude::*;
-use kaonic_vpn::{VpnPeerSnapshot, VpnRouteSnapshot, VpnSnapshot};
 use serde::{Deserialize, Serialize};
 
 use crate::app_types::{ReticulumEventDto, ReticulumLinkDto, ReticulumSnapshotDto};
@@ -15,9 +14,24 @@ fn format_timestamp(ts: u64) -> String {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReticulumPageSnapshot {
     pub local_hash: String,
-    pub configured_peers: Vec<String>,
+    pub local_destinations: Vec<LocalDestinationRow>,
+    pub open_destinations: Vec<DestinationRow>,
     pub reticulum: ReticulumSnapshotDto,
-    pub vpn: VpnSnapshot,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LocalDestinationRow {
+    pub name: String,
+    pub destination: String,
+    pub kind: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DestinationRow {
+    pub destination: String,
+    pub source: String,
+    pub status: String,
 }
 
 #[server]
@@ -27,22 +41,17 @@ pub async fn load_reticulum_snapshot() -> Result<ReticulumPageSnapshot, ServerFn
     let state = leptos::context::use_context::<AppState>()
         .ok_or_else(|| ServerFnError::new("missing AppState context"))?;
 
-    let configured_peers = state
-        .settings
-        .lock()
-        .ok()
-        .and_then(|settings| settings.load_config().ok())
-        .map(|config| config.peers)
-        .unwrap_or_default();
+    let reticulum = state.reticulum.snapshot().await;
+    let vpn = match &state.vpn {
+        Some(vpn) => vpn.snapshot().await,
+        None => Default::default(),
+    };
 
     Ok(ReticulumPageSnapshot {
         local_hash: state.vpn_hash.clone(),
-        configured_peers,
-        reticulum: state.reticulum.snapshot().await,
-        vpn: match &state.vpn {
-            Some(vpn) => vpn.snapshot().await,
-            None => VpnSnapshot::default(),
-        },
+        local_destinations: collect_local_destinations(&state, &vpn),
+        open_destinations: collect_open_destinations(&reticulum),
+        reticulum,
     })
 }
 
@@ -70,6 +79,13 @@ const RETICULUM_WS_JS: &str = r#"
         return new Date(ts * 1000).toLocaleTimeString();
     }
 
+    function formatHash(value) {
+        var text = String(value == null ? '' : value).replace(/\s+/g, '');
+        if (!text) { return '—'; }
+        if (!/^[0-9a-fA-F]+$/.test(text)) { return text; }
+        return text.match(/.{1,4}/g).join(' ');
+    }
+
     function renderLinks(id, links, emptyText) {
         var tbody = document.getElementById(id);
         if (!tbody) { return; }
@@ -79,8 +95,8 @@ const RETICULUM_WS_JS: &str = r#"
         }
         tbody.innerHTML = links.map(function(link) {
             return '<tr>'
-                + '<td class="td-hex">' + escapeHtml(link.id || '—') + '</td>'
-                + '<td class="td-hex">' + escapeHtml(link.destination || '—') + '</td>'
+                + '<td class="td-hex td-hash">' + escapeHtml(formatHash(link.id || '—')) + '</td>'
+                + '<td class="td-hex td-hash">' + escapeHtml(formatHash(link.destination || '—')) + '</td>'
                 + '<td class="td-time">' + escapeHtml(link.status || '—') + '</td>'
                 + '<td class="td-len">' + escapeHtml(link.rtt_ms != null ? String(link.rtt_ms) + " ms" : '—') + '</td>'
                 + '<td class="td-len">' + escapeHtml(String(link.packets || 0)) + '</td>'
@@ -102,44 +118,104 @@ const RETICULUM_WS_JS: &str = r#"
                 + '<td class="td-time">' + escapeHtml(formatTime(event.ts)) + '</td>'
                 + '<td class="td-time">' + escapeHtml(event.direction || '—') + '</td>'
                 + '<td class="td-time">' + escapeHtml(event.kind || '—') + '</td>'
-                + '<td class="td-hex">' + escapeHtml(event.link_id || '—') + '</td>'
-                + '<td class="td-hex">' + escapeHtml(event.destination || '—') + '</td>'
+                + '<td class="td-hex td-hash">' + escapeHtml(formatHash(event.link_id || '—')) + '</td>'
+                + '<td class="td-hex td-hash">' + escapeHtml(formatHash(event.destination || '—')) + '</td>'
                 + '<td class="td-hex">' + escapeHtml(event.details || '—') + '</td>'
                 + '</tr>';
         }).join('');
     }
 
-    function renderVpnPeers(peers) {
-        var tbody = document.getElementById('vpn-peers');
+    function collectOpenDestinations(reticulum) {
+        var map = {};
+
+        function upsert(destination, source, status) {
+            if (!destination) { return; }
+            if (!map[destination]) {
+                map[destination] = { destination: destination, sources: [], statuses: [] };
+            }
+            if (source && map[destination].sources.indexOf(source) === -1) {
+                map[destination].sources.push(source);
+            }
+            if (status && map[destination].statuses.indexOf(status) === -1) {
+                map[destination].statuses.push(status);
+            }
+        }
+
+        (reticulum.incoming_links || []).forEach(function(link) {
+            upsert(link.destination, 'incoming link', link.status);
+        });
+        (reticulum.outgoing_links || []).forEach(function(link) {
+            upsert(link.destination, 'outgoing link', link.status);
+        });
+        (reticulum.events || []).forEach(function(event) {
+            if (event.kind === 'announce') {
+                upsert(event.destination, 'announce', event.kind);
+            }
+        });
+        return Object.values(map)
+            .sort(function(a, b) { return a.destination.localeCompare(b.destination); })
+            .map(function(entry) {
+                return {
+                    destination: entry.destination,
+                    source: entry.sources.join(', ') || '—',
+                    status: entry.statuses.join(', ') || '—'
+                };
+            });
+    }
+
+    function renderOpenDestinations(reticulum) {
+        var tbody = document.getElementById('reticulum-open-destinations');
         if (!tbody) { return; }
-        if (!peers || peers.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="4" class="frames-empty">No VPN peers configured</td></tr>';
+        var rows = collectOpenDestinations(reticulum);
+        if (!rows.length) {
+            tbody.innerHTML = '<tr><td colspan="3" class="frames-empty">No open destinations observed yet</td></tr>';
             return;
         }
-        tbody.innerHTML = peers.map(function(peer) {
-            var routes = (peer.announced_routes || []).join(', ');
+        tbody.innerHTML = rows.map(function(row) {
             return '<tr>'
-                + '<td class="td-hex">' + escapeHtml(peer.destination || '—') + '</td>'
-                + '<td class="td-time">' + escapeHtml(peer.link_state || '—') + '</td>'
-                + '<td class="td-hex">' + escapeHtml(routes || '—') + '</td>'
-                + '<td class="td-time">' + escapeHtml(formatTime(peer.last_seen_ts)) + '</td>'
+                + '<td class="td-hex td-hash">' + escapeHtml(formatHash(row.destination)) + '</td>'
+                + '<td class="td-time">' + escapeHtml(row.source) + '</td>'
+                + '<td class="td-time">' + escapeHtml(row.status) + '</td>'
                 + '</tr>';
         }).join('');
     }
 
-    function renderVpnRoutes(routes) {
-        var tbody = document.getElementById('vpn-routes');
+    function collectLocalDestinations(payload) {
+        var rows = [];
+        var vpn = payload.vpn || {};
+        if (vpn.destination_hash) {
+            rows.push({
+                name: 'kaonic.vpn',
+                destination: vpn.destination_hash,
+                kind: 'VPN',
+                status: vpn.status || 'ready'
+            });
+        }
+        (payload.atak_bridges || []).forEach(function(bridge) {
+            rows.push({
+                name: 'kaonic.atak.' + String(bridge.port || ''),
+                destination: bridge.dest_hash || '',
+                kind: 'ATAK',
+                status: bridge.dest_hash ? 'ready' : 'starting'
+            });
+        });
+        return rows.sort(function(a, b) { return a.name.localeCompare(b.name); });
+    }
+
+    function renderLocalDestinations(payload) {
+        var tbody = document.getElementById('reticulum-local-destinations');
         if (!tbody) { return; }
-        if (!routes || routes.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="4" class="frames-empty">No VPN routes announced yet</td></tr>';
+        var rows = collectLocalDestinations(payload);
+        if (!rows.length) {
+            tbody.innerHTML = '<tr><td colspan="4" class="frames-empty">No local destinations registered yet</td></tr>';
             return;
         }
-        tbody.innerHTML = routes.map(function(route) {
+        tbody.innerHTML = rows.map(function(row) {
             return '<tr>'
-                + '<td class="td-hex">' + escapeHtml(route.network || '—') + '</td>'
-                + '<td class="td-hex">' + escapeHtml(route.owner || '—') + '</td>'
-                + '<td class="td-time">' + escapeHtml(route.status || '—') + '</td>'
-                + '<td class="td-time">' + escapeHtml(route.installed ? 'yes' : 'no') + '</td>'
+                + '<td class="td-time">' + escapeHtml(row.name) + '</td>'
+                + '<td class="td-hex td-hash">' + escapeHtml(formatHash(row.destination || '—')) + '</td>'
+                + '<td class="td-time">' + escapeHtml(row.kind) + '</td>'
+                + '<td class="td-time">' + escapeHtml(row.status) + '</td>'
                 + '</tr>';
         }).join('');
     }
@@ -148,21 +224,18 @@ const RETICULUM_WS_JS: &str = r#"
         try {
             var payload = JSON.parse(ev.data) || {};
             var snapshot = payload.reticulum || {};
-            var vpn = payload.vpn || {};
             var incoming = snapshot.incoming_links || [];
             var outgoing = snapshot.outgoing_links || [];
             var events = snapshot.events || [];
             setText('reticulum-incoming-count', String(incoming.length));
             setText('reticulum-outgoing-count', String(outgoing.length));
             setText('reticulum-events-count', String(events.length));
-            setText('vpn-status', vpn.status || '—');
-            setText('vpn-backend', vpn.backend || '—');
-            setText('vpn-interface', vpn.interface_name || '—');
+            setText('reticulum-local-destinations-count', String(collectLocalDestinations(payload).length));
             renderLinks('reticulum-incoming-links', incoming, 'No incoming links seen');
             renderLinks('reticulum-outgoing-links', outgoing, 'No outgoing links seen');
+            renderLocalDestinations(payload);
             renderEvents(events);
-            renderVpnPeers(vpn.peers || []);
-            renderVpnRoutes(vpn.remote_routes || []);
+            renderOpenDestinations(snapshot);
         } catch (e) {}
     };
 })();
@@ -191,17 +264,10 @@ pub fn ReticulumPage() -> impl IntoView {
 
 #[component]
 fn ReticulumContent(snapshot: ReticulumPageSnapshot) -> impl IntoView {
+    let local_destinations_count = snapshot.local_destinations.len();
     let incoming_count = snapshot.reticulum.incoming_links.len();
     let outgoing_count = snapshot.reticulum.outgoing_links.len();
     let events_count = snapshot.reticulum.events.len();
-    let vpn_status = snapshot.vpn.status.clone();
-    let vpn_backend = snapshot.vpn.backend.clone();
-    let configured_peer_count = snapshot.configured_peers.len();
-    let vpn_interface = snapshot
-        .vpn
-        .interface_name
-        .clone()
-        .unwrap_or_else(|| "—".into());
 
     view! {
         <div class="reticulum-summary">
@@ -219,14 +285,11 @@ fn ReticulumContent(snapshot: ReticulumPageSnapshot) -> impl IntoView {
             </div>
             <div class="card stat-card">
                 <span class="stat-label">"Local hash"</span>
-                <span class="stat-value td-hex">{snapshot.local_hash}</span>
-                <span class="stat-label">{format!("{configured_peer_count} configured peers")}</span>
+                <span class="stat-value td-hex td-hash">{format_hash(&snapshot.local_hash)}</span>
             </div>
             <div class="card stat-card">
-                <span class="stat-label">"VPN status"</span>
-                <span class="stat-value" id="vpn-status">{vpn_status}</span>
-                <span class="stat-label" id="vpn-backend">{vpn_backend}</span>
-                <span class="stat-label" id="vpn-interface">{vpn_interface}</span>
+                <span class="stat-label">"My destinations"</span>
+                <span class="stat-value" id="reticulum-local-destinations-count">{local_destinations_count}</span>
             </div>
         </div>
 
@@ -246,9 +309,8 @@ fn ReticulumContent(snapshot: ReticulumPageSnapshot) -> impl IntoView {
         </div>
 
         <div class="reticulum-grid">
-            <ConfiguredPeersCard peers=snapshot.configured_peers />
-            <VpnPeersCard peers=snapshot.vpn.peers />
-            <VpnRoutesCard routes=snapshot.vpn.remote_routes />
+            <LocalDestinationsCard destinations=snapshot.local_destinations />
+            <OpenDestinationsCard destinations=snapshot.open_destinations />
         </div>
 
         <ReticulumEventsCard events=snapshot.reticulum.events />
@@ -297,8 +359,8 @@ fn ReticulumLinksCard(
                                         .unwrap_or_else(|| "—".into());
                                     view! {
                                         <tr>
-                                            <td class="td-hex">{link.id}</td>
-                                            <td class="td-hex">{link.destination}</td>
+                                            <td class="td-hex td-hash">{format_hash(&link.id)}</td>
+                                            <td class="td-hex td-hash">{format_hash(&link.destination)}</td>
                                             <td class="td-time">{link.status}</td>
                                             <td class="td-len">{rtt}</td>
                                             <td class="td-len">{link.packets}</td>
@@ -353,10 +415,10 @@ fn ReticulumEventsCard(events: Vec<ReticulumEventDto>) -> impl IntoView {
                                             <td class="td-time">{ts}</td>
                                             <td class="td-time">{event.direction}</td>
                                             <td class="td-time">{event.kind}</td>
-                                            <td class="td-hex">
-                                                {if event.link_id.is_empty() { "—".into() } else { event.link_id }}
+                                            <td class="td-hex td-hash">
+                                                {if event.link_id.is_empty() { "—".into() } else { format_hash(&event.link_id) }}
                                             </td>
-                                            <td class="td-hex">{event.destination}</td>
+                                            <td class="td-hex td-hash">{format_hash(&event.destination)}</td>
                                             <td class="td-hex">{event.details}</td>
                                         </tr>
                                     }
@@ -372,27 +434,33 @@ fn ReticulumEventsCard(events: Vec<ReticulumEventDto>) -> impl IntoView {
 }
 
 #[component]
-fn ConfiguredPeersCard(peers: Vec<String>) -> impl IntoView {
+fn LocalDestinationsCard(destinations: Vec<LocalDestinationRow>) -> impl IntoView {
     view! {
         <div class="card reticulum-card">
             <div class="card-header">
-                <span class="card-title">"Configured Peers"</span>
+                <span class="card-title">"My Destinations"</span>
             </div>
             <div class="reticulum-table-wrap">
                 <table class="frames-table">
                     <thead>
                         <tr>
+                            <th>"Name"</th>
                             <th>"Destination"</th>
+                            <th>"Type"</th>
+                            <th>"State"</th>
                         </tr>
                     </thead>
-                    <tbody>
-                        {if peers.is_empty() {
-                            view! { <tr><td class="frames-empty">"No peers configured yet"</td></tr> }.into_any()
+                    <tbody id="reticulum-local-destinations">
+                        {if destinations.is_empty() {
+                            view! { <tr><td colspan="4" class="frames-empty">"No local destinations registered yet"</td></tr> }.into_any()
                         } else {
-                            peers.into_iter().map(|peer| {
+                            destinations.into_iter().map(|destination| {
                                 view! {
                                     <tr>
-                                        <td class="td-hex">{peer}</td>
+                                        <td class="td-time">{destination.name}</td>
+                                        <td class="td-hex td-hash">{format_hash(&destination.destination)}</td>
+                                        <td class="td-time">{destination.kind}</td>
+                                        <td class="td-time">{destination.status}</td>
                                     </tr>
                                 }
                             }).collect_view().into_any()
@@ -405,38 +473,31 @@ fn ConfiguredPeersCard(peers: Vec<String>) -> impl IntoView {
 }
 
 #[component]
-fn VpnPeersCard(peers: Vec<VpnPeerSnapshot>) -> impl IntoView {
+fn OpenDestinationsCard(destinations: Vec<DestinationRow>) -> impl IntoView {
     view! {
         <div class="card reticulum-card">
             <div class="card-header">
-                <span class="card-title">"VPN Peers"</span>
+                <span class="card-title">"Open Destinations"</span>
             </div>
             <div class="reticulum-table-wrap">
                 <table class="frames-table">
                     <thead>
                         <tr>
                             <th>"Destination"</th>
-                            <th>"Link"</th>
-                            <th>"Routes"</th>
-                            <th>"Last seen"</th>
+                            <th>"Seen via"</th>
+                            <th>"State"</th>
                         </tr>
                     </thead>
-                    <tbody id="vpn-peers">
-                        {if peers.is_empty() {
-                            view! { <tr><td colspan="4" class="frames-empty">"No VPN peers configured"</td></tr> }.into_any()
+                    <tbody id="reticulum-open-destinations">
+                        {if destinations.is_empty() {
+                            view! { <tr><td colspan="3" class="frames-empty">"No open destinations observed yet"</td></tr> }.into_any()
                         } else {
-                            peers.into_iter().map(|peer| {
-                                let routes = if peer.announced_routes.is_empty() {
-                                    "—".to_string()
-                                } else {
-                                    peer.announced_routes.join(", ")
-                                };
+                            destinations.into_iter().map(|destination| {
                                 view! {
                                     <tr>
-                                        <td class="td-hex">{peer.destination}</td>
-                                        <td class="td-time">{peer.link_state}</td>
-                                        <td class="td-hex">{routes}</td>
-                                        <td class="td-time">{format_timestamp(peer.last_seen_ts)}</td>
+                                        <td class="td-hex td-hash">{format_hash(&destination.destination)}</td>
+                                        <td class="td-time">{destination.source}</td>
+                                        <td class="td-time">{destination.status}</td>
                                     </tr>
                                 }
                             }).collect_view().into_any()
@@ -448,41 +509,102 @@ fn VpnPeersCard(peers: Vec<VpnPeerSnapshot>) -> impl IntoView {
     }
 }
 
-#[component]
-fn VpnRoutesCard(routes: Vec<VpnRouteSnapshot>) -> impl IntoView {
-    view! {
-        <div class="card reticulum-card">
-            <div class="card-header">
-                <span class="card-title">"VPN Routes"</span>
-            </div>
-            <div class="reticulum-table-wrap">
-                <table class="frames-table">
-                    <thead>
-                        <tr>
-                            <th>"Network"</th>
-                            <th>"Owner"</th>
-                            <th>"Status"</th>
-                            <th>"Installed"</th>
-                        </tr>
-                    </thead>
-                    <tbody id="vpn-routes">
-                        {if routes.is_empty() {
-                            view! { <tr><td colspan="4" class="frames-empty">"No VPN routes announced yet"</td></tr> }.into_any()
-                        } else {
-                            routes.into_iter().map(|route| {
-                                view! {
-                                    <tr>
-                                        <td class="td-hex">{route.network}</td>
-                                        <td class="td-hex">{route.owner}</td>
-                                        <td class="td-time">{route.status}</td>
-                                        <td class="td-time">{if route.installed { "yes" } else { "no" }}</td>
-                                    </tr>
-                                }
-                            }).collect_view().into_any()
-                        }}
-                    </tbody>
-                </table>
-            </div>
-        </div>
+fn format_hash(value: &str) -> String {
+    let compact = value.split_whitespace().collect::<String>();
+    if compact.is_empty() {
+        return "—".into();
     }
+    if !compact.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return compact;
+    }
+    compact
+        .as_bytes()
+        .chunks(4)
+        .map(|chunk| std::str::from_utf8(chunk).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn collect_local_destinations(
+    state: &crate::state::AppState,
+    vpn: &kaonic_vpn::VpnSnapshot,
+) -> Vec<LocalDestinationRow> {
+    let mut rows = Vec::new();
+
+    if !vpn.destination_hash.is_empty() {
+        rows.push(LocalDestinationRow {
+            name: "kaonic.vpn".into(),
+            destination: vpn.destination_hash.clone(),
+            kind: "VPN".into(),
+            status: vpn.status.clone(),
+        });
+    }
+
+    for bridge in &state.atak_metrics {
+        rows.push(LocalDestinationRow {
+            name: format!("kaonic.atak.{}", bridge.port),
+            destination: bridge.dest_hash.get().cloned().unwrap_or_default(),
+            kind: "ATAK".into(),
+            status: if bridge.dest_hash.get().is_some() {
+                "ready".into()
+            } else {
+                "starting".into()
+            },
+        });
+    }
+
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows
+}
+
+fn collect_open_destinations(reticulum: &ReticulumSnapshotDto) -> Vec<DestinationRow> {
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    struct Entry {
+        sources: Vec<String>,
+        statuses: Vec<String>,
+    }
+
+    fn push_unique(items: &mut Vec<String>, value: &str) {
+        if !value.is_empty() && !items.iter().any(|item| item == value) {
+            items.push(value.to_string());
+        }
+    }
+
+    let mut entries = BTreeMap::<String, Entry>::new();
+
+    for link in &reticulum.incoming_links {
+        let entry = entries.entry(link.destination.clone()).or_default();
+        push_unique(&mut entry.sources, "incoming link");
+        push_unique(&mut entry.statuses, &link.status);
+    }
+    for link in &reticulum.outgoing_links {
+        let entry = entries.entry(link.destination.clone()).or_default();
+        push_unique(&mut entry.sources, "outgoing link");
+        push_unique(&mut entry.statuses, &link.status);
+    }
+    for event in &reticulum.events {
+        if event.kind == "announce" && !event.destination.is_empty() {
+            let entry = entries.entry(event.destination.clone()).or_default();
+            push_unique(&mut entry.sources, "announce");
+            push_unique(&mut entry.statuses, "announce");
+        }
+    }
+    entries
+        .into_iter()
+        .map(|(destination, entry)| DestinationRow {
+            destination,
+            source: if entry.sources.is_empty() {
+                "—".into()
+            } else {
+                entry.sources.join(", ")
+            },
+            status: if entry.statuses.is_empty() {
+                "—".into()
+            } else {
+                entry.statuses.join(", ")
+            },
+        })
+        .collect()
 }

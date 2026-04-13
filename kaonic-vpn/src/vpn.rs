@@ -1,9 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-#[cfg(target_os = "linux")]
-use std::net::Ipv4Addr;
 
 use cidr::Ipv4Cidr;
 #[cfg(target_os = "linux")]
@@ -62,6 +61,7 @@ impl From<serde_json::Error> for VpnRuntimeError {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VpnPeerSnapshot {
     pub destination: String,
+    pub tunnel_ip: Option<String>,
     pub link_state: String,
     pub announced_routes: Vec<String>,
     pub last_seen_ts: u64,
@@ -79,6 +79,9 @@ pub struct VpnRouteSnapshot {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VpnSnapshot {
+    pub destination_hash: String,
+    pub network: String,
+    pub local_tunnel_ip: Option<String>,
     pub backend: String,
     pub interface_name: Option<String>,
     pub status: String,
@@ -98,7 +101,22 @@ struct PeerState {
     last_error: Option<String>,
 }
 
+impl PeerState {
+    fn new(destination: AddressHash, link_state: &str) -> Self {
+        Self {
+            destination,
+            link_state: link_state.into(),
+            announced_routes: Vec::new(),
+            last_seen_ts: 0,
+            last_error: None,
+        }
+    }
+}
+
 struct VpnRuntimeState {
+    destination_hash: String,
+    network: Ipv4Cidr,
+    local_tunnel_ip: Ipv4Addr,
     backend: String,
     interface_name: Option<String>,
     status: String,
@@ -127,9 +145,15 @@ impl VpnRuntime {
         cancel: CancellationToken,
     ) -> Result<Arc<Self>, VpnRuntimeError> {
         let peers = parse_configured_peers(&config.peers)?;
+        validate_peer_network(config.network)?;
+
+        let local_tunnel_ip = derive_tunnel_ip(config.network, &id.address_hash())?;
 
         let tun = platform_create_tun()?;
         let interface_name = platform_tun_name(tun.as_ref());
+        if let Some(interface_name) = interface_name.as_deref() {
+            platform_configure_tun_address(interface_name, local_tunnel_ip, config.network.network_length())?;
+        }
         let local_routes = discover_local_routes(interface_name.as_deref());
         if interface_name.is_some() {
             platform_enable_forwarding()?;
@@ -144,6 +168,9 @@ impl VpnRuntime {
 
         let runtime = Arc::new(Self {
             state: Mutex::new(VpnRuntimeState {
+                destination_hash: destination_hash.to_hex_string(),
+                network: config.network,
+                local_tunnel_ip,
                 backend: platform_backend_name().into(),
                 interface_name: interface_name.clone(),
                 status: if interface_name.is_some() {
@@ -155,16 +182,7 @@ impl VpnRuntime {
                 peers: peers
                     .iter()
                     .map(|peer| {
-                        (
-                            peer.to_hex_string(),
-                            PeerState {
-                                destination: *peer,
-                                link_state: "configured".into(),
-                                announced_routes: Vec::new(),
-                                last_seen_ts: 0,
-                                last_error: None,
-                            },
-                        )
+                        (peer.to_hex_string(), PeerState::new(*peer, "configured"))
                     })
                     .collect(),
                 installed_routes: BTreeSet::new(),
@@ -203,7 +221,6 @@ impl VpnRuntime {
             let runtime = runtime.clone();
             let transport = transport.clone();
             let cancel = cancel.clone();
-            let configured_peers = peers.clone();
             tokio::spawn(async move {
                 let mut announce_rx = transport.lock().await.recv_announces().await;
                 loop {
@@ -212,7 +229,7 @@ impl VpnRuntime {
                         recv = announce_rx.recv() => match recv {
                             Ok(announce) => {
                                 let destination = announce.destination.lock().await.desc.clone();
-                                if destination.address_hash == destination_hash || !configured_peers.contains(&destination.address_hash) {
+                                if destination.address_hash == destination_hash {
                                     continue;
                                 }
                                 let Some(parsed) = decode_announce(announce.app_data.as_slice()) else {
@@ -220,6 +237,7 @@ impl VpnRuntime {
                                 };
                                 match parsed {
                                     Ok(routes) => {
+                                        runtime.ensure_peer(destination.address_hash, "discovered").await;
                                         runtime.update_peer_routes(destination.address_hash, routes).await;
                                         let existing = transport.lock().await.find_out_link(&destination.address_hash).await;
                                         if existing.is_none() {
@@ -341,34 +359,48 @@ impl VpnRuntime {
 
     async fn update_peer_routes(&self, destination: AddressHash, routes: Vec<Ipv4Cidr>) {
         let mut state = self.state.lock().await;
-        if let Some(peer) = state.peers.get_mut(&destination.to_hex_string()) {
-            peer.announced_routes = routes;
-            peer.last_seen_ts = unix_timestamp_secs();
-            peer.last_error = None;
-        }
+        let peer = state
+            .peers
+            .entry(destination.to_hex_string())
+            .or_insert_with(|| PeerState::new(destination, "discovered"));
+        peer.announced_routes = routes;
+        peer.last_seen_ts = unix_timestamp_secs();
+        peer.last_error = None;
         state.last_error = None;
     }
 
     async fn record_peer_error(&self, destination: AddressHash, message: String) {
         let mut state = self.state.lock().await;
-        if let Some(peer) = state.peers.get_mut(&destination.to_hex_string()) {
-            peer.last_error = Some(message.clone());
-        }
+        let peer = state
+            .peers
+            .entry(destination.to_hex_string())
+            .or_insert_with(|| PeerState::new(destination, "discovered"));
+        peer.last_error = Some(message.clone());
         state.last_error = Some(message);
         state.status = "error".into();
     }
 
     async fn set_peer_link_state(&self, destination: AddressHash, link_state: &str) {
         let mut state = self.state.lock().await;
-        if let Some(peer) = state.peers.get_mut(&destination.to_hex_string()) {
-            peer.link_state = link_state.into();
-            if link_state == "active" {
-                peer.last_seen_ts = unix_timestamp_secs();
-            }
+        let peer = state
+            .peers
+            .entry(destination.to_hex_string())
+            .or_insert_with(|| PeerState::new(destination, "discovered"));
+        peer.link_state = link_state.into();
+        if link_state == "active" {
+            peer.last_seen_ts = unix_timestamp_secs();
         }
         if state.status != "mock" {
             state.status = "running".into();
         }
+    }
+
+    async fn ensure_peer(&self, destination: AddressHash, link_state: &str) {
+        let mut state = self.state.lock().await;
+        state
+            .peers
+            .entry(destination.to_hex_string())
+            .or_insert_with(|| PeerState::new(destination, link_state));
     }
 
     #[cfg(target_os = "linux")]
@@ -440,6 +472,7 @@ fn build_snapshot(state: &VpnRuntimeState) -> VpnSnapshot {
         .iter()
         .map(|(destination, peer)| VpnPeerSnapshot {
             destination: destination.clone(),
+            tunnel_ip: assign_tunnel_ip_for_peer(state.network, peer).map(|ip| ip.to_string()),
             link_state: peer.link_state.clone(),
             announced_routes: peer
                 .announced_routes
@@ -493,6 +526,9 @@ fn build_snapshot(state: &VpnRuntimeState) -> VpnSnapshot {
     local_routes.sort();
 
     VpnSnapshot {
+        destination_hash: state.destination_hash.clone(),
+        network: state.network.to_string(),
+        local_tunnel_ip: Some(state.local_tunnel_ip.to_string()),
         backend: state.backend.clone(),
         interface_name: state.interface_name.clone(),
         status: state.status.clone(),
@@ -501,6 +537,33 @@ fn build_snapshot(state: &VpnRuntimeState) -> VpnSnapshot {
         remote_routes,
         last_error: state.last_error.clone(),
     }
+}
+
+fn validate_peer_network(network: Ipv4Cidr) -> Result<(), VpnRuntimeError> {
+    if network.network_length() > 30 {
+        return Err(VpnRuntimeError::Config(format!(
+            "vpn network {network} must have at least 2 host bits for automatic peer IP assignment"
+        )));
+    }
+    Ok(())
+}
+
+fn assign_tunnel_ip_for_peer(network: Ipv4Cidr, peer: &PeerState) -> Option<Ipv4Addr> {
+    derive_tunnel_ip(network, &peer.destination).ok()
+}
+
+fn derive_tunnel_ip(network: Ipv4Cidr, destination: &AddressHash) -> Result<Ipv4Addr, VpnRuntimeError> {
+    validate_peer_network(network)?;
+
+    let host_bits = 32 - network.network_length() as u32;
+    let usable_hosts = (1u64 << host_bits) - 2;
+    let mut seed = 0u64;
+    for byte in destination.as_slice() {
+        seed = seed.wrapping_mul(131).wrapping_add(u64::from(*byte));
+    }
+    let host_offset = (seed % usable_hosts) + 1;
+    let network_base = u32::from(network.first_address());
+    Ok(Ipv4Addr::from(network_base.wrapping_add(host_offset as u32)))
 }
 
 fn desired_route_owners(state: &VpnRuntimeState) -> (BTreeMap<Ipv4Cidr, String>, BTreeSet<String>) {
@@ -693,6 +756,25 @@ fn platform_enable_forwarding() -> Result<(), VpnRuntimeError> {
 
 #[cfg(not(target_os = "linux"))]
 fn platform_enable_forwarding() -> Result<(), VpnRuntimeError> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn platform_configure_tun_address(
+    interface_name: &str,
+    address: Ipv4Addr,
+    prefix_len: u8,
+) -> Result<(), VpnRuntimeError> {
+    let cidr = format!("{address}/{prefix_len}");
+    run_command("ip", &["addr", "replace", &cidr, "dev", interface_name]).map(|_| ())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn platform_configure_tun_address(
+    _interface_name: &str,
+    _address: Ipv4Addr,
+    _prefix_len: u8,
+) -> Result<(), VpnRuntimeError> {
     Ok(())
 }
 

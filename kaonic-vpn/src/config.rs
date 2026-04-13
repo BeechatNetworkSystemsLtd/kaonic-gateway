@@ -7,7 +7,7 @@ fn default_announce_freq_secs() -> u32 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VpnConfig {
-    /// Reserved transit network for future overlay/IP assignment work.
+    /// Transit network used for deterministic tunnel IP assignment.
     pub network: Ipv4Cidr,
     /// Remote Kaonic Reticulum destination hashes that should participate in the VPN.
     pub peers: Vec<String>,

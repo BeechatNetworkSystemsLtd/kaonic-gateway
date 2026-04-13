@@ -11,7 +11,9 @@ use http::{AppState, SharedSettings};
 use kaonic_vpn::{VpnConfig, VpnRuntime};
 use kaonic_gateway::atak::{AtakBridge, BridgeMetrics};
 use kaonic_gateway::gateway_reticulum::GatewayReticulum;
-use kaonic_gateway::radio::{attach_radio_interface, connect_radio_client, SharedRadioClient};
+use kaonic_gateway::radio::{
+    attach_radio_interface, connect_radio_client, SharedRadioClient, SharedTxObserver,
+};
 use kaonic_gateway::settings::Settings;
 use log;
 use reticulum::identity::PrivateIdentity;
@@ -99,6 +101,10 @@ async fn async_main() -> Result<(), process::ExitCode> {
             Vec::new(),
             "webapp-only".into(),
             None,
+            cmd.kaonic_ctrl_server
+                .unwrap_or_else(|| "192.168.10.1:9090".parse().unwrap()),
+            cmd.http_addr,
+            None,
             None,
             reticulum,
             serial,
@@ -132,13 +138,25 @@ async fn async_main() -> Result<(), process::ExitCode> {
         process::ExitCode::FAILURE
     })?;
 
+    let (tx_events_tx, mut tx_events_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(usize, Vec<u8>)>();
+    let radio_tx_observer: SharedTxObserver = Arc::new(move |module, payload| {
+        let _ = tx_events_tx.send((module, payload.to_vec()));
+    });
+
     let mut transport_cfg = TransportConfig::new("kaonic-gateway", &id, true);
     transport_cfg.set_retransmit(true);
     let transport = Arc::new(tokio::sync::Mutex::new(Transport::new(transport_cfg)));
     let reticulum = Arc::new(GatewayReticulum::new());
     reticulum.attach(transport.clone()).await;
 
-    attach_radio_interface(&transport, radio_client.clone(), &config.radio, 0)
+    attach_radio_interface(
+        &transport,
+        radio_client.clone(),
+        &config.radio,
+        0,
+        Some(radio_tx_observer.clone()),
+    )
         .await
         .map_err(|err| {
             log::error!("radio interface attach error: {err:?}");
@@ -193,6 +211,9 @@ async fn async_main() -> Result<(), process::ExitCode> {
         atak_metrics,
         vpn_hash,
         vpn,
+        server_addr,
+        cmd.http_addr,
+        Some(radio_tx_observer.clone()),
         Some(radio_client.clone()),
         reticulum,
         serial,
@@ -208,7 +229,6 @@ async fn async_main() -> Result<(), process::ExitCode> {
         let rx_bufs = app_state.rx_buffers.clone();
         let frame_stats = app_state.frame_stats.clone();
         let mut rx = radio_client.lock().await.module_receive();
-        let mut tx = radio_client.lock().await.module_transmit();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -239,15 +259,15 @@ async fn async_main() -> Result<(), process::ExitCode> {
                         Err(RecvError::Lagged(_)) => continue,
                         Err(_) => break,
                     },
-                    sent = tx.recv() => match sent {
-                        Ok(sent) => {
-                            let module = sent.module.min(1);
+                    sent = tx_events_rx.recv() => match sent {
+                        Some((module, payload)) => {
+                            let module = module.min(1);
                             let entry = RxFrameDto {
                                 module,
                                 direction: "tx".into(),
                                 rssi: 0,
-                                len: sent.frame.len,
-                                hex: frame_preview(sent.frame.as_slice()),
+                                len: payload.len() as u16,
+                                hex: frame_preview(payload.as_slice()),
                                 ts: unix_timestamp_secs(),
                             };
                             frame_stats[module]
@@ -255,13 +275,12 @@ async fn async_main() -> Result<(), process::ExitCode> {
                                 .fetch_add(1, Ordering::Relaxed);
                             frame_stats[module]
                                 .tx_bytes
-                                .fetch_add(sent.frame.len as u64, Ordering::Relaxed);
+                                .fetch_add(payload.len() as u64, Ordering::Relaxed);
                             let mut buf = rx_bufs[module].lock().await;
                             buf.push_front(entry);
                             buf.truncate(RX_BUF_SIZE);
                         }
-                        Err(RecvError::Lagged(_)) => continue,
-                        Err(_) => break,
+                        None => break,
                     }
                 }
             }

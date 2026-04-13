@@ -3,7 +3,7 @@ use std::sync::Arc;
 use kaonic_ctrl::protocol::RADIO_FRAME_SIZE;
 use kaonic_ctrl::radio::RadioClient;
 use kaonic_frame::frame::Frame;
-use kaonic_reticulum::KaonicCtrlInterface;
+use kaonic_reticulum::{KaonicCtrlInterface, TxObserver};
 use radio_common::{Hertz, Modulation, RadioConfig, RadioConfigBuilder};
 use reticulum::transport::Transport;
 use serde::{Deserialize, Serialize};
@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 pub type SharedRadioClient = Arc<Mutex<RadioClient>>;
+pub type SharedTxObserver = TxObserver;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RadioModuleConfig {
@@ -71,6 +72,7 @@ pub async fn attach_radio_interface(
     radio_client: SharedRadioClient,
     radio: &HardwareRadioConfig,
     rns_module: usize,
+    tx_observer: Option<SharedTxObserver>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for (module, cfg) in radio.module_configs.iter().enumerate() {
         log::info!("applying saved radio config on boot (module {module})");
@@ -92,7 +94,7 @@ pub async fn attach_radio_interface(
         }
     }
 
-    let iface = KaonicCtrlInterface::new(radio_client, rns_module);
+    let iface = KaonicCtrlInterface::new(radio_client, rns_module, tx_observer);
     let iface_mgr = transport.lock().await.iface_manager();
     iface_mgr
         .lock()
@@ -104,6 +106,7 @@ pub async fn attach_radio_interface(
 
 pub async fn transmit_test_frame(
     radio_client: Option<SharedRadioClient>,
+    tx_observer: Option<SharedTxObserver>,
     module: usize,
     payload: &[u8],
 ) -> Result<(), String> {
@@ -133,6 +136,12 @@ pub async fn transmit_test_frame(
         .transmit(module, &frame)
         .await
         .map_err(|err| format!("transmit: {err:?}"));
+
+    if transmit_result.is_ok() {
+        if let Some(observer) = tx_observer {
+            observer(module, payload);
+        }
+    }
 
     transmit_result
 }
