@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[cfg(target_os = "linux")]
-const DEFAULT_WIFI_SCRIPT: &str = "wifi_mode.sh";
+const DEFAULT_WIFI_SCRIPT: &str = "/usr/bin/kaonic-wifi-mode";
 #[cfg(target_os = "linux")]
 const DEFAULT_WIFI_MODE_FILE: &str = "/etc/kaonic/wifi-mode";
 #[cfg(target_os = "linux")]
@@ -164,7 +164,7 @@ impl NetworkService {
                 configured_ssid: state.configured_ssid.clone(),
                 connected_ssid: state.connected_ssid.clone(),
                 wlan0_ip: match state.mode {
-                    WifiMode::Ap => Some("192.168.4.1".into()),
+                    WifiMode::Ap => Some("192.168.10.1".into()),
                     WifiMode::Sta if state.connected_ssid.is_some() => Some("192.168.1.42".into()),
                     WifiMode::Sta => None,
                 },
@@ -198,9 +198,6 @@ impl NetworkService {
                 state.connected_ssid = None;
             }
             WifiMode::Sta => {
-                if state.configured_ssid.is_none() {
-                    return Err(NetworkError::MissingStaConfig);
-                }
                 state.mode = WifiMode::Sta;
                 state.connected_ssid = state.configured_ssid.clone();
             }
@@ -255,7 +252,10 @@ fn read_interface_details_linux() -> Result<(String, String), NetworkError> {
 fn read_wifi_status_linux() -> Result<WifiStatusDto, NetworkError> {
     let mode = read_current_mode_linux();
     let configured_ssid = read_configured_ssid(&wpa_conf_path());
-    let wlan0_ip = read_wifi_ip_linux()?;
+    let wlan0_ip = match mode {
+        WifiMode::Ap => Some("192.168.10.1".into()),
+        WifiMode::Sta => read_wifi_ip_linux()?,
+    };
     let hostapd_status =
         read_service_status_linux("hostapd.service").unwrap_or_else(|_| "unknown".into());
     let wpa_supplicant_status = if wpa_pid_file_path().exists() {
@@ -289,19 +289,12 @@ fn set_wifi_mode_linux(mode: WifiMode) -> Result<(), NetworkError> {
         }
         WifiMode::Sta => {
             let wpa_conf = wpa_conf_path();
-            if !wpa_conf.exists() {
-                return Err(NetworkError::MissingStaConfig);
+            write_wifi_mode_file("sta")?;
+            if wpa_conf.exists() {
+                run_program(format!("{} apply", script.display()), &script, &["apply"]).map(|_| ())
+            } else {
+                prepare_station_mode_without_config_linux()
             }
-
-            let mode_file = wifi_mode_file_path();
-            if let Some(parent) = mode_file.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|err| NetworkError::ModeFileWrite(format!("{parent:?}: {err}")))?;
-            }
-            fs::write(&mode_file, "sta\n")
-                .map_err(|err| NetworkError::ModeFileWrite(format!("{mode_file:?}: {err}")))?;
-
-            run_program(format!("{} apply", script.display()), &script, &["apply"]).map(|_| ())
         }
     }
 }
@@ -315,6 +308,49 @@ fn connect_wifi_linux(ssid: &str, psk: &str) -> Result<(), NetworkError> {
         &["sta", ssid, psk],
     )
     .map(|_| ())
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_station_mode_without_config_linux() -> Result<(), NetworkError> {
+    write_sta_network_override_linux()?;
+    let _ = run_command(
+        "systemctl stop hostapd.service",
+        "systemctl",
+        &["stop", "hostapd.service"],
+    );
+    run_command(
+        "systemctl restart systemd-networkd.service",
+        "systemctl",
+        &["restart", "systemd-networkd.service"],
+    )?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn write_wifi_mode_file(mode: &str) -> Result<(), NetworkError> {
+    let mode_file = wifi_mode_file_path();
+    if let Some(parent) = mode_file.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| NetworkError::ModeFileWrite(format!("{parent:?}: {err}")))?;
+    }
+    fs::write(&mode_file, format!("{mode}\n"))
+        .map_err(|err| NetworkError::ModeFileWrite(format!("{mode_file:?}: {err}")))?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn write_sta_network_override_linux() -> Result<(), NetworkError> {
+    let path = Path::new("/etc/systemd/network/62-wlan0.network");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| NetworkError::ModeFileWrite(format!("{parent:?}: {err}")))?;
+    }
+    fs::write(
+        path,
+        "[Match]\nName=wlan0\n\n[Network]\nDHCP=yes\nIPv6AcceptRA=yes\n",
+    )
+    .map_err(|err| NetworkError::ModeFileWrite(format!("{path:?}: {err}")))?;
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -435,9 +471,26 @@ fn read_configured_ssid(path: &Path) -> Option<String> {
 
 #[cfg(target_os = "linux")]
 fn wifi_script_path() -> PathBuf {
-    std::env::var_os("KAONIC_WIFI_MODE_SCRIPT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_WIFI_SCRIPT))
+    if let Some(path) = std::env::var_os("KAONIC_WIFI_MODE_SCRIPT") {
+        return PathBuf::from(path);
+    }
+
+    for candidate in [
+        DEFAULT_WIFI_SCRIPT,
+        "/home/root/wifi_mode.sh",
+        "wifi_mode.sh",
+    ] {
+        let path = PathBuf::from(candidate);
+        if path.is_absolute() {
+            if path.exists() {
+                return path;
+            }
+        } else {
+            return path;
+        }
+    }
+
+    PathBuf::from(DEFAULT_WIFI_SCRIPT)
 }
 
 #[cfg(target_os = "linux")]
@@ -479,6 +532,8 @@ fn mock_interface_details() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(target_os = "linux"))]
+    use super::NetworkService;
     use super::{validate_wifi_credentials, NetworkError, WifiMode};
 
     #[test]
@@ -495,5 +550,14 @@ mod tests {
 
         let err = validate_wifi_credentials("test", "short").expect_err("psk should fail");
         assert!(matches!(err, NetworkError::InvalidPsk));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn mock_station_mode_does_not_require_saved_config() {
+        let service = NetworkService::new();
+        service
+            .set_wifi_mode_mock(WifiMode::Sta)
+            .expect("station mode should be allowed without saved config");
     }
 }

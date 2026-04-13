@@ -7,8 +7,8 @@ use leptos_router::{
 
 use crate::components::navbar::Navbar;
 use crate::pages::{
-    dashboard::DashboardPage, media::MediaPage, network::NetworkPage, radio::SettingsPage,
-    update::SystemPage,
+    dashboard::DashboardPage, media::MediaPage, network::NetworkPage, radio::RadioPage,
+    reticulum::ReticulumPage, update::SystemPage,
 };
 
 pub fn shell(options: leptos::config::LeptosOptions) -> impl IntoView {
@@ -40,7 +40,9 @@ pub fn App() -> impl IntoView {
             <main class="main-content">
                 <Routes fallback=|| view! { <p class="not-found">"Page not found."</p> }>
                     <Route path=StaticSegment("") view=DashboardPage/>
-                    <Route path=StaticSegment("settings") view=SettingsPage/>
+                    <Route path=StaticSegment("radio") view=RadioPage/>
+                    <Route path=StaticSegment("reticulum") view=ReticulumPage/>
+                    <Route path=StaticSegment("settings") view=RadioPage/>
                     <Route path=StaticSegment("network") view=NetworkPage/>
                     <Route path=StaticSegment("media") view=MediaPage/>
                     <Route path=StaticSegment("system") view=SystemPage/>

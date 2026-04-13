@@ -1,5 +1,11 @@
 use crate::app_types::ServiceStatusDto;
 
+pub const GATEWAY_SERVICE_UNITS: [&str; 3] = [
+    "kaonic-commd.service",
+    "kaonic-gateway.service",
+    "kaonic-update.service",
+];
+
 pub async fn read_cpu_percent_async() -> f32 {
     let Some((idle1, total1)) = parse_stat() else {
         return 0.0;
@@ -137,14 +143,15 @@ pub fn read_cpu_cores() -> usize {
 }
 
 pub fn read_gateway_services() -> Vec<ServiceStatusDto> {
-    [
-        "kaonic-commd.service",
-        "kaonic-gateway.service",
-        "kaonic-update.service",
-    ]
-    .into_iter()
+    GATEWAY_SERVICE_UNITS
+    .iter()
+    .copied()
     .map(read_service_status)
     .collect()
+}
+
+pub fn is_gateway_service_unit(unit: &str) -> bool {
+    GATEWAY_SERVICE_UNITS.contains(&unit)
 }
 
 #[cfg(target_os = "linux")]

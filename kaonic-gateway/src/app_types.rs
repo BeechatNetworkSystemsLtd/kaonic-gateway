@@ -70,6 +70,35 @@ pub struct ServiceStatusDto {
     pub status: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReticulumLinkDto {
+    pub id: String,
+    pub destination: String,
+    pub status: String,
+    pub last_event: String,
+    pub packets: u64,
+    pub bytes: u64,
+    pub rtt_ms: Option<u64>,
+    pub last_seen_ts: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReticulumEventDto {
+    pub ts: u64,
+    pub direction: String,
+    pub kind: String,
+    pub link_id: String,
+    pub destination: String,
+    pub details: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReticulumSnapshotDto {
+    pub incoming_links: Vec<ReticulumLinkDto>,
+    pub outgoing_links: Vec<ReticulumLinkDto>,
+    pub events: Vec<ReticulumEventDto>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayStatusDto {
     pub serial: String,
@@ -78,6 +107,7 @@ pub struct GatewayStatusDto {
     pub system: SystemStatusDto,
     pub services: Vec<ServiceStatusDto>,
     pub radio_modules: Vec<RadioModuleConfigDto>,
+    pub reticulum: ReticulumSnapshotDto,
 }
 
 impl Default for GatewayStatusDto {
@@ -89,6 +119,7 @@ impl Default for GatewayStatusDto {
             system: SystemStatusDto::default(),
             services: vec![],
             radio_modules: vec![],
+            reticulum: ReticulumSnapshotDto::default(),
         }
     }
 }

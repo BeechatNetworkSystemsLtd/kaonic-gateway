@@ -7,6 +7,7 @@ use tokio::sync::Mutex as TokioMutex;
 use crate::app_types::RxFrameDto;
 use crate::atak::BridgeMetrics;
 use crate::audio::AudioService;
+use crate::gateway_reticulum::SharedGatewayReticulum;
 use crate::network::NetworkService;
 use crate::radio::SharedRadioClient;
 use crate::settings::Settings;
@@ -45,6 +46,7 @@ pub struct AppState {
     pub atak_metrics: Vec<Arc<BridgeMetrics>>,
     pub vpn_hash: String,
     pub radio_client: Option<SharedRadioClient>,
+    pub reticulum: SharedGatewayReticulum,
     pub serial: String,
     /// Ring buffers of recent frame events, one per module (index 0 = A, 1 = B).
     pub rx_buffers: [RxFrameBuffer; 2],
@@ -57,6 +59,7 @@ impl AppState {
         atak_metrics: Vec<Arc<BridgeMetrics>>,
         vpn_hash: String,
         radio_client: Option<SharedRadioClient>,
+        reticulum: SharedGatewayReticulum,
         serial: String,
     ) -> Self {
         Self {
@@ -66,6 +69,7 @@ impl AppState {
             atak_metrics,
             vpn_hash,
             radio_client,
+            reticulum,
             serial,
             rx_buffers: [empty_rx_buffer(), empty_rx_buffer()],
             frame_stats: [empty_frame_stats(), empty_frame_stats()],

@@ -58,6 +58,7 @@ pub async fn get_gateway_status() -> Result<GatewayStatusDto, ServerFnError> {
         system,
         services,
         radio_modules,
+        reticulum: state.reticulum.snapshot().await,
     })
 }
 
@@ -103,6 +104,7 @@ pub fn DashboardPage() -> impl IntoView {
 /// Plain-JS WebSocket client that patches DOM element values live.
 const WS_SCRIPT: &str = r#"
 (function() {
+  var selectedService = null;
   function connect() {
     var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     var ws = new WebSocket(proto + '//' + location.host + '/api/ws/status');
@@ -163,9 +165,77 @@ const WS_SCRIPT: &str = r#"
     if ((svc.load_state || '') !== 'loaded') { return svc.load_state || 'missing'; }
     return svc.active_state || 'unknown';
   }
+  function setRestartStatus(text, kind) {
+    var status = document.getElementById('service-restart-status');
+    if (!status) { return; }
+    status.textContent = text;
+    status.className = kind || '';
+  }
+  function openRestartModal(unit) {
+    selectedService = unit || null;
+    var modal = document.getElementById('service-restart-modal');
+    if (!modal) { return; }
+    set('service-restart-unit', selectedService || 'service');
+    setRestartStatus('', '');
+    modal.hidden = false;
+    document.body.classList.add('modal-open');
+  }
+  function closeRestartModal() {
+    var modal = document.getElementById('service-restart-modal');
+    if (!modal) { return; }
+    modal.hidden = true;
+    document.body.classList.remove('modal-open');
+  }
   function formatStorageMb(mb) {
     return mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : mb + ' MB';
   }
+  document.addEventListener('click', function(ev) {
+    var target = ev.target;
+    if (!(target instanceof Element)) { return; }
+    var restartBtn = target.closest('[data-service-restart]');
+    if (restartBtn) {
+      openRestartModal(restartBtn.getAttribute('data-service-restart'));
+      return;
+    }
+    if (target.closest('[data-close-service-restart]')) {
+      closeRestartModal();
+      return;
+    }
+    if (target.id === 'service-restart-modal') {
+      closeRestartModal();
+    }
+  });
+  var confirmBtn = document.getElementById('service-restart-confirm');
+  if (confirmBtn) {
+    confirmBtn.addEventListener('click', function() {
+      if (!selectedService) { return; }
+      confirmBtn.disabled = true;
+      setRestartStatus('Requesting restart…', 'flash-ok');
+      fetch('/api/system/service/restart', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ unit: selectedService })
+      }).then(function(resp) {
+        if (!resp.ok) {
+          return resp.text().then(function(text) {
+            throw new Error(text || ('HTTP ' + resp.status));
+          });
+        }
+        return resp.json();
+      }).then(function() {
+        closeRestartModal();
+      }).catch(function(err) {
+        setRestartStatus('Error: ' + (err.message || err), 'flash-err');
+      }).finally(function() {
+        confirmBtn.disabled = false;
+      });
+    });
+  }
+  window.addEventListener('keydown', function(ev) {
+    if (ev.key === 'Escape') {
+      closeRestartModal();
+    }
+  });
   connect();
 })();
 "#;
@@ -180,6 +250,30 @@ fn StatusView(status: GatewayStatusDto) -> impl IntoView {
             <ServicesCard services=status.services/>
             <VpnCard vpn_hash=status.vpn_hash serial=status.serial/>
             <AtakCard bridges=status.atak_bridges/>
+        </div>
+        <div class="modal-backdrop" id="service-restart-modal" hidden>
+            <div class="modal-card">
+                <div class="modal-header">
+                    <h2 class="modal-title">"Confirm service restart"</h2>
+                    <button type="button" class="modal-close" data-close-service-restart>"×"</button>
+                </div>
+                <div class="modal-form">
+                    <p class="card-body-text">
+                        "Are you sure you want to restart "
+                        <strong id="service-restart-unit">"service"</strong>
+                        "?"
+                    </p>
+                    <div id="service-restart-status"></div>
+                    <div class="modal-actions">
+                        <button type="button" class="btn-secondary" data-close-service-restart>
+                            "Cancel"
+                        </button>
+                        <button type="button" id="service-restart-confirm" class="btn-primary">
+                            "Restart"
+                        </button>
+                    </div>
+                </div>
+            </div>
         </div>
         <h2 class="section-title">"Radio Modules"</h2>
         <div class="module-grid">
@@ -272,12 +366,21 @@ fn ServicesCard(services: Vec<ServiceStatusDto>) -> impl IntoView {
                                 {service.status.clone()}
                             </span>
                         </div>
-                        <span
-                            id=format!("service-badge-{i}")
-                            class=badge_class
-                        >
-                            {badge_label}
-                        </span>
+                        <div class="service-actions">
+                            <span
+                                id=format!("service-badge-{i}")
+                                class=badge_class
+                            >
+                                {badge_label}
+                            </span>
+                            <button
+                                type="button"
+                                class="btn-secondary service-restart-btn"
+                                data-service-restart=service.unit.clone()
+                            >
+                                "Restart"
+                            </button>
+                        </div>
                     </div>
                 }
             }).collect_view()}

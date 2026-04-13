@@ -62,6 +62,10 @@ pub async fn serve(state: AppState, addr: SocketAddr) {
         )
         .route("/api/radio/{module}/test", post(handlers::post_radio_test))
         .route("/api/system/reboot", post(handlers::post_system_reboot))
+        .route(
+            "/api/system/service/restart",
+            post(handlers::post_system_service_restart),
+        )
         .route("/api/status", get(handlers::get_status))
         .route("/api/info", get(handlers::get_info))
         .route("/api/network/snapshot", get(handlers::get_network_snapshot))

@@ -149,7 +149,7 @@ const RADIO_WS_JS: &str = r#"
 "#;
 
 #[component]
-pub fn SettingsPage() -> impl IntoView {
+pub fn RadioPage() -> impl IntoView {
     let settings_res = Resource::new(|| (), |_| load_settings());
 
     view! {

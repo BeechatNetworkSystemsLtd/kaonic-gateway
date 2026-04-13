@@ -1,7 +1,9 @@
 use axum::extract::{Form, Path, State};
 use axum::http::StatusCode;
 use axum::Json;
-use kaonic_gateway::app_types::{FrameStatsDto, NetworkSnapshotDto, RxFrameDto, ServiceStatusDto};
+use kaonic_gateway::app_types::{
+    FrameStatsDto, NetworkSnapshotDto, ReticulumSnapshotDto, RxFrameDto, ServiceStatusDto,
+};
 use kaonic_gateway::audio::{
     AudioCardSnapshot, AudioControlSnapshot, AudioControlState, AudioError, AudioOutput,
 };
@@ -9,7 +11,8 @@ use kaonic_gateway::config::GatewayConfig;
 use kaonic_gateway::network::{NetworkError, WifiMode};
 use kaonic_gateway::radio::{transmit_test_frame, RadioModuleConfig};
 use kaonic_gateway::system_metrics::{
-    read_cpu_percent_async, read_fs_mb, read_gateway_services, read_mem_mb, read_os_details,
+    is_gateway_service_unit, read_cpu_percent_async, read_fs_mb, read_gateway_services,
+    read_mem_mb, read_os_details,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
@@ -165,6 +168,18 @@ pub async fn post_system_reboot() -> Result<Json<SystemActionResponse>, (StatusC
     Ok(Json(SystemActionResponse { status }))
 }
 
+pub async fn post_system_service_restart(
+    Json(request): Json<ServiceActionRequest>,
+) -> Result<Json<SystemActionResponse>, (StatusCode, String)> {
+    if !is_gateway_service_unit(&request.unit) {
+        return Err((StatusCode::BAD_REQUEST, "unsupported service".into()));
+    }
+
+    let status = request_service_restart(&request.unit)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    Ok(Json(SystemActionResponse { status }))
+}
+
 // ── /api/audio ────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -176,6 +191,11 @@ pub struct PutAudioRequest {
 #[derive(Deserialize)]
 pub struct RadioTestRequest {
     pub message: String,
+}
+
+#[derive(Deserialize)]
+pub struct ServiceActionRequest {
+    pub unit: String,
 }
 
 #[derive(Serialize)]
@@ -345,6 +365,32 @@ fn request_system_reboot() -> Result<String, String> {
     Ok("Mock reboot requested".into())
 }
 
+#[cfg(target_os = "linux")]
+fn request_service_restart(unit: &str) -> Result<String, String> {
+    let output = Command::new("systemctl")
+        .args(["--no-block", "restart", unit])
+        .output()
+        .map_err(|err| format!("failed to execute systemctl restart {unit}: {err}"))?;
+
+    if output.status.success() {
+        return Ok(format!("Restart requested for {unit}"));
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let message = if stderr.is_empty() { stdout } else { stderr };
+    Err(if message.is_empty() {
+        format!("systemctl restart {unit} failed")
+    } else {
+        message
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn request_service_restart(unit: &str) -> Result<String, String> {
+    Ok(format!("Mock restart requested for {unit}"))
+}
+
 // ── /network/wifi actions ─────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -442,6 +488,7 @@ pub struct StatusResponse {
     system: SystemStatus,
     services: Vec<ServiceStatusDto>,
     radio_modules: Vec<RadioModuleConfig>,
+    reticulum: ReticulumSnapshotDto,
     rx_frames: [Vec<RxFrameDto>; 2],
     frame_stats: [FrameStatsDto; 2],
 }
@@ -503,6 +550,7 @@ pub async fn build_status(state: &AppState) -> StatusResponse {
             },
         },
     ];
+    let reticulum = state.reticulum.snapshot().await;
 
     StatusResponse {
         vpn_hash: state.vpn_hash.clone(),
@@ -510,6 +558,7 @@ pub async fn build_status(state: &AppState) -> StatusResponse {
         system: read_system_status_async().await,
         services: read_gateway_services(),
         radio_modules,
+        reticulum,
         rx_frames,
         frame_stats,
     }

@@ -2,6 +2,7 @@
 pub mod atak;
 pub mod audio;
 pub mod config;
+pub mod gateway_reticulum;
 pub mod network;
 pub mod radio;
 pub mod settings;

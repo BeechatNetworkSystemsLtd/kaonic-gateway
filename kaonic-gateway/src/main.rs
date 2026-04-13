@@ -9,6 +9,7 @@ use clap::Parser;
 use env_logger;
 use http::{AppState, SharedSettings};
 use kaonic_gateway::atak::{AtakBridge, BridgeMetrics};
+use kaonic_gateway::gateway_reticulum::GatewayReticulum;
 use kaonic_gateway::radio::{attach_radio_interface, connect_radio_client, SharedRadioClient};
 use kaonic_gateway::settings::Settings;
 use log;
@@ -91,11 +92,13 @@ async fn async_main() -> Result<(), process::ExitCode> {
 
     if webapp_only {
         log::info!("starting in webapp-only mode; skipping radio and transport initialization");
+        let reticulum = Arc::new(GatewayReticulum::new());
         let app_state = AppState::new(
             settings.clone(),
             Vec::new(),
             "webapp-only".into(),
             None,
+            reticulum,
             serial,
         );
 
@@ -130,6 +133,8 @@ async fn async_main() -> Result<(), process::ExitCode> {
     let mut transport_cfg = TransportConfig::new("kaonic-gateway", &id, true);
     transport_cfg.set_retransmit(true);
     let transport = Arc::new(tokio::sync::Mutex::new(Transport::new(transport_cfg)));
+    let reticulum = Arc::new(GatewayReticulum::new());
+    reticulum.attach(transport.clone()).await;
 
     attach_radio_interface(&transport, radio_client.clone(), &config.radio, 0)
         .await
@@ -168,6 +173,7 @@ async fn async_main() -> Result<(), process::ExitCode> {
         atak_metrics,
         vpn_hash,
         Some(radio_client.clone()),
+        reticulum,
         serial,
     );
 

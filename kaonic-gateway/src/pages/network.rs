@@ -83,7 +83,7 @@ const NETWORK_JS: &str = r#"
         setNodeText('network-backend', snapshot.backend || '—');
         setNodeText('wifi-configured-ssid', wifi.configured_ssid || '—');
         setNodeText('wifi-status-value', isStation ? (stationConnected ? 'Connected' : 'Disconnected') : 'Active');
-        setNodeText('wifi-ip-address', wifi.wlan0_ip || '—');
+        setNodeText('wifi-ip-hero-value', wifi.wlan0_ip || '—');
         setNodeText('wifi-connected-ssid', wifi.connected_ssid || '—');
         setNodeText('wifi-station-link-text', wifi.link_details || 'Disconnected');
         setNodeText('wifi-station-empty-text', 'Disconnected');
@@ -265,6 +265,11 @@ fn NetworkContent(snapshot: NetworkSnapshotDto) -> impl IntoView {
                     <span class="badge badge-ok" id="wifi-mode-badge">{mode_label}</span>
                 </div>
 
+                <div class="wifi-ip-hero">
+                    <div class="wifi-ip-hero-label">"IP address"</div>
+                    <div class="wifi-ip-hero-value" id="wifi-ip-hero-value">{wlan0_ip}</div>
+                </div>
+
                 <div class="network-mode-toggle">
                     <button
                         type="button"
@@ -309,10 +314,6 @@ fn NetworkContent(snapshot: NetworkSnapshotDto) -> impl IntoView {
                     <span class="info-value" id="wifi-status-value">
                         {if is_station { station_status } else { "Active" }}
                     </span>
-                </div>
-                <div class="info-row">
-                    <span class="info-label">"wlan0 IP"</span>
-                    <span class="info-value" id="wifi-ip-address">{wlan0_ip}</span>
                 </div>
                 <div id="wifi-station-fields" hidden=!is_station>
                     <div class="info-row">

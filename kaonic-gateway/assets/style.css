@@ -390,6 +390,18 @@ code.info-value,
   color: var(--text-muted);
 }
 
+.service-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.service-restart-btn {
+  padding: 7px 12px;
+  font-size: 12px;
+}
+
 /* ─── Forms ───────────────────────────────────────────────────────────────── */
 
 .settings-form { max-width: 760px; }
@@ -1262,6 +1274,28 @@ select.field-input {
   align-items: center;
 }
 
+.wifi-ip-hero {
+  margin-bottom: 16px;
+}
+
+.wifi-ip-hero-label {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+
+.wifi-ip-hero-value {
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 28px;
+  font-weight: 800;
+  line-height: 1.1;
+  word-break: break-word;
+}
+
 .network-mode-toggle {
   display: flex;
   gap: 8px;
@@ -1361,6 +1395,40 @@ select.field-input {
 .network-dump {
   max-height: 520px;
   overflow: auto;
+}
+
+.reticulum-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+.reticulum-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+  margin-bottom: 18px;
+}
+
+.reticulum-card {
+  min-width: 0;
+}
+
+.reticulum-card--events {
+  margin-top: 0;
+}
+
+.reticulum-table-wrap {
+  overflow: auto;
+  max-height: 420px;
+}
+
+@media (max-width: 1100px) {
+  .reticulum-summary,
+  .reticulum-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 .modal-open {
