@@ -17,7 +17,13 @@ cidr-v3          = { package = "cidr", version = "0.3", features = ["serde"], op
 cidr             = { version = "0.2", features = ["serde"] }
 radio-common     = { git = "https://github.com/BeechatNetworkSystemsLtd/kaonic-radio" }
 tokio-util       = { version = "0.7", optional = true }
+etherparse       = "0.19"
+if-addrs         = "0.13"
+serde_json       = "1"
 
 log   = "0.4"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+riptun = { version = "0.1", default-features = false, features = ["tokio-impl"] }

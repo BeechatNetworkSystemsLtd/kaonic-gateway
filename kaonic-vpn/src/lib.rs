@@ -1,7 +1,9 @@
+pub mod config;
+
 #[cfg(feature = "run")]
 pub mod vpn;
 
+pub use config::VpnConfig;
+
 #[cfg(feature = "run")]
-pub use kaonic_reticulum::{KaonicCtrlInterface, RadioClient};
-#[cfg(feature = "run")]
-pub use vpn::run_vpn;
+pub use vpn::{VpnPeerSnapshot, VpnRouteSnapshot, VpnRuntime, VpnRuntimeError, VpnSnapshot};

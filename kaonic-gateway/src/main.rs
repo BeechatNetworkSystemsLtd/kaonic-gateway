@@ -8,6 +8,7 @@ use std::sync::Arc;
 use clap::Parser;
 use env_logger;
 use http::{AppState, SharedSettings};
+use kaonic_vpn::{VpnConfig, VpnRuntime};
 use kaonic_gateway::atak::{AtakBridge, BridgeMetrics};
 use kaonic_gateway::gateway_reticulum::GatewayReticulum;
 use kaonic_gateway::radio::{attach_radio_interface, connect_radio_client, SharedRadioClient};
@@ -98,6 +99,7 @@ async fn async_main() -> Result<(), process::ExitCode> {
             Vec::new(),
             "webapp-only".into(),
             None,
+            None,
             reticulum,
             serial,
         );
@@ -145,6 +147,24 @@ async fn async_main() -> Result<(), process::ExitCode> {
 
     // Shared cancellation token — cancelled on Ctrl-C / SIGTERM.
     let cancel = CancellationToken::new();
+    let vpn = match VpnRuntime::start(
+        VpnConfig {
+            network: config.network,
+            peers: config.peers.clone(),
+            announce_freq_secs: config.announce_freq_secs,
+        },
+        transport.clone(),
+        id.clone(),
+        cancel.clone(),
+    )
+    .await
+    {
+        Ok(vpn) => Some(vpn),
+        Err(err) => {
+            log::error!("vpn runtime start failed: {err}");
+            None
+        }
+    };
 
     let mut atak_metrics = Vec::new();
     for &(port, _) in kaonic_gateway::atak::ATAK_PORTS {
@@ -172,6 +192,7 @@ async fn async_main() -> Result<(), process::ExitCode> {
         settings.clone(),
         atak_metrics,
         vpn_hash,
+        vpn,
         Some(radio_client.clone()),
         reticulum,
         serial,

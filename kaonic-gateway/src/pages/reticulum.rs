@@ -1,4 +1,6 @@
 use leptos::prelude::*;
+use kaonic_vpn::{VpnPeerSnapshot, VpnRouteSnapshot, VpnSnapshot};
+use serde::{Deserialize, Serialize};
 
 use crate::app_types::{ReticulumEventDto, ReticulumLinkDto, ReticulumSnapshotDto};
 
@@ -10,14 +12,38 @@ fn format_timestamp(ts: u64) -> String {
     format!("{hours:02}:{minutes:02}:{secs:02} UTC")
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReticulumPageSnapshot {
+    pub local_hash: String,
+    pub configured_peers: Vec<String>,
+    pub reticulum: ReticulumSnapshotDto,
+    pub vpn: VpnSnapshot,
+}
+
 #[server]
-pub async fn load_reticulum_snapshot() -> Result<ReticulumSnapshotDto, ServerFnError> {
+pub async fn load_reticulum_snapshot() -> Result<ReticulumPageSnapshot, ServerFnError> {
     use crate::state::AppState;
 
     let state = leptos::context::use_context::<AppState>()
         .ok_or_else(|| ServerFnError::new("missing AppState context"))?;
 
-    Ok(state.reticulum.snapshot().await)
+    let configured_peers = state
+        .settings
+        .lock()
+        .ok()
+        .and_then(|settings| settings.load_config().ok())
+        .map(|config| config.peers)
+        .unwrap_or_default();
+
+    Ok(ReticulumPageSnapshot {
+        local_hash: state.vpn_hash.clone(),
+        configured_peers,
+        reticulum: state.reticulum.snapshot().await,
+        vpn: match &state.vpn {
+            Some(vpn) => vpn.snapshot().await,
+            None => VpnSnapshot::default(),
+        },
+    })
 }
 
 const RETICULUM_WS_JS: &str = r#"
@@ -83,18 +109,60 @@ const RETICULUM_WS_JS: &str = r#"
         }).join('');
     }
 
+    function renderVpnPeers(peers) {
+        var tbody = document.getElementById('vpn-peers');
+        if (!tbody) { return; }
+        if (!peers || peers.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="4" class="frames-empty">No VPN peers configured</td></tr>';
+            return;
+        }
+        tbody.innerHTML = peers.map(function(peer) {
+            var routes = (peer.announced_routes || []).join(', ');
+            return '<tr>'
+                + '<td class="td-hex">' + escapeHtml(peer.destination || '—') + '</td>'
+                + '<td class="td-time">' + escapeHtml(peer.link_state || '—') + '</td>'
+                + '<td class="td-hex">' + escapeHtml(routes || '—') + '</td>'
+                + '<td class="td-time">' + escapeHtml(formatTime(peer.last_seen_ts)) + '</td>'
+                + '</tr>';
+        }).join('');
+    }
+
+    function renderVpnRoutes(routes) {
+        var tbody = document.getElementById('vpn-routes');
+        if (!tbody) { return; }
+        if (!routes || routes.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="4" class="frames-empty">No VPN routes announced yet</td></tr>';
+            return;
+        }
+        tbody.innerHTML = routes.map(function(route) {
+            return '<tr>'
+                + '<td class="td-hex">' + escapeHtml(route.network || '—') + '</td>'
+                + '<td class="td-hex">' + escapeHtml(route.owner || '—') + '</td>'
+                + '<td class="td-time">' + escapeHtml(route.status || '—') + '</td>'
+                + '<td class="td-time">' + escapeHtml(route.installed ? 'yes' : 'no') + '</td>'
+                + '</tr>';
+        }).join('');
+    }
+
     ws.onmessage = function(ev) {
         try {
-            var snapshot = (JSON.parse(ev.data) || {}).reticulum || {};
+            var payload = JSON.parse(ev.data) || {};
+            var snapshot = payload.reticulum || {};
+            var vpn = payload.vpn || {};
             var incoming = snapshot.incoming_links || [];
             var outgoing = snapshot.outgoing_links || [];
             var events = snapshot.events || [];
             setText('reticulum-incoming-count', String(incoming.length));
             setText('reticulum-outgoing-count', String(outgoing.length));
             setText('reticulum-events-count', String(events.length));
+            setText('vpn-status', vpn.status || '—');
+            setText('vpn-backend', vpn.backend || '—');
+            setText('vpn-interface', vpn.interface_name || '—');
             renderLinks('reticulum-incoming-links', incoming, 'No incoming links seen');
             renderLinks('reticulum-outgoing-links', outgoing, 'No outgoing links seen');
             renderEvents(events);
+            renderVpnPeers(vpn.peers || []);
+            renderVpnRoutes(vpn.remote_routes || []);
         } catch (e) {}
     };
 })();
@@ -122,10 +190,18 @@ pub fn ReticulumPage() -> impl IntoView {
 }
 
 #[component]
-fn ReticulumContent(snapshot: ReticulumSnapshotDto) -> impl IntoView {
-    let incoming_count = snapshot.incoming_links.len();
-    let outgoing_count = snapshot.outgoing_links.len();
-    let events_count = snapshot.events.len();
+fn ReticulumContent(snapshot: ReticulumPageSnapshot) -> impl IntoView {
+    let incoming_count = snapshot.reticulum.incoming_links.len();
+    let outgoing_count = snapshot.reticulum.outgoing_links.len();
+    let events_count = snapshot.reticulum.events.len();
+    let vpn_status = snapshot.vpn.status.clone();
+    let vpn_backend = snapshot.vpn.backend.clone();
+    let configured_peer_count = snapshot.configured_peers.len();
+    let vpn_interface = snapshot
+        .vpn
+        .interface_name
+        .clone()
+        .unwrap_or_else(|| "—".into());
 
     view! {
         <div class="reticulum-summary">
@@ -141,6 +217,17 @@ fn ReticulumContent(snapshot: ReticulumSnapshotDto) -> impl IntoView {
                 <span class="stat-label">"Recent events"</span>
                 <span class="stat-value" id="reticulum-events-count">{events_count}</span>
             </div>
+            <div class="card stat-card">
+                <span class="stat-label">"Local hash"</span>
+                <span class="stat-value td-hex">{snapshot.local_hash}</span>
+                <span class="stat-label">{format!("{configured_peer_count} configured peers")}</span>
+            </div>
+            <div class="card stat-card">
+                <span class="stat-label">"VPN status"</span>
+                <span class="stat-value" id="vpn-status">{vpn_status}</span>
+                <span class="stat-label" id="vpn-backend">{vpn_backend}</span>
+                <span class="stat-label" id="vpn-interface">{vpn_interface}</span>
+            </div>
         </div>
 
         <div class="reticulum-grid">
@@ -148,17 +235,23 @@ fn ReticulumContent(snapshot: ReticulumSnapshotDto) -> impl IntoView {
                 title="Incoming Links"
                 table_id="reticulum-incoming-links"
                 empty_text="No incoming links seen"
-                links=snapshot.incoming_links
+                links=snapshot.reticulum.incoming_links
             />
             <ReticulumLinksCard
                 title="Outgoing Links"
                 table_id="reticulum-outgoing-links"
                 empty_text="No outgoing links seen"
-                links=snapshot.outgoing_links
+                links=snapshot.reticulum.outgoing_links
             />
         </div>
 
-        <ReticulumEventsCard events=snapshot.events />
+        <div class="reticulum-grid">
+            <ConfiguredPeersCard peers=snapshot.configured_peers />
+            <VpnPeersCard peers=snapshot.vpn.peers />
+            <VpnRoutesCard routes=snapshot.vpn.remote_routes />
+        </div>
+
+        <ReticulumEventsCard events=snapshot.reticulum.events />
     }
 }
 
@@ -270,6 +363,122 @@ fn ReticulumEventsCard(events: Vec<ReticulumEventDto>) -> impl IntoView {
                                 })
                                 .collect_view()
                                 .into_any()
+                        }}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    }
+}
+
+#[component]
+fn ConfiguredPeersCard(peers: Vec<String>) -> impl IntoView {
+    view! {
+        <div class="card reticulum-card">
+            <div class="card-header">
+                <span class="card-title">"Configured Peers"</span>
+            </div>
+            <div class="reticulum-table-wrap">
+                <table class="frames-table">
+                    <thead>
+                        <tr>
+                            <th>"Destination"</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {if peers.is_empty() {
+                            view! { <tr><td class="frames-empty">"No peers configured yet"</td></tr> }.into_any()
+                        } else {
+                            peers.into_iter().map(|peer| {
+                                view! {
+                                    <tr>
+                                        <td class="td-hex">{peer}</td>
+                                    </tr>
+                                }
+                            }).collect_view().into_any()
+                        }}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    }
+}
+
+#[component]
+fn VpnPeersCard(peers: Vec<VpnPeerSnapshot>) -> impl IntoView {
+    view! {
+        <div class="card reticulum-card">
+            <div class="card-header">
+                <span class="card-title">"VPN Peers"</span>
+            </div>
+            <div class="reticulum-table-wrap">
+                <table class="frames-table">
+                    <thead>
+                        <tr>
+                            <th>"Destination"</th>
+                            <th>"Link"</th>
+                            <th>"Routes"</th>
+                            <th>"Last seen"</th>
+                        </tr>
+                    </thead>
+                    <tbody id="vpn-peers">
+                        {if peers.is_empty() {
+                            view! { <tr><td colspan="4" class="frames-empty">"No VPN peers configured"</td></tr> }.into_any()
+                        } else {
+                            peers.into_iter().map(|peer| {
+                                let routes = if peer.announced_routes.is_empty() {
+                                    "—".to_string()
+                                } else {
+                                    peer.announced_routes.join(", ")
+                                };
+                                view! {
+                                    <tr>
+                                        <td class="td-hex">{peer.destination}</td>
+                                        <td class="td-time">{peer.link_state}</td>
+                                        <td class="td-hex">{routes}</td>
+                                        <td class="td-time">{format_timestamp(peer.last_seen_ts)}</td>
+                                    </tr>
+                                }
+                            }).collect_view().into_any()
+                        }}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    }
+}
+
+#[component]
+fn VpnRoutesCard(routes: Vec<VpnRouteSnapshot>) -> impl IntoView {
+    view! {
+        <div class="card reticulum-card">
+            <div class="card-header">
+                <span class="card-title">"VPN Routes"</span>
+            </div>
+            <div class="reticulum-table-wrap">
+                <table class="frames-table">
+                    <thead>
+                        <tr>
+                            <th>"Network"</th>
+                            <th>"Owner"</th>
+                            <th>"Status"</th>
+                            <th>"Installed"</th>
+                        </tr>
+                    </thead>
+                    <tbody id="vpn-routes">
+                        {if routes.is_empty() {
+                            view! { <tr><td colspan="4" class="frames-empty">"No VPN routes announced yet"</td></tr> }.into_any()
+                        } else {
+                            routes.into_iter().map(|route| {
+                                view! {
+                                    <tr>
+                                        <td class="td-hex">{route.network}</td>
+                                        <td class="td-hex">{route.owner}</td>
+                                        <td class="td-time">{route.status}</td>
+                                        <td class="td-time">{if route.installed { "yes" } else { "no" }}</td>
+                                    </tr>
+                                }
+                            }).collect_view().into_any()
                         }}
                     </tbody>
                 </table>

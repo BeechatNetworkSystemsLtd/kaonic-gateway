@@ -59,6 +59,10 @@ pub async fn get_gateway_status() -> Result<GatewayStatusDto, ServerFnError> {
         services,
         radio_modules,
         reticulum: state.reticulum.snapshot().await,
+        vpn: match &state.vpn {
+            Some(vpn) => vpn.snapshot().await,
+            None => Default::default(),
+        },
     })
 }
 

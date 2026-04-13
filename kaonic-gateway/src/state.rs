@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::Mutex as TokioMutex;
 
+use kaonic_vpn::VpnRuntime;
+
 use crate::app_types::RxFrameDto;
 use crate::atak::BridgeMetrics;
 use crate::audio::AudioService;
@@ -45,6 +47,7 @@ pub struct AppState {
     pub settings: SharedSettings,
     pub atak_metrics: Vec<Arc<BridgeMetrics>>,
     pub vpn_hash: String,
+    pub vpn: Option<Arc<VpnRuntime>>,
     pub radio_client: Option<SharedRadioClient>,
     pub reticulum: SharedGatewayReticulum,
     pub serial: String,
@@ -58,6 +61,7 @@ impl AppState {
         settings: SharedSettings,
         atak_metrics: Vec<Arc<BridgeMetrics>>,
         vpn_hash: String,
+        vpn: Option<Arc<VpnRuntime>>,
         radio_client: Option<SharedRadioClient>,
         reticulum: SharedGatewayReticulum,
         serial: String,
@@ -68,6 +72,7 @@ impl AppState {
             settings,
             atak_metrics,
             vpn_hash,
+            vpn,
             radio_client,
             reticulum,
             serial,

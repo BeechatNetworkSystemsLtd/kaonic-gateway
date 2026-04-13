@@ -1,6 +1,7 @@
 use axum::extract::{Form, Path, State};
 use axum::http::StatusCode;
 use axum::Json;
+use kaonic_vpn::VpnSnapshot;
 use kaonic_gateway::app_types::{
     FrameStatsDto, NetworkSnapshotDto, ReticulumSnapshotDto, RxFrameDto, ServiceStatusDto,
 };
@@ -489,6 +490,7 @@ pub struct StatusResponse {
     services: Vec<ServiceStatusDto>,
     radio_modules: Vec<RadioModuleConfig>,
     reticulum: ReticulumSnapshotDto,
+    vpn: VpnSnapshot,
     rx_frames: [Vec<RxFrameDto>; 2],
     frame_stats: [FrameStatsDto; 2],
 }
@@ -551,6 +553,10 @@ pub async fn build_status(state: &AppState) -> StatusResponse {
         },
     ];
     let reticulum = state.reticulum.snapshot().await;
+    let vpn = match &state.vpn {
+        Some(vpn) => vpn.snapshot().await,
+        None => VpnSnapshot::default(),
+    };
 
     StatusResponse {
         vpn_hash: state.vpn_hash.clone(),
@@ -559,6 +565,7 @@ pub async fn build_status(state: &AppState) -> StatusResponse {
         services: read_gateway_services(),
         radio_modules,
         reticulum,
+        vpn,
         rx_frames,
         frame_stats,
     }

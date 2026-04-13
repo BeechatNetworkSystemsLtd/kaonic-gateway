@@ -3,6 +3,7 @@ use radio_common::{
     RadioConfig,
 };
 use serde::{Deserialize, Serialize};
+use kaonic_vpn::VpnSnapshot;
 
 // ── Radio ────────────────────────────────────────────────────────────────────
 
@@ -108,6 +109,7 @@ pub struct GatewayStatusDto {
     pub services: Vec<ServiceStatusDto>,
     pub radio_modules: Vec<RadioModuleConfigDto>,
     pub reticulum: ReticulumSnapshotDto,
+    pub vpn: VpnSnapshot,
 }
 
 impl Default for GatewayStatusDto {
@@ -120,6 +122,7 @@ impl Default for GatewayStatusDto {
             services: vec![],
             radio_modules: vec![],
             reticulum: ReticulumSnapshotDto::default(),
+            vpn: VpnSnapshot::default(),
         }
     }
 }
