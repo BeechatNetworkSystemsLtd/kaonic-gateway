@@ -1,5 +1,6 @@
 use leptos::prelude::*;
 
+use super::PageTitle;
 use crate::app_types::{
     AtakBridgeStatusDto, GatewayStatusDto, NetworkPortStatusDto, RadioModuleConfigDto,
     ServiceStatusDto, SystemStatusDto,
@@ -92,7 +93,7 @@ pub fn DashboardPage() -> impl IntoView {
 
     view! {
         <div class="page">
-            <h1 class="page-title">"Dashboard"</h1>
+            <PageTitle icon="📊" title="Dashboard" />
             <Suspense fallback=|| view! { <p class="loading">"Loading…"</p> }>
                 {move || match status.get() {
                     None => view! { <p class="loading">"Loading…"</p> }.into_any(),
@@ -112,11 +113,26 @@ pub fn DashboardPage() -> impl IntoView {
 const WS_SCRIPT: &str = r#"
 (function() {
   var selectedService = null;
+  function shouldPauseLiveUpdates() {
+    if (document.body.classList.contains('modal-open')) { return true; }
+    var active = document.activeElement;
+    if (active && (
+      active.tagName === 'INPUT' ||
+      active.tagName === 'TEXTAREA' ||
+      active.tagName === 'SELECT' ||
+      active.isContentEditable
+    )) {
+      return true;
+    }
+    var selection = window.getSelection ? window.getSelection() : null;
+    return !!(selection && !selection.isCollapsed && String(selection).trim().length > 0);
+  }
   function connect() {
     var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     var ws = new WebSocket(proto + '//' + location.host + '/api/ws/status');
     ws.onmessage = function(e) {
       try {
+        if (shouldPauseLiveUpdates()) { return; }
         var s = JSON.parse(e.data);
         var sys = s.system || {};
         var cpu = (sys.cpu_percent || 0);

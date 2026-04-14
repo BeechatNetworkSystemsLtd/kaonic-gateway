@@ -19,6 +19,7 @@ use kaonic_gateway::system_metrics::{
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
 use std::process::Command;
+use std::net::Ipv4Addr;
 
 use super::AppState;
 
@@ -187,6 +188,61 @@ pub async fn post_system_service_restart(
     Ok(Json(SystemActionResponse { status }))
 }
 
+pub async fn put_vpn_routes(
+    State(state): State<AppState>,
+    Json(request): Json<PutVpnRoutesRequest>,
+) -> Result<Json<SystemActionResponse>, (StatusCode, String)> {
+    let routes = request
+        .routes
+        .iter()
+        .map(|route| {
+            route
+                .trim()
+                .parse::<cidr::Ipv4Cidr>()
+                .map_err(|err| (StatusCode::BAD_REQUEST, format!("invalid route '{route}': {err}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    {
+        let settings = state
+            .settings
+            .lock()
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "settings lock poisoned".into()))?;
+        let mut config = settings
+            .load_config()
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to load config: {err}")))?;
+        config.advertised_routes = routes.clone();
+        settings
+            .save_config(&config)
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to save config: {err}")))?;
+    }
+
+    if let Some(vpn) = &state.vpn {
+        vpn.replace_advertised_routes(routes).await;
+    }
+
+    Ok(Json(SystemActionResponse {
+        status: "VPN advertised routes updated".into(),
+    }))
+}
+
+pub async fn post_vpn_ping(
+    Json(request): Json<VpnPingRequest>,
+) -> Result<Json<VpnPingResponse>, (StatusCode, String)> {
+    let address = request
+        .address
+        .trim()
+        .parse::<Ipv4Addr>()
+        .map_err(|err| (StatusCode::BAD_REQUEST, format!("invalid IPv4 address '{}': {err}", request.address.trim())))?;
+
+    let status = request_vpn_ping(address)
+        .map_err(|err| (StatusCode::BAD_GATEWAY, err))?;
+    Ok(Json(VpnPingResponse {
+        ok: true,
+        status,
+    }))
+}
+
 // ── /api/audio ────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -198,6 +254,16 @@ pub struct PutAudioRequest {
 #[derive(Deserialize)]
 pub struct RadioTestRequest {
     pub message: String,
+}
+
+#[derive(Deserialize)]
+pub struct PutVpnRoutesRequest {
+    pub routes: Vec<String>,
+}
+
+#[derive(Deserialize)]
+pub struct VpnPingRequest {
+    pub address: String,
 }
 
 #[derive(Deserialize)]
@@ -217,6 +283,12 @@ pub struct RadioTestResponse {
 
 #[derive(Serialize)]
 pub struct SystemActionResponse {
+    pub status: String,
+}
+
+#[derive(Serialize)]
+pub struct VpnPingResponse {
+    pub ok: bool,
     pub status: String,
 }
 
@@ -396,6 +468,49 @@ fn request_service_restart(unit: &str) -> Result<String, String> {
 #[cfg(not(target_os = "linux"))]
 fn request_service_restart(unit: &str) -> Result<String, String> {
     Ok(format!("Mock restart requested for {unit}"))
+}
+
+#[cfg(target_os = "linux")]
+fn request_vpn_ping(address: Ipv4Addr) -> Result<String, String> {
+    let output = Command::new("ping")
+        .args(["-n", "-c", "1", "-W", "1", &address.to_string()])
+        .output()
+        .map_err(|err| format!("failed to execute ping {address}: {err}"))?;
+
+    if output.status.success() {
+        return Ok(summarize_ping_output(&output.stdout)
+            .unwrap_or_else(|| format!("Ping to {address} succeeded")));
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let message = if stderr.is_empty() { stdout } else { stderr };
+    Err(if message.is_empty() {
+        format!("ping {address} failed")
+    } else {
+        message
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn request_vpn_ping(address: Ipv4Addr) -> Result<String, String> {
+    Ok(format!("Mock ping to {address} succeeded"))
+}
+
+#[cfg(target_os = "linux")]
+fn summarize_ping_output(stdout: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(stdout);
+    text.lines()
+        .find(|line| line.contains("time="))
+        .map(str::trim)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            text.lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .map(str::trim)
+                .map(ToOwned::to_owned)
+        })
 }
 
 // ── /network/wifi actions ─────────────────────────────────────────────────────

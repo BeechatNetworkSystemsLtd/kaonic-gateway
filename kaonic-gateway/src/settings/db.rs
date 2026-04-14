@@ -9,6 +9,7 @@ use crate::radio::{HardwareRadioConfig, RadioModuleConfig};
 
 const DEFAULT_NETWORK: &str = "10.20.0.0/16";
 const DEFAULT_ANNOUNCE_FREQ_SECS: u32 = 1;
+const DEFAULT_ADVERTISED_ROUTES: &str = "[]";
 
 pub struct Database {
     conn: Connection,
@@ -91,6 +92,11 @@ impl Database {
             rows.collect::<Result<Vec<String>>>()?
         };
 
+        let advertised_routes = self
+            .get("advertised_routes")?
+            .unwrap_or_else(|| DEFAULT_ADVERTISED_ROUTES.to_string());
+        let advertised_routes = serde_json::from_str(&advertised_routes).unwrap_or_default();
+
         let defaults = HardwareRadioConfig::default();
         let module_configs = std::array::from_fn(|i| {
             let suffix = format!("_{i}");
@@ -129,6 +135,7 @@ impl Database {
         Ok(GatewayConfig {
             network,
             peers,
+            advertised_routes,
             announce_freq_secs,
             radio: HardwareRadioConfig { module_configs },
         })
@@ -136,6 +143,10 @@ impl Database {
 
     pub fn save_config(&self, config: &GatewayConfig) -> Result<()> {
         self.set("network", &config.network.to_string())?;
+        self.set(
+            "advertised_routes",
+            &serde_json::to_string(&config.advertised_routes).unwrap(),
+        )?;
         self.set("announce_freq_secs", &config.announce_freq_secs.to_string())?;
 
         self.conn.execute("DELETE FROM peers", [])?;

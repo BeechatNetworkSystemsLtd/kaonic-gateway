@@ -1,6 +1,7 @@
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use super::PageTitle;
 use crate::app_types::{ReticulumEventDto, ReticulumLinkDto, ReticulumSnapshotDto};
 
 fn format_timestamp(ts: u64) -> String {
@@ -60,6 +61,21 @@ const RETICULUM_WS_JS: &str = r#"
     var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     var ws = new WebSocket(proto + '//' + location.host + '/api/ws/status');
 
+    function shouldPauseLiveUpdates() {
+        if (document.body.classList.contains('modal-open')) { return true; }
+        var active = document.activeElement;
+        if (active && (
+            active.tagName === 'INPUT' ||
+            active.tagName === 'TEXTAREA' ||
+            active.tagName === 'SELECT' ||
+            active.isContentEditable
+        )) {
+            return true;
+        }
+        var selection = window.getSelection ? window.getSelection() : null;
+        return !!(selection && !selection.isCollapsed && String(selection).trim().length > 0);
+    }
+
     function escapeHtml(value) {
         return String(value == null ? '' : value)
             .replace(/&/g, '&amp;')
@@ -82,8 +98,68 @@ const RETICULUM_WS_JS: &str = r#"
     function formatHash(value) {
         var text = String(value == null ? '' : value).replace(/\s+/g, '');
         if (!text) { return '—'; }
-        if (!/^[0-9a-fA-F]+$/.test(text)) { return text; }
-        return text.match(/.{1,4}/g).join(' ');
+        return text;
+    }
+
+    function splitCommaValues(value) {
+        return String(value == null ? '' : value)
+            .split(',')
+            .map(function(item) { return item.trim(); })
+            .filter(Boolean);
+    }
+
+    function statusBadgeClass(value) {
+        var text = String(value == null ? '' : value).toLowerCase();
+        if (text === 'active' || text === 'ready' || text === 'running' || text === 'announce' || text === 'open') {
+            return 'badge-ok';
+        }
+        if (text === 'starting' || text === 'discovered' || text === 'configured' || text === 'pending') {
+            return 'badge-warn';
+        }
+        if (text === 'error' || text === 'failed' || text === 'closed' || text === 'down') {
+            return 'badge-err';
+        }
+        return 'reticulum-badge-soft';
+    }
+
+    function sourceBadgeClass(value) {
+        var text = String(value == null ? '' : value).toLowerCase();
+        if (text === 'incoming link') { return 'reticulum-badge-source-in'; }
+        if (text === 'outgoing link') { return 'reticulum-badge-source-out'; }
+        if (text === 'announce') { return 'reticulum-badge-source-announce'; }
+        return 'reticulum-badge-soft';
+    }
+
+    function directionBadgeClass(value) {
+        var text = String(value == null ? '' : value).toLowerCase();
+        if (text === 'in' || text === 'rx' || text === 'incoming') { return 'reticulum-badge-dir-in'; }
+        if (text === 'out' || text === 'tx' || text === 'outgoing') { return 'reticulum-badge-dir-out'; }
+        return 'reticulum-badge-soft';
+    }
+
+    function eventKindBadgeClass(value) {
+        var text = String(value == null ? '' : value).toLowerCase();
+        if (text === 'announce') { return 'reticulum-badge-kind-announce'; }
+        if (text === 'link') { return 'reticulum-badge-kind-link'; }
+        if (text === 'data' || text === 'packet') { return 'reticulum-badge-kind-data'; }
+        if (text === 'error') { return 'badge-err'; }
+        return 'reticulum-badge-soft';
+    }
+
+    function destinationKindBadgeClass(value) {
+        var text = String(value == null ? '' : value).toLowerCase();
+        if (text === 'vpn') { return 'reticulum-badge-kind-vpn'; }
+        if (text === 'atak') { return 'reticulum-badge-kind-atak'; }
+        return 'reticulum-badge-soft';
+    }
+
+    function renderBadgeList(items, classResolver) {
+        if (!items || items.length === 0) {
+            return '<span class="badge reticulum-badge-soft">—</span>';
+        }
+        return '<div class="reticulum-badge-list">' + items.map(function(item) {
+            return '<span class="badge ' + classResolver(item) + '">' + escapeHtml(item) + '</span>';
+        }).join('') + '</div>';
     }
 
     function renderLinks(id, links, emptyText) {
@@ -97,7 +173,7 @@ const RETICULUM_WS_JS: &str = r#"
             return '<tr>'
                 + '<td class="td-hex td-hash">' + escapeHtml(formatHash(link.id || '—')) + '</td>'
                 + '<td class="td-hex td-hash">' + escapeHtml(formatHash(link.destination || '—')) + '</td>'
-                + '<td class="td-time">' + escapeHtml(link.status || '—') + '</td>'
+                + '<td>' + renderBadgeList([link.status || '—'], statusBadgeClass) + '</td>'
                 + '<td class="td-len">' + escapeHtml(link.rtt_ms != null ? String(link.rtt_ms) + " ms" : '—') + '</td>'
                 + '<td class="td-len">' + escapeHtml(String(link.packets || 0)) + '</td>'
                 + '<td class="td-len">' + escapeHtml(String(link.bytes || 0)) + ' B</td>'
@@ -116,8 +192,8 @@ const RETICULUM_WS_JS: &str = r#"
         tbody.innerHTML = events.map(function(event) {
             return '<tr>'
                 + '<td class="td-time">' + escapeHtml(formatTime(event.ts)) + '</td>'
-                + '<td class="td-time">' + escapeHtml(event.direction || '—') + '</td>'
-                + '<td class="td-time">' + escapeHtml(event.kind || '—') + '</td>'
+                + '<td>' + renderBadgeList([event.direction || '—'], directionBadgeClass) + '</td>'
+                + '<td>' + renderBadgeList([event.kind || '—'], eventKindBadgeClass) + '</td>'
                 + '<td class="td-hex td-hash">' + escapeHtml(formatHash(event.link_id || '—')) + '</td>'
                 + '<td class="td-hex td-hash">' + escapeHtml(formatHash(event.destination || '—')) + '</td>'
                 + '<td class="td-hex">' + escapeHtml(event.details || '—') + '</td>'
@@ -174,8 +250,8 @@ const RETICULUM_WS_JS: &str = r#"
         tbody.innerHTML = rows.map(function(row) {
             return '<tr>'
                 + '<td class="td-hex td-hash">' + escapeHtml(formatHash(row.destination)) + '</td>'
-                + '<td class="td-time">' + escapeHtml(row.source) + '</td>'
-                + '<td class="td-time">' + escapeHtml(row.status) + '</td>'
+                + '<td>' + renderBadgeList(splitCommaValues(row.source), sourceBadgeClass) + '</td>'
+                + '<td>' + renderBadgeList(splitCommaValues(row.status), statusBadgeClass) + '</td>'
                 + '</tr>';
         }).join('');
     }
@@ -214,14 +290,15 @@ const RETICULUM_WS_JS: &str = r#"
             return '<tr>'
                 + '<td class="td-time">' + escapeHtml(row.name) + '</td>'
                 + '<td class="td-hex td-hash">' + escapeHtml(formatHash(row.destination || '—')) + '</td>'
-                + '<td class="td-time">' + escapeHtml(row.kind) + '</td>'
-                + '<td class="td-time">' + escapeHtml(row.status) + '</td>'
+                + '<td>' + renderBadgeList([row.kind || '—'], destinationKindBadgeClass) + '</td>'
+                + '<td>' + renderBadgeList([row.status || '—'], statusBadgeClass) + '</td>'
                 + '</tr>';
         }).join('');
     }
 
     ws.onmessage = function(ev) {
         try {
+            if (shouldPauseLiveUpdates()) { return; }
             var payload = JSON.parse(ev.data) || {};
             var snapshot = payload.reticulum || {};
             var incoming = snapshot.incoming_links || [];
@@ -246,8 +323,8 @@ pub fn ReticulumPage() -> impl IntoView {
     let snapshot = Resource::new(|| (), |_| load_reticulum_snapshot());
 
     view! {
-        <div class="page page--fill">
-            <h1 class="page-title">"Reticulum"</h1>
+        <div class="page">
+            <PageTitle icon="🛰️" title="Reticulum" />
             <Suspense fallback=|| view! { <p class="loading">"Loading…"</p> }>
                 {move || match snapshot.get() {
                     None => view! { <p class="loading">"Loading…"</p> }.into_any(),
@@ -361,7 +438,7 @@ fn ReticulumLinksCard(
                                         <tr>
                                             <td class="td-hex td-hash">{format_hash(&link.id)}</td>
                                             <td class="td-hex td-hash">{format_hash(&link.destination)}</td>
-                                            <td class="td-time">{link.status}</td>
+                                            <td>{render_badge_list(&[link.status], status_badge_class)}</td>
                                             <td class="td-len">{rtt}</td>
                                             <td class="td-len">{link.packets}</td>
                                             <td class="td-len">{format!("{} B", link.bytes)}</td>
@@ -413,8 +490,8 @@ fn ReticulumEventsCard(events: Vec<ReticulumEventDto>) -> impl IntoView {
                                     view! {
                                         <tr>
                                             <td class="td-time">{ts}</td>
-                                            <td class="td-time">{event.direction}</td>
-                                            <td class="td-time">{event.kind}</td>
+                                            <td>{render_badge_list(&[event.direction], direction_badge_class)}</td>
+                                            <td>{render_badge_list(&[event.kind], event_kind_badge_class)}</td>
                                             <td class="td-hex td-hash">
                                                 {if event.link_id.is_empty() { "—".into() } else { format_hash(&event.link_id) }}
                                             </td>
@@ -459,8 +536,8 @@ fn LocalDestinationsCard(destinations: Vec<LocalDestinationRow>) -> impl IntoVie
                                     <tr>
                                         <td class="td-time">{destination.name}</td>
                                         <td class="td-hex td-hash">{format_hash(&destination.destination)}</td>
-                                        <td class="td-time">{destination.kind}</td>
-                                        <td class="td-time">{destination.status}</td>
+                                        <td>{render_badge_list(&[destination.kind], destination_kind_badge_class)}</td>
+                                        <td>{render_badge_list(&[destination.status], status_badge_class)}</td>
                                     </tr>
                                 }
                             }).collect_view().into_any()
@@ -496,8 +573,8 @@ fn OpenDestinationsCard(destinations: Vec<DestinationRow>) -> impl IntoView {
                                 view! {
                                     <tr>
                                         <td class="td-hex td-hash">{format_hash(&destination.destination)}</td>
-                                        <td class="td-time">{destination.source}</td>
-                                        <td class="td-time">{destination.status}</td>
+                                        <td>{render_badge_list(&split_badge_values(&destination.source), source_badge_class)}</td>
+                                        <td>{render_badge_list(&split_badge_values(&destination.status), status_badge_class)}</td>
                                     </tr>
                                 }
                             }).collect_view().into_any()
@@ -514,15 +591,79 @@ fn format_hash(value: &str) -> String {
     if compact.is_empty() {
         return "—".into();
     }
-    if !compact.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return compact;
-    }
     compact
-        .as_bytes()
-        .chunks(4)
-        .map(|chunk| std::str::from_utf8(chunk).unwrap_or_default())
-        .collect::<Vec<_>>()
-        .join(" ")
+}
+
+fn split_badge_values(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn status_badge_class(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "active" | "ready" | "running" | "announce" | "open" => "badge-ok",
+        "starting" | "discovered" | "configured" | "pending" => "badge-warn",
+        "error" | "failed" | "closed" | "down" => "badge-err",
+        _ => "reticulum-badge-soft",
+    }
+}
+
+fn source_badge_class(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "incoming link" => "reticulum-badge-source-in",
+        "outgoing link" => "reticulum-badge-source-out",
+        "announce" => "reticulum-badge-source-announce",
+        _ => "reticulum-badge-soft",
+    }
+}
+
+fn direction_badge_class(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "in" | "rx" | "incoming" => "reticulum-badge-dir-in",
+        "out" | "tx" | "outgoing" => "reticulum-badge-dir-out",
+        _ => "reticulum-badge-soft",
+    }
+}
+
+fn event_kind_badge_class(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "announce" => "reticulum-badge-kind-announce",
+        "link" => "reticulum-badge-kind-link",
+        "data" | "packet" => "reticulum-badge-kind-data",
+        "error" => "badge-err",
+        _ => "reticulum-badge-soft",
+    }
+}
+
+fn destination_kind_badge_class(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "vpn" => "reticulum-badge-kind-vpn",
+        "atak" => "reticulum-badge-kind-atak",
+        _ => "reticulum-badge-soft",
+    }
+}
+
+fn render_badge_list(values: &[String], class_fn: fn(&str) -> &'static str) -> impl IntoView {
+    if values.is_empty() {
+        return view! { <span class="badge reticulum-badge-soft">"—"</span> }.into_any();
+    }
+
+    view! {
+        <div class="reticulum-badge-list">
+            {values.iter().map(|value| {
+                let class_name = format!("badge {}", class_fn(value));
+                let value = value.clone();
+                view! {
+                    <span class=class_name>{value}</span>
+                }
+            }).collect_view()}
+        </div>
+    }
+        .into_any()
 }
 
 fn collect_local_destinations(

@@ -166,9 +166,22 @@ html, body {
 }
 
 .page-title {
+  display: flex;
+  align-items: center;
+  gap: 12px;
   font-size: 24px;
   font-weight: 700;
   margin-bottom: 24px;
+}
+
+.page-title-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.5em;
+  min-width: 1.5em;
+  font-size: 1.05em;
+  line-height: 1;
 }
 
 .page-header {
@@ -1427,6 +1440,39 @@ select.field-input {
   min-width: 0;
 }
 
+.vpn-help-card {
+  margin-bottom: 18px;
+}
+
+.vpn-ping-cell {
+  min-width: 190px;
+}
+
+.vpn-ping-btn {
+  min-width: 88px;
+}
+
+.vpn-ping-status {
+  min-height: 20px;
+  margin-top: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  word-break: break-word;
+}
+
+.vpn-ping-status.ok {
+  color: var(--ok);
+}
+
+.vpn-ping-status.err {
+  color: var(--danger);
+}
+
+.vpn-ping-status.pending {
+  color: var(--text-muted);
+}
+
 .reticulum-summary .stat-card {
   display: flex;
   flex-direction: column;
@@ -1442,8 +1488,85 @@ select.field-input {
   max-height: 420px;
 }
 
+.reticulum-badge-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.reticulum-badge-soft {
+  background: rgba(139,148,158,.14);
+  color: var(--text-muted);
+}
+
+.reticulum-badge-source-in {
+  background: rgba(88,166,255,.16);
+  color: #79c0ff;
+}
+
+.reticulum-badge-source-out {
+  background: rgba(168,85,247,.16);
+  color: #c084fc;
+}
+
+.reticulum-badge-source-announce,
+.reticulum-badge-kind-announce {
+  background: rgba(34,197,94,.16);
+  color: #4ade80;
+}
+
+.reticulum-badge-dir-in {
+  background: rgba(45,212,191,.16);
+  color: #5eead4;
+}
+
+.reticulum-badge-dir-out {
+  background: rgba(251,191,36,.16);
+  color: #facc15;
+}
+
+.reticulum-badge-kind-link {
+  background: rgba(129,140,248,.16);
+  color: #a5b4fc;
+}
+
+.reticulum-badge-kind-data,
+.reticulum-badge-kind-vpn {
+  background: rgba(59,130,246,.16);
+  color: #93c5fd;
+}
+
+.reticulum-badge-kind-atak {
+  background: rgba(236,72,153,.16);
+  color: #f9a8d4;
+}
+
+.vpn-stat-card {
+  position: relative;
+  overflow: hidden;
+}
+
+.vpn-stat-card::after {
+  content: "";
+  position: absolute;
+  inset: auto -24px -24px auto;
+  width: 96px;
+  height: 96px;
+  border-radius: 999px;
+  opacity: .18;
+  pointer-events: none;
+}
+
+.vpn-stat-card--status::after { background: #4ade80; }
+.vpn-stat-card--network::after { background: #60a5fa; }
+.vpn-stat-card--peers::after { background: #c084fc; }
+.vpn-stat-card--routes::after { background: #facc15; }
+.vpn-stat-card--traffic::after { background: linear-gradient(135deg, #fb7185, #22d3ee); }
+.vpn-stat-card--error::after { background: #ef4444; }
+
 .td-hash {
-  letter-spacing: .05em;
+  letter-spacing: normal;
   overflow-wrap: anywhere;
   word-break: normal;
 }

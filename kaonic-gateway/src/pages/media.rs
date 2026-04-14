@@ -1,5 +1,6 @@
 use leptos::prelude::*;
 
+use super::PageTitle;
 use crate::audio::{AudioCardSnapshot, AudioControlSnapshot};
 
 #[server]
@@ -232,7 +233,7 @@ pub fn MediaPage() -> impl IntoView {
 
     view! {
         <div class="page">
-            <h1 class="page-title">"Media"</h1>
+            <PageTitle icon="🎛️" title="Media" />
             <Suspense fallback=|| view! { <p class="loading">"Loading audio controls…"</p> }>
                 {move || match cards.get() {
                     None => view! { <p class="loading">"Loading…"</p> }.into_any(),

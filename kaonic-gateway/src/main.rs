@@ -9,7 +9,6 @@ use clap::Parser;
 use env_logger;
 use http::{AppState, SharedSettings};
 use kaonic_vpn::{VpnConfig, VpnRuntime};
-use kaonic_gateway::atak::{AtakBridge, BridgeMetrics};
 use kaonic_gateway::gateway_reticulum::GatewayReticulum;
 use kaonic_gateway::radio::{
     attach_radio_interface, connect_radio_client, SharedRadioClient, SharedTxObserver,
@@ -82,7 +81,7 @@ async fn async_main() -> Result<(), process::ExitCode> {
         });
 
     env_logger::Builder::new()
-        .parse_filters("warn,kaonic_gateway=trace,kaonic_vpn=warn,kaonic_reticulum=trace,rns_vpn=warn,reticulum=debug")
+        .parse_filters("warn,kaonic_gateway=trace,kaonic_vpn=info,kaonic_reticulum=warn,rns_vpn=warn,reticulum=warn")
         .parse_default_env()
         .init();
 
@@ -169,6 +168,7 @@ async fn async_main() -> Result<(), process::ExitCode> {
         VpnConfig {
             network: config.network,
             peers: config.peers.clone(),
+            advertised_routes: config.advertised_routes.clone(),
             announce_freq_secs: config.announce_freq_secs,
         },
         transport.clone(),
@@ -184,27 +184,8 @@ async fn async_main() -> Result<(), process::ExitCode> {
         }
     };
 
-    let mut atak_metrics = Vec::new();
-    for &(port, _) in kaonic_gateway::atak::ATAK_PORTS {
-        let seed = settings
-            .lock()
-            .unwrap()
-            .load_or_create_named_seed(&format!("atak_identity_seed_{port}"))
-            .unwrap_or_else(|err| {
-                log::error!("failed to load/create atak identity seed for port {port}: {err}");
-                process::exit(1);
-            });
-        let atak_identity = PrivateIdentity::new_from_name(&seed);
-        let metrics = BridgeMetrics::new(port);
-        atak_metrics.push(metrics.clone());
-        let bridge = AtakBridge::new(transport.clone(), atak_identity, port, metrics);
-        let c = cancel.clone();
-        tokio::spawn(async move {
-            if let Err(e) = bridge.run(c).await {
-                log::error!("atak-bridge:{port} exited with error: {e}");
-            }
-        });
-    }
+    log::info!("ATAK bridge disabled");
+    let atak_metrics = Vec::new();
 
     let app_state = AppState::new(
         settings.clone(),

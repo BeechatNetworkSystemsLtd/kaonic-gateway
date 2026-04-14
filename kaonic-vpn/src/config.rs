@@ -11,6 +11,9 @@ pub struct VpnConfig {
     pub network: Ipv4Cidr,
     /// Remote Kaonic Reticulum destination hashes that should participate in the VPN.
     pub peers: Vec<String>,
+    /// Extra local subnets to advertise even when they are not auto-detected from interfaces.
+    #[serde(default)]
+    pub advertised_routes: Vec<Ipv4Cidr>,
     #[serde(default = "default_announce_freq_secs")]
     pub announce_freq_secs: u32,
 }

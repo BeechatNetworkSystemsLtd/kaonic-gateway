@@ -12,6 +12,8 @@ fn default_announce_freq_secs() -> u32 {
 pub struct GatewayConfig {
     pub network: Ipv4Cidr,
     pub peers: Vec<String>,
+    #[serde(default)]
+    pub advertised_routes: Vec<Ipv4Cidr>,
     #[serde(default = "default_announce_freq_secs")]
     pub announce_freq_secs: u32,
     #[serde(default)]

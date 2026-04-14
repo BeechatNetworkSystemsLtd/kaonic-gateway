@@ -8,7 +8,7 @@ use axum::extract::Path;
 use axum::http::header;
 use axum::response::IntoResponse;
 use axum::{
-    routing::{get, post},
+    routing::{get, post, put},
     Router,
 };
 use leptos::config::LeptosOptions;
@@ -69,6 +69,8 @@ pub async fn serve(state: AppState, addr: SocketAddr) {
         .route("/api/status", get(handlers::get_status))
         .route("/api/info", get(handlers::get_info))
         .route("/api/network/snapshot", get(handlers::get_network_snapshot))
+        .route("/api/vpn/routes", put(handlers::put_vpn_routes))
+        .route("/api/vpn/ping", post(handlers::post_vpn_ping))
         .route("/api/update/{target}/version", get(update::get_version))
         .route("/api/update/{target}/upload", post(update::upload_update))
         .route("/network/wifi/mode", post(handlers::post_wifi_mode))

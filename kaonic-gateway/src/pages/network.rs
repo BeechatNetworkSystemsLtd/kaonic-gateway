@@ -1,5 +1,6 @@
 use leptos::prelude::*;
 
+use super::PageTitle;
 use crate::app_types::NetworkSnapshotDto;
 
 #[server]
@@ -218,7 +219,7 @@ pub fn NetworkPage() -> impl IntoView {
     view! {
         <div class="page">
             <div class="page-header">
-                <h1 class="page-title">"Network"</h1>
+                <PageTitle icon="🌐" title="Network" />
                 <button type="button" id="network-refresh-btn" class="btn-secondary" data-network-action>
                     "Refresh"
                 </button>

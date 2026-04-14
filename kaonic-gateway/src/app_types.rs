@@ -192,6 +192,7 @@ pub struct GatewaySettingsDto {
     /// CIDR network string, e.g. `"10.0.0.0/24"`.
     pub network: String,
     pub peers: Vec<String>,
+    pub advertised_routes: Vec<String>,
     pub announce_freq_secs: u32,
     /// Exactly 2 radio modules.
     pub radio_modules: [RadioModuleConfigDto; 2],
@@ -202,6 +203,7 @@ impl Default for GatewaySettingsDto {
         Self {
             network: "10.0.0.0/24".into(),
             peers: vec![],
+            advertised_routes: vec![],
             announce_freq_secs: 1,
             radio_modules: [
                 RadioModuleConfigDto::default(),
@@ -236,6 +238,11 @@ impl From<crate::config::GatewayConfig> for GatewaySettingsDto {
         Self {
             network: c.network.to_string(),
             peers: c.peers,
+            advertised_routes: c
+                .advertised_routes
+                .into_iter()
+                .map(|route| route.to_string())
+                .collect(),
             announce_freq_secs: c.announce_freq_secs,
             radio_modules: [
                 c.radio.module_configs[0].clone().into(),
@@ -253,9 +260,17 @@ impl TryFrom<GatewaySettingsDto> for crate::config::GatewayConfig {
             .network
             .parse()
             .map_err(|e| format!("invalid network CIDR '{}: {e}", d.network))?;
+        let advertised_routes = d
+            .advertised_routes
+            .into_iter()
+            .map(|route| {
+                route.parse().map_err(|e| format!("invalid advertised route '{route}': {e}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(crate::config::GatewayConfig {
             network,
             peers: d.peers,
+            advertised_routes,
             announce_freq_secs: d.announce_freq_secs,
             radio: HardwareRadioConfig {
                 module_configs: [

@@ -11,7 +11,7 @@ run = ["dep:reticulum", "dep:kaonic-reticulum", "dep:tokio-util", "dep:cidr-v3"]
 
 [dependencies]
 # rns-vpn = { git = "https://github.com/BeechatNetworkSystemsLtd/rns-vpn-rs", optional = true }  # disabled: pins tokio 1.44
-reticulum        = { git = "https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs", rev = "9d055d1d68658963d5cf0417e29c78e38cd4baff", optional = true }
+reticulum        = { git = "https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs", branch = "main", optional = true }
 kaonic-reticulum = { path = "../kaonic-reticulum", optional = true }
 cidr-v3          = { package = "cidr", version = "0.3", features = ["serde"], optional = true }
 cidr             = { version = "0.2", features = ["serde"] }

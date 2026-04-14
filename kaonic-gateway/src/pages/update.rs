@@ -1,6 +1,7 @@
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use super::PageTitle;
 use reqwest;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -196,7 +197,7 @@ pub fn SystemPage() -> impl IntoView {
     view! {
         <div class="page">
             <div class="page-header">
-                <h1 class="page-title">"System"</h1>
+                <PageTitle icon="🖥️" title="System" />
                 <button type="button" id="system-reboot-open" class="btn-secondary system-reboot-btn">
                     "Reboot"
                 </button>

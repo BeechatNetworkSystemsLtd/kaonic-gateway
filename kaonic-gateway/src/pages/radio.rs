@@ -1,5 +1,6 @@
 use leptos::prelude::*;
 
+use super::PageTitle;
 use crate::app_types::{GatewaySettingsDto, RadioModuleConfigDto};
 
 // ── Server functions ──────────────────────────────────────────────────────────
@@ -84,9 +85,29 @@ pub async fn save_radio_module(
 
 const RADIO_WS_JS: &str = r#"
 (function() {
-    var ws = new WebSocket('ws://' + location.host + '/api/ws/status');
+    function shouldPauseLiveUpdates() {
+        if (document.body.classList.contains('modal-open')) { return true; }
+        var active = document.activeElement;
+        if (active && (
+            active.tagName === 'INPUT' ||
+            active.tagName === 'TEXTAREA' ||
+            active.tagName === 'SELECT' ||
+            active.isContentEditable
+        )) {
+            return true;
+        }
+        var selection = window.getSelection ? window.getSelection() : null;
+        return !!(selection && !selection.isCollapsed && String(selection).trim().length > 0);
+    }
     function formatKBytes(bytes) {
         return (bytes / 1024).toFixed(1);
+    }
+    function formatFrameTime(ts) {
+        return new Date(ts * 1000).toLocaleTimeString([], {
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit'
+        });
     }
     function rssiClass(frame) {
         if (frame.direction === 'tx') {
@@ -104,47 +125,56 @@ const RADIO_WS_JS: &str = r#"
         }
         return 'td-rssi td-rssi-good';
     }
-    ws.onmessage = function(ev) {
-        try {
-            var d = JSON.parse(ev.data);
-            var frames = d.rx_frames || [[], []];
-            var frameStats = d.frame_stats || [{}, {}];
-            [0, 1].forEach(function(i) {
-                var tbody = document.getElementById('rx-frames-' + i);
-                var stats = document.getElementById('rx-stats-summary-' + i);
-                var rssi = document.getElementById('rx-stats-rssi-' + i);
-                if (!tbody || !stats || !rssi) return;
-                var list = frames[i] || [];
-                var totals = frameStats[i] || {};
-                var rxCount = Number(totals.rx_frames) || 0;
-                var rxBytes = Number(totals.rx_bytes) || 0;
-                var txCount = Number(totals.tx_frames) || 0;
-                var txBytes = Number(totals.tx_bytes) || 0;
-                stats.textContent = 'RX: ' + rxCount + ' frames, ' + formatKBytes(rxBytes)
-                    + ' KB | TX: ' + txCount + ' frames, ' + formatKBytes(txBytes) + ' KB';
-                rssi.textContent = totals.last_rssi !== null && totals.last_rssi !== undefined
-                    ? 'Last RSSI: ' + totals.last_rssi + ' dBm'
-                    : 'Last RSSI: —';
-                if (list.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="5" class="frames-empty">No frames observed</td></tr>';
-                    return;
-                }
-                tbody.innerHTML = list.map(function(f) {
-                    var t = new Date(f.ts * 1000).toLocaleTimeString();
-                    var dir = f.direction === 'tx' ? '\u2191' : '\u2193';
-                    var trxClass = f.direction === 'tx' ? 'td-trx td-trx-tx' : 'td-trx td-trx-rx';
-                    return '<tr><td class="' + trxClass + '">' + dir + '</td>'
-                         + '<td class="td-time">' + t + '</td>'
-                           + '<td class="' + rssiClass(f) + '">' + f.rssi + ' dBm</td>'
-                           + '<td class="td-len">' + f.len + ' B</td>'
-                           + '<td class="td-hex">' + (f.hex || '—') + '</td></tr>';
-                }).join('');
-            });
-        } catch(e) {}
-    };
-    ws.onerror = function() {
-        setTimeout(function() { location.reload(); }, 3000);
-    };
+    function connect() {
+        var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        var ws = new WebSocket(proto + '//' + location.host + '/api/ws/status');
+        ws.onmessage = function(ev) {
+            try {
+                if (shouldPauseLiveUpdates()) { return; }
+                var d = JSON.parse(ev.data);
+                var frames = d.rx_frames || [[], []];
+                var frameStats = d.frame_stats || [{}, {}];
+                [0, 1].forEach(function(i) {
+                    var tbody = document.getElementById('rx-frames-' + i);
+                    var stats = document.getElementById('rx-stats-summary-' + i);
+                    var rssi = document.getElementById('rx-stats-rssi-' + i);
+                    if (!tbody || !stats || !rssi) return;
+                    var list = frames[i] || [];
+                    var totals = frameStats[i] || {};
+                    var rxCount = Number(totals.rx_frames) || 0;
+                    var rxBytes = Number(totals.rx_bytes) || 0;
+                    var txCount = Number(totals.tx_frames) || 0;
+                    var txBytes = Number(totals.tx_bytes) || 0;
+                    stats.textContent = 'RX: ' + rxCount + ' frames, ' + formatKBytes(rxBytes)
+                        + ' KB | TX: ' + txCount + ' frames, ' + formatKBytes(txBytes) + ' KB';
+                    rssi.textContent = totals.last_rssi !== null && totals.last_rssi !== undefined
+                        ? 'Last RSSI: ' + totals.last_rssi + ' dBm'
+                        : 'Last RSSI: —';
+                    if (list.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="5" class="frames-empty">No frames observed</td></tr>';
+                        return;
+                    }
+                    tbody.innerHTML = list.map(function(f) {
+                        var t = formatFrameTime(f.ts);
+                        var dir = f.direction === 'tx' ? '\u2191' : '\u2193';
+                        var trxClass = f.direction === 'tx' ? 'td-trx td-trx-tx' : 'td-trx td-trx-rx';
+                        return '<tr><td class="' + trxClass + '">' + dir + '</td>'
+                             + '<td class="td-time">' + t + '</td>'
+                               + '<td class="' + rssiClass(f) + '">' + f.rssi + ' dBm</td>'
+                               + '<td class="td-len">' + f.len + ' B</td>'
+                               + '<td class="td-hex">' + (f.hex || '—') + '</td></tr>';
+                    }).join('');
+                });
+            } catch(e) {}
+        };
+        ws.onclose = function() {
+            setTimeout(connect, 3000);
+        };
+        ws.onerror = function() {
+            ws.close();
+        };
+    }
+    connect();
 })();
 "#;
 
@@ -154,6 +184,7 @@ pub fn RadioPage() -> impl IntoView {
 
     view! {
         <div class="page page--fill">
+            <PageTitle icon="📡" title="Radio" />
             <Suspense fallback=|| view! { <p class="loading">"Loading…"</p> }>
                 {move || match settings_res.get() {
                     None => view! { <p class="loading">"Loading…"</p> }.into_any(),
