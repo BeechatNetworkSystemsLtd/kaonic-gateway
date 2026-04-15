@@ -144,10 +144,10 @@ pub fn read_cpu_cores() -> usize {
 
 pub fn read_gateway_services() -> Vec<ServiceStatusDto> {
     GATEWAY_SERVICE_UNITS
-    .iter()
-    .copied()
-    .map(read_service_status)
-    .collect()
+        .iter()
+        .copied()
+        .map(read_service_status)
+        .collect()
 }
 
 pub fn is_gateway_service_unit(unit: &str) -> bool {

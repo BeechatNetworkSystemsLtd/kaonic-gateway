@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use reticulum::destination::link::{Link, LinkEvent, LinkEventData, LinkStatus};
 use reticulum::transport::{AnnounceEvent, ReceivedData, Transport};
-use tokio::sync::Mutex;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::Mutex;
 
 use crate::app_types::{ReticulumEventDto, ReticulumLinkDto, ReticulumSnapshotDto};
 
@@ -33,10 +33,18 @@ impl GatewayReticulum {
         let state = self.state.lock().await;
 
         let mut incoming_links = state.incoming_links.values().cloned().collect::<Vec<_>>();
-        incoming_links.sort_by(|a, b| b.last_seen_ts.cmp(&a.last_seen_ts).then_with(|| a.id.cmp(&b.id)));
+        incoming_links.sort_by(|a, b| {
+            b.last_seen_ts
+                .cmp(&a.last_seen_ts)
+                .then_with(|| a.id.cmp(&b.id))
+        });
 
         let mut outgoing_links = state.outgoing_links.values().cloned().collect::<Vec<_>>();
-        outgoing_links.sort_by(|a, b| b.last_seen_ts.cmp(&a.last_seen_ts).then_with(|| a.id.cmp(&b.id)));
+        outgoing_links.sort_by(|a, b| {
+            b.last_seen_ts
+                .cmp(&a.last_seen_ts)
+                .then_with(|| a.id.cmp(&b.id))
+        });
 
         ReticulumSnapshotDto {
             incoming_links,
@@ -118,7 +126,9 @@ impl GatewayReticulum {
         let packet_len = link_event_packet_len(&event.event);
         let status = link_event_status(&event.event);
 
-        let mut snapshot = self.resolve_link_snapshot(transport, incoming, &event, &kind, ts).await;
+        let mut snapshot = self
+            .resolve_link_snapshot(transport, incoming, &event, &kind, ts)
+            .await;
         snapshot.status = status.into();
         snapshot.last_event = kind.clone();
         snapshot.last_seen_ts = ts;
@@ -130,7 +140,9 @@ impl GatewayReticulum {
             &mut state.outgoing_links
         };
 
-        let entry = links.entry(snapshot.id.clone()).or_insert_with(|| snapshot.clone());
+        let entry = links
+            .entry(snapshot.id.clone())
+            .or_insert_with(|| snapshot.clone());
         entry.destination = snapshot.destination;
         entry.status = snapshot.status;
         entry.rtt_ms = snapshot.rtt_ms;
@@ -170,7 +182,13 @@ impl GatewayReticulum {
     }
 
     async fn handle_announce(&self, event: AnnounceEvent) {
-        let destination = event.destination.lock().await.desc.address_hash.to_hex_string();
+        let destination = event
+            .destination
+            .lock()
+            .await
+            .desc
+            .address_hash
+            .to_hex_string();
         let mut state = self.state.lock().await;
         push_event(
             &mut state.events,
@@ -196,7 +214,11 @@ impl GatewayReticulum {
         let link = if incoming {
             transport.lock().await.find_in_link(&event.id).await
         } else {
-            transport.lock().await.find_out_link(&event.address_hash).await
+            transport
+                .lock()
+                .await
+                .find_out_link(&event.address_hash)
+                .await
         };
 
         if let Some(link) = link {

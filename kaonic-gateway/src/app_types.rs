@@ -1,9 +1,9 @@
+use kaonic_vpn::VpnSnapshot;
 use radio_common::{
     modulation::{Modulation, OfdmModulation},
     RadioConfig,
 };
 use serde::{Deserialize, Serialize};
-use kaonic_vpn::VpnSnapshot;
 
 // ── Radio ────────────────────────────────────────────────────────────────────
 
@@ -31,7 +31,7 @@ pub struct RxFrameDto {
     pub direction: String,
     pub rssi: i8,
     pub len: u16,
-    pub hex: String, // hex preview of first 8 bytes
+    pub hex: String, // hex preview of first 16 bytes
     pub ts: u64,     // unix timestamp (seconds)
 }
 
@@ -264,7 +264,9 @@ impl TryFrom<GatewaySettingsDto> for crate::config::GatewayConfig {
             .advertised_routes
             .into_iter()
             .map(|route| {
-                route.parse().map_err(|e| format!("invalid advertised route '{route}': {e}"))
+                route
+                    .parse()
+                    .map_err(|e| format!("invalid advertised route '{route}': {e}"))
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(crate::config::GatewayConfig {

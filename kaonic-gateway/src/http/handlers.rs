@@ -1,7 +1,6 @@
 use axum::extract::{Form, Path, State};
-use axum::http::StatusCode;
-use axum::Json;
-use kaonic_vpn::VpnSnapshot;
+use axum::http::{header, StatusCode};
+use axum::{response::IntoResponse, Json};
 use kaonic_gateway::app_types::{
     FrameStatsDto, NetworkPortStatusDto, NetworkSnapshotDto, ReticulumSnapshotDto, RxFrameDto,
     ServiceStatusDto,
@@ -16,10 +15,11 @@ use kaonic_gateway::system_metrics::{
     is_gateway_service_unit, read_cpu_percent_async, read_fs_mb, read_gateway_services,
     read_mem_mb, read_os_details,
 };
+use kaonic_vpn::VpnSnapshot;
 use serde::{Deserialize, Serialize};
+use std::net::Ipv4Addr;
 #[cfg(target_os = "linux")]
 use std::process::Command;
-use std::net::Ipv4Addr;
 
 use super::AppState;
 
@@ -34,6 +34,16 @@ pub async fn get_info(State(state): State<AppState>) -> Json<InfoResponse> {
     Json(InfoResponse {
         serial: state.serial.clone(),
     })
+}
+
+pub async fn get_serial(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; charset=utf-8".to_string(),
+        )],
+        state.serial.clone(),
+    )
 }
 
 /// `GET /api/settings` — return the full gateway config.
@@ -160,8 +170,8 @@ pub async fn post_radio_test(
         module,
         message.as_bytes(),
     )
-        .await
-        .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err))?;
+    .await
+    .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err))?;
 
     Ok(Json(RadioTestResponse {
         status: format!(
@@ -196,25 +206,35 @@ pub async fn put_vpn_routes(
         .routes
         .iter()
         .map(|route| {
-            route
-                .trim()
-                .parse::<cidr::Ipv4Cidr>()
-                .map_err(|err| (StatusCode::BAD_REQUEST, format!("invalid route '{route}': {err}")))
+            route.trim().parse::<cidr::Ipv4Cidr>().map_err(|err| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid route '{route}': {err}"),
+                )
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
 
     {
-        let settings = state
-            .settings
-            .lock()
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "settings lock poisoned".into()))?;
-        let mut config = settings
-            .load_config()
-            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to load config: {err}")))?;
+        let settings = state.settings.lock().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "settings lock poisoned".into(),
+            )
+        })?;
+        let mut config = settings.load_config().map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load config: {err}"),
+            )
+        })?;
         config.advertised_routes = routes.clone();
-        settings
-            .save_config(&config)
-            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to save config: {err}")))?;
+        settings.save_config(&config).map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to save config: {err}"),
+            )
+        })?;
     }
 
     if let Some(vpn) = &state.vpn {
@@ -229,18 +249,50 @@ pub async fn put_vpn_routes(
 pub async fn post_vpn_ping(
     Json(request): Json<VpnPingRequest>,
 ) -> Result<Json<VpnPingResponse>, (StatusCode, String)> {
-    let address = request
-        .address
-        .trim()
-        .parse::<Ipv4Addr>()
-        .map_err(|err| (StatusCode::BAD_REQUEST, format!("invalid IPv4 address '{}': {err}", request.address.trim())))?;
+    let address = request.address.trim().parse::<Ipv4Addr>().map_err(|err| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid IPv4 address '{}': {err}", request.address.trim()),
+        )
+    })?;
 
-    let status = request_vpn_ping(address)
+    let result = request_vpn_ping(address)
+        .await
         .map_err(|err| (StatusCode::BAD_GATEWAY, err))?;
     Ok(Json(VpnPingResponse {
-        ok: true,
-        status,
+        ok: result.ok,
+        latency: result.latency,
     }))
+}
+
+#[derive(Serialize)]
+pub struct VpnRoutesResponse {
+    pub tunnel_ip: Option<String>,
+    /// Routes exported to peers. Entries use "exported/prefix -> local/prefix" when
+    /// NAT aliasing is active, or just "net/prefix" when no aliasing is needed.
+    pub exported_routes: Vec<String>,
+    /// Alias subnets announced by remote peers that are currently installed as kernel routes.
+    /// Add these on laptops/hosts behind this device:
+    ///   ip route add <network> via <kaonic-lan-ip>
+    pub remote_installed: Vec<String>,
+}
+
+pub async fn get_vpn_routes(State(state): State<AppState>) -> Json<VpnRoutesResponse> {
+    let vpn = match &state.vpn {
+        Some(vpn) => vpn.snapshot().await,
+        None => kaonic_vpn::VpnSnapshot::default(),
+    };
+    let remote_installed = vpn
+        .remote_routes
+        .iter()
+        .filter(|r| r.installed)
+        .map(|r| r.network.clone())
+        .collect();
+    Json(VpnRoutesResponse {
+        tunnel_ip: vpn.local_tunnel_ip,
+        exported_routes: vpn.local_routes,
+        remote_installed,
+    })
 }
 
 // ── /api/audio ────────────────────────────────────────────────────────────────
@@ -289,7 +341,12 @@ pub struct SystemActionResponse {
 #[derive(Serialize)]
 pub struct VpnPingResponse {
     pub ok: bool,
-    pub status: String,
+    pub latency: Option<String>,
+}
+
+struct PingAttempt {
+    ok: bool,
+    latency: Option<String>,
 }
 
 pub async fn get_audio(
@@ -471,46 +528,74 @@ fn request_service_restart(unit: &str) -> Result<String, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn request_vpn_ping(address: Ipv4Addr) -> Result<String, String> {
-    let output = Command::new("ping")
-        .args(["-n", "-c", "1", "-W", "1", &address.to_string()])
+async fn request_vpn_ping(address: Ipv4Addr) -> Result<PingAttempt, String> {
+    let output = tokio::process::Command::new("ping")
+        .args(["-n", "-c", "1", "-W", "3", &address.to_string()])
         .output()
+        .await
         .map_err(|err| format!("failed to execute ping {address}: {err}"))?;
 
     if output.status.success() {
-        return Ok(summarize_ping_output(&output.stdout)
-            .unwrap_or_else(|| format!("Ping to {address} succeeded")));
+        return Ok(PingAttempt {
+            ok: true,
+            latency: parse_ping_latency(&output.stdout),
+        });
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let message = if stderr.is_empty() { stdout } else { stderr };
-    Err(if message.is_empty() {
-        format!("ping {address} failed")
-    } else {
-        message
+    Ok(PingAttempt {
+        ok: false,
+        latency: None,
     })
 }
 
 #[cfg(not(target_os = "linux"))]
-fn request_vpn_ping(address: Ipv4Addr) -> Result<String, String> {
-    Ok(format!("Mock ping to {address} succeeded"))
+async fn request_vpn_ping(_address: Ipv4Addr) -> Result<PingAttempt, String> {
+    Ok(PingAttempt {
+        ok: true,
+        latency: Some("1.0 ms".into()),
+    })
 }
 
-#[cfg(target_os = "linux")]
-fn summarize_ping_output(stdout: &[u8]) -> Option<String> {
+fn parse_ping_latency(stdout: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(stdout);
     text.lines()
-        .find(|line| line.contains("time="))
-        .map(str::trim)
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            text.lines()
-                .rev()
-                .find(|line| !line.trim().is_empty())
-                .map(str::trim)
-                .map(ToOwned::to_owned)
+        .find(|line| line.contains("time=") || line.contains("time<"))
+        .and_then(|line| {
+            let start = line
+                .find("time=")
+                .map(|idx| idx + "time=".len())
+                .or_else(|| line.find("time").map(|idx| idx + "time".len()))?;
+            let tail = &line[start..];
+            let end = tail.find(" ms").or_else(|| tail.find("ms"))?;
+            let value = tail[..end].trim();
+            if value.is_empty() {
+                return None;
+            }
+            Some(format!("{value} ms"))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_ping_latency;
+
+    #[test]
+    fn parses_ping_latency_from_output() {
+        let output = b"64 bytes from 10.20.78.77: icmp_seq=1 ttl=64 time=12.34 ms\n";
+        assert_eq!(parse_ping_latency(output), Some("12.34 ms".into()));
+    }
+
+    #[test]
+    fn missing_ping_latency_returns_none() {
+        let output = b"1 packets transmitted, 0 packets received, 100% packet loss\n";
+        assert_eq!(parse_ping_latency(output), None);
+    }
+
+    #[test]
+    fn parses_busybox_sub_millisecond_latency() {
+        let output = b"64 bytes from 10.20.78.77: seq=0 ttl=64 time<1 ms\n";
+        assert_eq!(parse_ping_latency(output), Some("<1 ms".into()));
+    }
 }
 
 // ── /network/wifi actions ─────────────────────────────────────────────────────

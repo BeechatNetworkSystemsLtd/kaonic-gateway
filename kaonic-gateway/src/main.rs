@@ -8,12 +8,12 @@ use std::sync::Arc;
 use clap::Parser;
 use env_logger;
 use http::{AppState, SharedSettings};
-use kaonic_vpn::{VpnConfig, VpnRuntime};
 use kaonic_gateway::gateway_reticulum::GatewayReticulum;
 use kaonic_gateway::radio::{
     attach_radio_interface, connect_radio_client, SharedRadioClient, SharedTxObserver,
 };
 use kaonic_gateway::settings::Settings;
+use kaonic_vpn::{VpnConfig, VpnRuntime};
 use log;
 use reticulum::identity::PrivateIdentity;
 use reticulum::transport::{Transport, TransportConfig};
@@ -25,7 +25,7 @@ const DEFAULT_DB_PATH: &str = "kaonic-gateway.db";
 
 fn frame_preview(data: &[u8]) -> String {
     data.iter()
-        .take(8)
+        .take(16)
         .map(|b| format!("{b:02x}"))
         .collect::<Vec<_>>()
         .join(" ")
@@ -156,11 +156,11 @@ async fn async_main() -> Result<(), process::ExitCode> {
         0,
         Some(radio_tx_observer.clone()),
     )
-        .await
-        .map_err(|err| {
-            log::error!("radio interface attach error: {err:?}");
-            process::ExitCode::FAILURE
-        })?;
+    .await
+    .map_err(|err| {
+        log::error!("radio interface attach error: {err:?}");
+        process::ExitCode::FAILURE
+    })?;
 
     // Shared cancellation token — cancelled on Ctrl-C / SIGTERM.
     let cancel = CancellationToken::new();

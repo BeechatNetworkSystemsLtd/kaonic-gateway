@@ -663,7 +663,7 @@ fn render_badge_list(values: &[String], class_fn: fn(&str) -> &'static str) -> i
             }).collect_view()}
         </div>
     }
-        .into_any()
+    .into_any()
 }
 
 fn collect_local_destinations(

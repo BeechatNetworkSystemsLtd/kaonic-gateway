@@ -391,13 +391,9 @@ fn read_wifi_ip_linux() -> Result<Option<String>, NetworkError> {
         &["-4", "addr", "show", "dev", iface],
     ) {
         Ok(output) => Ok(parse_ipv4_from_ip_addr(&output)),
-        Err(_) => run_command(
-            &format!("ifconfig {iface}"),
-            "ifconfig",
-            &[iface],
-        )
-        .map(|output| parse_ipv4_from_ifconfig(&output))
-        .or(Ok(None)),
+        Err(_) => run_command(&format!("ifconfig {iface}"), "ifconfig", &[iface])
+            .map(|output| parse_ipv4_from_ifconfig(&output))
+            .or(Ok(None)),
     }
 }
 
@@ -417,7 +413,13 @@ fn parse_ipv4_from_ifconfig(output: &str) -> Option<String> {
             return Some(value.split_whitespace().next()?.trim().to_string());
         }
         let start = trimmed.find("inet ")? + 5;
-        Some(trimmed[start..].split_whitespace().next()?.trim().to_string())
+        Some(
+            trimmed[start..]
+                .split_whitespace()
+                .next()?
+                .trim()
+                .to_string(),
+        )
     })
 }
 

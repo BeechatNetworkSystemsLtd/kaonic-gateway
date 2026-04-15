@@ -153,7 +153,11 @@ impl AppState {
             });
         }
 
-        ports.sort_by(|a, b| a.port.cmp(&b.port).then_with(|| a.protocol.cmp(&b.protocol)));
+        ports.sort_by(|a, b| {
+            a.port
+                .cmp(&b.port)
+                .then_with(|| a.protocol.cmp(&b.protocol))
+        });
         ports
     }
 }
