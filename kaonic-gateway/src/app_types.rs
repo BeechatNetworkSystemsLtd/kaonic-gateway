@@ -65,6 +65,7 @@ pub struct SystemStatusDto {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServiceStatusDto {
     pub unit: String,
+    pub brief_name: String,
     pub load_state: String,
     pub active_state: String,
     pub sub_state: String,

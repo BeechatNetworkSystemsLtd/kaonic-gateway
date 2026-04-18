@@ -1740,11 +1740,12 @@ dependencies = [
  "if-addrs",
  "kaonic-reticulum",
  "log",
+ "parking_lot",
  "radio-common",
  "reticulum",
  "riptun",
+ "rmp-serde",
  "serde",
- "serde_json",
  "tokio",
  "tokio-util",
 ]

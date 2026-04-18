@@ -1,7 +1,8 @@
 use crate::app_types::ServiceStatusDto;
 
-pub const GATEWAY_SERVICE_UNITS: [&str; 3] = [
+pub const GATEWAY_SERVICE_UNITS: [&str; 4] = [
     "kaonic-commd.service",
+    "kaonic-factory.service",
     "kaonic-gateway.service",
     "kaonic-update.service",
 ];
@@ -176,6 +177,7 @@ fn read_service_status(unit: &str) -> ServiceStatusDto {
             let sub_state = lines.next().unwrap_or_default().trim().to_string();
             ServiceStatusDto {
                 unit: unit.into(),
+                brief_name: service_brief_name(unit).into(),
                 status: format_service_status(&load_state, &active_state, &sub_state),
                 load_state,
                 active_state,
@@ -188,6 +190,7 @@ fn read_service_status(unit: &str) -> ServiceStatusDto {
             let message = if stderr.is_empty() { stdout } else { stderr };
             ServiceStatusDto {
                 unit: unit.into(),
+                brief_name: service_brief_name(unit).into(),
                 load_state: "unknown".into(),
                 active_state: "error".into(),
                 sub_state: String::new(),
@@ -200,6 +203,7 @@ fn read_service_status(unit: &str) -> ServiceStatusDto {
         }
         Err(err) => ServiceStatusDto {
             unit: unit.into(),
+            brief_name: service_brief_name(unit).into(),
             load_state: "unknown".into(),
             active_state: "error".into(),
             sub_state: String::new(),
@@ -212,10 +216,21 @@ fn read_service_status(unit: &str) -> ServiceStatusDto {
 fn read_service_status(unit: &str) -> ServiceStatusDto {
     ServiceStatusDto {
         unit: unit.into(),
+        brief_name: service_brief_name(unit).into(),
         load_state: "mock".into(),
         active_state: "unknown".into(),
         sub_state: String::new(),
         status: "Unavailable on this host".into(),
+    }
+}
+
+fn service_brief_name(unit: &str) -> &'static str {
+    match unit {
+        "kaonic-commd.service" => "Radio control",
+        "kaonic-factory.service" => "Factory setup",
+        "kaonic-gateway.service" => "Web gateway",
+        "kaonic-update.service" => "Update agent",
+        _ => "Service",
     }
 }
 

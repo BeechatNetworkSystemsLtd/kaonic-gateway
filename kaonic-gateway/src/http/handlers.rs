@@ -9,7 +9,7 @@ use kaonic_gateway::audio::{
     AudioCardSnapshot, AudioControlSnapshot, AudioControlState, AudioError, AudioOutput,
 };
 use kaonic_gateway::config::GatewayConfig;
-use kaonic_gateway::network::{NetworkError, WifiMode};
+use kaonic_gateway::network::{read_interface_ipv4, NetworkError, WifiMode};
 use kaonic_gateway::radio::{transmit_test_frame, RadioModuleConfig};
 use kaonic_gateway::system_metrics::{
     is_gateway_service_unit, read_cpu_percent_async, read_fs_mb, read_gateway_services,
@@ -691,6 +691,8 @@ pub struct SystemStatus {
 #[derive(Serialize)]
 pub struct StatusResponse {
     vpn_hash: String,
+    wlan0_ip: Option<String>,
+    usb0_ip: Option<String>,
     atak_bridges: Vec<AtakBridgeStatus>,
     network_ports: Vec<NetworkPortStatusDto>,
     system: SystemStatus,
@@ -769,6 +771,8 @@ pub async fn build_status(state: &AppState) -> StatusResponse {
 
     StatusResponse {
         vpn_hash: state.vpn_hash.clone(),
+        wlan0_ip: read_interface_ipv4("wlan0"),
+        usb0_ip: read_interface_ipv4("usb0"),
         atak_bridges,
         network_ports,
         system: read_system_status_async().await,

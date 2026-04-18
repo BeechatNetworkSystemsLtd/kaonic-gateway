@@ -9,40 +9,23 @@ use super::PageTitle;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VpnPageSnapshot {
     pub local_hash: String,
-    /// Best-guess LAN IP of this device (used in laptop setup commands).
-    pub gateway_ip: String,
+    pub wlan0_ip: Option<String>,
+    pub usb0_ip: Option<String>,
     pub vpn: VpnSnapshot,
 }
 
 #[server]
 pub async fn load_vpn_snapshot() -> Result<VpnPageSnapshot, ServerFnError> {
+    use crate::network::read_interface_ipv4;
     use crate::state::AppState;
-    use std::net::IpAddr;
 
     let state = leptos::context::use_context::<AppState>()
         .ok_or_else(|| ServerFnError::new("missing AppState context"))?;
 
-    // Detect the most likely LAN interface IP.
-    // Skip loopback, wlan, and the VPN tunnel itself.
-    let gateway_ip = if_addrs::get_if_addrs()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|i| {
-            let n = i.name.as_str();
-            !i.addr.ip().is_loopback()
-                && !n.starts_with("wlan")
-                && !n.starts_with("kaonic-vpn")
-                && !n.starts_with("lo")
-        })
-        .find_map(|i| match i.addr.ip() {
-            IpAddr::V4(a) if !a.is_loopback() => Some(a.to_string()),
-            _ => None,
-        })
-        .unwrap_or_else(|| "192.168.10.1".to_string());
-
     Ok(VpnPageSnapshot {
         local_hash: state.vpn_hash.clone(),
-        gateway_ip,
+        wlan0_ip: read_interface_ipv4("wlan0"),
+        usb0_ip: read_interface_ipv4("usb0"),
         vpn: match &state.vpn {
             Some(vpn) => vpn.snapshot().await,
             None => VpnSnapshot::default(),
@@ -81,6 +64,16 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / 1024.0)
     } else {
         format!("{bytes} B")
+    }
+}
+
+fn format_bps(bps: u64) -> String {
+    if bps >= 1_000_000 {
+        format!("{:.1} Mbps", bps as f64 / 1_000_000.0)
+    } else if bps >= 1_000 {
+        format!("{:.1} Kbps", bps as f64 / 1_000.0)
+    } else {
+        format!("{bps} bps")
     }
 }
 
@@ -169,12 +162,13 @@ pub fn VpnPage() -> impl IntoView {
 
 #[component]
 fn VpnContent(snapshot: VpnPageSnapshot) -> impl IntoView {
-    let gateway_ip = snapshot.gateway_ip.clone();
     let vpn = &snapshot.vpn;
 
     let status = vpn.status.clone();
     let peer_count = vpn.peers.len();
     let tunnel_ip = vpn.local_tunnel_ip.clone().unwrap_or_else(|| "—".into());
+    let wlan0_ip = snapshot.wlan0_ip.clone().unwrap_or_else(|| "—".into());
+    let usb0_ip = snapshot.usb0_ip.clone().unwrap_or_else(|| "—".into());
     let network = vpn.network.clone();
     let tx_bytes = format_bytes(vpn.tx_bytes);
     let rx_bytes = format_bytes(vpn.rx_bytes);
@@ -183,9 +177,6 @@ fn VpnContent(snapshot: VpnPageSnapshot) -> impl IntoView {
 
     let installed_routes: Vec<&VpnRouteSnapshot> =
         vpn.remote_routes.iter().filter(|r| r.installed).collect();
-
-    // Gateway script injected before the WS script so JS can read it.
-    let gateway_script = format!("window.__vpnGatewayIp = {:?};", gateway_ip);
 
     view! {
         // ── Connection banner ────────────────────────────────────────────────
@@ -198,6 +189,14 @@ fn VpnContent(snapshot: VpnPageSnapshot) -> impl IntoView {
             <div class="vpn-banner-field">
                 <span class="vpn-banner-label">"Tunnel IP"</span>
                 <span class="vpn-banner-ip" id="vpn-local-ip">{tunnel_ip}</span>
+            </div>
+            <div class="vpn-banner-field">
+                <span class="vpn-banner-label">"wlan0 IP"</span>
+                <span class="vpn-banner-ip" id="vpn-wlan0-ip">{wlan0_ip}</span>
+            </div>
+            <div class="vpn-banner-field">
+                <span class="vpn-banner-label">"usb0 IP"</span>
+                <span class="vpn-banner-ip" id="vpn-usb0-ip">{usb0_ip}</span>
             </div>
             <div class="vpn-banner-field">
                 <span class="vpn-banner-label">"Network"</span>
@@ -252,7 +251,6 @@ fn VpnContent(snapshot: VpnPageSnapshot) -> impl IntoView {
             />
             <VpnLaptopSetupCard
                 installed_routes=installed_routes.iter().map(|r| r.network.clone()).collect()
-                gateway_ip=gateway_ip.clone()
             />
         </div>
 
@@ -270,7 +268,6 @@ fn VpnContent(snapshot: VpnPageSnapshot) -> impl IntoView {
             advertised_routes=vpn.advertised_routes.clone()
         />
 
-        <script>{gateway_script}</script>
         <script>{VPN_WS_JS}</script>
     }
 }
@@ -359,9 +356,8 @@ fn VpnThisDeviceCard(
 // ── Laptop Setup card ─────────────────────────────────────────────────────────
 
 #[component]
-fn VpnLaptopSetupCard(installed_routes: Vec<String>, gateway_ip: String) -> impl IntoView {
+fn VpnLaptopSetupCard(installed_routes: Vec<String>) -> impl IntoView {
     let has_routes = !installed_routes.is_empty();
-    let gw = gateway_ip.clone();
     view! {
         <div class="card">
             <div class="card-header">
@@ -380,19 +376,9 @@ fn VpnLaptopSetupCard(installed_routes: Vec<String>, gateway_ip: String) -> impl
                     }.into_any()
                 } else {
                     installed_routes.into_iter().map(|net| {
-                        let cmd = format!("ip route add {} via {}", net, gateway_ip);
-                        let cmd_copy = cmd.clone();
                         let wget_cmd = serial_test_ip(&net)
                             .map(|ip| format!("wget -qO- http://{ip}/api/serial"));
                         view! {
-                            <div class="vpn-setup-cmd">
-                                <span class="vpn-setup-cmd-text">{cmd}</span>
-                                <button
-                                    type="button"
-                                    class="vpn-copy-btn"
-                                    data-vpn-copy=cmd_copy
-                                >"Copy"</button>
-                            </div>
                             {wget_cmd.map(|cmd| {
                                 let cmd_copy = cmd.clone();
                                 view! {
@@ -413,10 +399,9 @@ fn VpnLaptopSetupCard(installed_routes: Vec<String>, gateway_ip: String) -> impl
             {if has_routes {
                 view! {
                     <p class="vpn-setup-note" style="margin-top:10px;">
-                        "Manual routes are only needed for devices that are not using this Kaonic as their default gateway. Directly connected AP/USB clients should be configless. The wget example reads the remote Kaonic serial from "
+                        "The wget example reads the remote Kaonic serial from "
                         <code style="font-family:var(--font-mono);font-size:11px;">"/api/serial"</code>
-                        ". Gateway shown for external-LAN setup: "
-                        <code style="font-family:var(--font-mono);font-size:11px;">{gw}</code>
+                        "."
                     </p>
                 }.into_any()
             } else {
@@ -466,6 +451,12 @@ fn VpnPeersCard(peers: Vec<VpnPeerSnapshot>) -> impl IntoView {
                         let last_seen = format_relative_time(peer.last_seen_ts);
                         let ping_ip = peer.tunnel_ip.clone().unwrap_or_default();
                         let ping_disabled = !has_ip;
+                        let tx_bps_str = format_bps(peer.tx_bps);
+                        let rx_bps_str = format_bps(peer.rx_bps);
+                        let tx_bytes_str = format_bytes(peer.tx_bytes);
+                        let rx_bytes_str = format_bytes(peer.rx_bytes);
+                        let tx_packets = peer.tx_packets;
+                        let rx_packets = peer.rx_packets;
 
                         view! {
                             <div class="vpn-peer-row">
@@ -492,6 +483,24 @@ fn VpnPeersCard(peers: Vec<VpnPeerSnapshot>) -> impl IntoView {
                                             <span class="vpn-route-tag">{r.clone()}</span>
                                         }).collect_view().into_any()
                                     }}
+                                </div>
+
+                                // Traffic: tx/rx speed + totals
+                                <div class="vpn-peer-traffic">
+                                    <div class="vpn-peer-traffic-row">
+                                        <span class="vpn-peer-traffic-dir">"TX"</span>
+                                        <span class="vpn-peer-traffic-rate">{tx_bps_str}</span>
+                                        <span class="vpn-peer-traffic-total" title=format!("{tx_packets} packets")>
+                                            {tx_bytes_str}
+                                        </span>
+                                    </div>
+                                    <div class="vpn-peer-traffic-row">
+                                        <span class="vpn-peer-traffic-dir">"RX"</span>
+                                        <span class="vpn-peer-traffic-rate">{rx_bps_str}</span>
+                                        <span class="vpn-peer-traffic-total" title=format!("{rx_packets} packets")>
+                                            {rx_bytes_str}
+                                        </span>
+                                    </div>
                                 </div>
 
                                 // Meta: last seen + link state
@@ -691,6 +700,13 @@ const VPN_WS_JS: &str = r#"
         return b + ' B';
     }
 
+    function fmtBps(b) {
+        b = Number(b) || 0;
+        if (b >= 1000000) { return (b / 1000000).toFixed(1) + ' Mbps'; }
+        if (b >= 1000)    { return (b / 1000).toFixed(1) + ' Kbps'; }
+        return b + ' bps';
+    }
+
     function serialTestIp(route) {
         var network = String(route || '').split('/')[0] || '';
         var octets = network.trim().split('.');
@@ -738,13 +754,46 @@ const VPN_WS_JS: &str = r#"
         return 'status-dot status-dot--idle';
     }
 
+    function flashCopyButton(btn, label) {
+        if (!btn) { return; }
+        btn.textContent = label;
+        btn.classList.add('copied');
+        setTimeout(function() {
+            btn.textContent = 'Copy';
+            btn.classList.remove('copied');
+        }, 1800);
+    }
+
+    function fallbackCopyText(text) {
+        var input = document.createElement('textarea');
+        input.value = text;
+        input.setAttribute('readonly', '');
+        input.style.position = 'fixed';
+        input.style.top = '-1000px';
+        input.style.left = '-1000px';
+        document.body.appendChild(input);
+        input.focus();
+        input.select();
+        var ok = false;
+        try { ok = document.execCommand('copy'); } catch (_) {}
+        document.body.removeChild(input);
+        return ok;
+    }
+
+    function copyText(text) {
+        if (!text) { return Promise.resolve(false); }
+        if (navigator.clipboard && window.isSecureContext) {
+            return navigator.clipboard.writeText(text).then(function() { return true; }).catch(function() {
+                return fallbackCopyText(text);
+            });
+        }
+        return Promise.resolve(fallbackCopyText(text));
+    }
+
     function shortHash(h) {
         var c = String(h || '').replace(/\s+/g, '');
         return c.length > 16 ? c.substring(0, 16) + '\u2026' : c;
     }
-
-    var gatewayIp = (typeof window.__vpnGatewayIp === 'string' && window.__vpnGatewayIp)
-        ? window.__vpnGatewayIp : '192.168.10.1';
 
     // ── Banner + error bar ──────────────────────────────────────────────────
 
@@ -808,12 +857,8 @@ const VPN_WS_JS: &str = r#"
         }
         el.innerHTML = installed.map(function(r) {
             var network = r.network || '';
-            var cmd = 'ip route add ' + network + ' via ' + gatewayIp;
             var wgetIp = serialTestIp(network);
-            var html = '<div class="vpn-setup-cmd">'
-                + '<span class="vpn-setup-cmd-text">' + esc(cmd) + '</span>'
-                + '<button type="button" class="vpn-copy-btn" data-vpn-copy="' + esc(cmd) + '">Copy</button>'
-                + '</div>';
+            var html = '';
             if (wgetIp) {
                 var wgetCmd = 'wget -qO- http://' + wgetIp + '/api/serial';
                 html += '<div class="vpn-setup-cmd">'
@@ -823,8 +868,7 @@ const VPN_WS_JS: &str = r#"
             }
             return html;
         }).join('')
-        + '<p class="vpn-setup-note" style="margin-top:10px;">Manual routes are only needed for devices that are not using this Kaonic as their default gateway. Directly connected AP/USB clients should be configless. The wget example reads the remote Kaonic serial from <code style="font-family:monospace;font-size:11px;">/api/serial</code>. Gateway shown for external-LAN setup: <code style="font-family:monospace;font-size:11px;">'
-        + esc(gatewayIp) + '</code></p>';
+        + '<p class="vpn-setup-note" style="margin-top:10px;">The wget example reads the remote Kaonic serial from <code style="font-family:monospace;font-size:11px;">/api/serial</code>.</p>';
     }
 
     // ── Peers card ──────────────────────────────────────────────────────────
@@ -859,6 +903,13 @@ const VPN_WS_JS: &str = r#"
             var pingStatusCls = 'vpn-ping-status' + (ps.kind ? ' ' + ps.kind : '');
             var stateBadgeCls = 'badge ' + vpnBadgeClass(peer.link_state || '\u2014');
 
+            var txBps   = fmtBps(peer.tx_bps);
+            var rxBps   = fmtBps(peer.rx_bps);
+            var txBytes = fmtBytes(peer.tx_bytes);
+            var rxBytes = fmtBytes(peer.rx_bytes);
+            var txPkts  = Number(peer.tx_packets) || 0;
+            var rxPkts  = Number(peer.rx_packets) || 0;
+
             return '<div class="vpn-peer-row">'
                 + '<div class="vpn-peer-left">'
                     + '<span class="' + peerDotClass(peer.link_state) + '"></span>'
@@ -868,6 +919,18 @@ const VPN_WS_JS: &str = r#"
                     + '</div>'
                 + '</div>'
                 + '<div class="vpn-peer-routes">' + routeHtml + '</div>'
+                + '<div class="vpn-peer-traffic">'
+                    + '<div class="vpn-peer-traffic-row">'
+                        + '<span class="vpn-peer-traffic-dir">TX</span>'
+                        + '<span class="vpn-peer-traffic-rate">' + esc(txBps) + '</span>'
+                        + '<span class="vpn-peer-traffic-total" title="' + txPkts + ' packets">' + esc(txBytes) + '</span>'
+                    + '</div>'
+                    + '<div class="vpn-peer-traffic-row">'
+                        + '<span class="vpn-peer-traffic-dir">RX</span>'
+                        + '<span class="vpn-peer-traffic-rate">' + esc(rxBps) + '</span>'
+                        + '<span class="vpn-peer-traffic-total" title="' + rxPkts + ' packets">' + esc(rxBytes) + '</span>'
+                    + '</div>'
+                + '</div>'
                 + '<div class="vpn-peer-meta">'
                     + '<span class="vpn-peer-lastseen">' + esc(fmtRelative(peer.last_seen_ts)) + '</span>'
                     + '<span class="' + stateBadgeCls + '">' + esc(peer.link_state || '\u2014') + '</span>'
@@ -940,6 +1003,8 @@ const VPN_WS_JS: &str = r#"
                 var vpn = payload.vpn || {};
 
                 updateBanner(vpn);
+                setText('vpn-wlan0-ip', payload.wlan0_ip || '\u2014');
+                setText('vpn-usb0-ip', payload.usb0_ip || '\u2014');
                 renderLocalRoutesList(vpn.local_routes || []);
                 setAdvertisedRoutes(vpn.advertised_routes || []);
                 renderSetupCommands(vpn.remote_routes || []);
@@ -974,16 +1039,9 @@ const VPN_WS_JS: &str = r#"
         var copyBtn = target.closest('[data-vpn-copy]');
         if (copyBtn) {
             var text = copyBtn.getAttribute('data-vpn-copy') || '';
-            if (navigator.clipboard && text) {
-                navigator.clipboard.writeText(text).then(function() {
-                    copyBtn.textContent = 'Copied!';
-                    copyBtn.classList.add('copied');
-                    setTimeout(function() {
-                        copyBtn.textContent = 'Copy';
-                        copyBtn.classList.remove('copied');
-                    }, 1800);
-                });
-            }
+            copyText(text).then(function(ok) {
+                flashCopyButton(copyBtn, ok ? 'Copied!' : 'Copy failed');
+            });
             return;
         }
 

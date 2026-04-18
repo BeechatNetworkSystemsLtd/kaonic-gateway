@@ -1,6 +1,7 @@
 use thiserror::Error;
 
 use crate::app_types::{NetworkSnapshotDto, WifiStatusDto};
+use if_addrs::IfAddr;
 #[cfg(not(target_os = "linux"))]
 use std::sync::Mutex;
 
@@ -213,6 +214,21 @@ impl NetworkService {
         state.connected_ssid = state.configured_ssid.clone();
         Ok(())
     }
+}
+
+pub fn read_interface_ipv4(interface_name: &str) -> Option<String> {
+    if_addrs::get_if_addrs()
+        .ok()?
+        .into_iter()
+        .find_map(|interface| {
+            if interface.name != interface_name {
+                return None;
+            }
+            match interface.addr {
+                IfAddr::V4(addr) => Some(addr.ip.to_string()),
+                IfAddr::V6(_) => None,
+            }
+        })
 }
 
 fn validate_wifi_credentials(ssid: &str, psk: &str) -> Result<(), NetworkError> {

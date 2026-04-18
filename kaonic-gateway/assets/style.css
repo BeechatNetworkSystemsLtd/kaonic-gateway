@@ -423,6 +423,13 @@ code.info-value,
   word-break: break-word;
 }
 
+.service-brief-name {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
 .service-status-text {
   font-size: 12px;
   color: var(--text-muted);
@@ -1905,7 +1912,7 @@ select.field-input {
 
 .vpn-peer-row {
   display: grid;
-  grid-template-columns: auto 1fr auto auto;
+  grid-template-columns: auto 1fr auto auto auto;
   align-items: center;
   gap: 16px;
   padding: 14px 0;
@@ -1967,6 +1974,43 @@ select.field-input {
   font-size: 11px;
   font-weight: 600;
   white-space: nowrap;
+}
+
+.vpn-peer-traffic {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  align-items: flex-end;
+  flex-shrink: 0;
+  min-width: 120px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.25;
+}
+
+.vpn-peer-traffic-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.vpn-peer-traffic-dir {
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--text-muted);
+  min-width: 20px;
+}
+
+.vpn-peer-traffic-rate {
+  font-weight: 700;
+  color: var(--text);
+}
+
+.vpn-peer-traffic-total {
+  color: var(--text-muted);
+  cursor: help;
 }
 
 .vpn-peer-meta {
@@ -2077,8 +2121,9 @@ select.field-input {
 @media (max-width: 700px) {
   .vpn-peer-row {
     grid-template-columns: auto 1fr;
-    grid-template-rows: auto auto;
+    grid-template-rows: auto auto auto;
   }
-  .vpn-peer-meta   { grid-column: 2; align-items: flex-start; }
+  .vpn-peer-traffic { grid-column: 1 / -1; align-items: flex-start; min-width: 0; }
+  .vpn-peer-meta    { grid-column: 2; align-items: flex-start; }
   .vpn-peer-actions { grid-column: 1 / -1; flex-direction: row; align-items: center; min-width: 0; }
 }

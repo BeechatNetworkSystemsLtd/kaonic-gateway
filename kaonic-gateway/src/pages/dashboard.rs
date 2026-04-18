@@ -1,5 +1,7 @@
 use leptos::prelude::*;
 
+use kaonic_vpn::VpnSnapshot;
+
 use super::PageTitle;
 use crate::app_types::{
     AtakBridgeStatusDto, GatewayStatusDto, NetworkPortStatusDto, RadioModuleConfigDto,
@@ -163,6 +165,19 @@ const WS_SCRIPT: &str = r#"
         }).length;
         set('services-count', activeServices + '/' + ((s.services || []).length) + ' active');
         renderNetworkPorts(s.network_ports || []);
+        var vpn = s.vpn || {};
+        var vpnStatus = (vpn.status || 'unknown');
+        var vpnBadge = document.getElementById('dash-vpn-status');
+        if (vpnBadge) {
+          vpnBadge.textContent = vpnStatus;
+          vpnBadge.className = vpnStatusBadgeClass(vpnStatus);
+        }
+        set('dash-vpn-tunnel', vpn.local_tunnel_ip || '—');
+        var peers = vpn.peers || [];
+        var active = peers.filter(function(p) { return (p.link_state || '') === 'active'; }).length;
+        set('dash-vpn-peers', active + '/' + peers.length + ' linked');
+        set('dash-vpn-tx', formatBytes(vpn.tx_bytes || 0));
+        set('dash-vpn-rx', formatBytes(vpn.rx_bytes || 0));
         (s.atak_bridges || []).forEach(function(b, i) {
           set('bridge-rx-' + i, '\u2193 ' + b.rx_packets);
           set('bridge-tx-' + i, '\u2191 ' + b.tx_packets);
@@ -212,6 +227,19 @@ const WS_SCRIPT: &str = r#"
   }
   function formatStorageMb(mb) {
     return mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : mb + ' MB';
+  }
+  function formatBytes(bytes) {
+    var KB = 1024, MB = KB * 1024, GB = MB * 1024;
+    if (bytes >= GB) return (bytes / GB).toFixed(1) + ' GB';
+    if (bytes >= MB) return (bytes / MB).toFixed(1) + ' MB';
+    if (bytes >= KB) return (bytes / KB).toFixed(1) + ' KB';
+    return bytes + ' B';
+  }
+  function vpnStatusBadgeClass(status) {
+    if (status === 'running') return 'badge badge-ok';
+    if (status === 'mock') return 'badge badge-warn';
+    if (status === 'error') return 'badge badge-err';
+    return 'badge';
   }
   function portBadgeClass(port) {
     var status = String((port && port.status) || '').toLowerCase();
@@ -301,7 +329,7 @@ fn StatusView(status: GatewayStatusDto) -> impl IntoView {
             <SystemCard system=status.system/>
             <ServicesCard services=status.services/>
             <NetworkPortsCard ports=status.network_ports/>
-            <VpnCard vpn_hash=status.vpn_hash serial=status.serial/>
+            <VpnCard vpn_hash=status.vpn_hash serial=status.serial vpn=status.vpn/>
             <AtakCard bridges=status.atak_bridges/>
         </div>
         <div class="modal-backdrop" id="service-restart-modal" hidden>
@@ -415,6 +443,7 @@ fn ServicesCard(services: Vec<ServiceStatusDto>) -> impl IntoView {
                     <div class="service-row">
                         <div class="service-info">
                             <span class="service-name">{service.unit.clone()}</span>
+                            <span class="service-brief-name">{service.brief_name.clone()}</span>
                             <span class="service-status-text" id=format!("service-status-{i}")>
                                 {service.status.clone()}
                             </span>
@@ -472,21 +501,73 @@ fn format_storage_mb(mb: u64) -> String {
 }
 
 #[component]
-fn VpnCard(vpn_hash: String, serial: String) -> impl IntoView {
+fn VpnCard(vpn_hash: String, serial: String, vpn: VpnSnapshot) -> impl IntoView {
+    let status = vpn.status.clone();
+    let status_badge_class = vpn_status_badge_class(&status);
+    let tunnel_ip = vpn.local_tunnel_ip.clone().unwrap_or_else(|| "—".into());
+    let peer_total = vpn.peers.len();
+    let peer_active = vpn
+        .peers
+        .iter()
+        .filter(|p| p.link_state == "active")
+        .count();
+    let peer_summary = format!("{peer_active}/{peer_total} linked");
+    let tx = format_bytes(vpn.tx_bytes);
+    let rx = format_bytes(vpn.rx_bytes);
+
     view! {
         <div class="card">
             <div class="card-header">
-                <span class="card-title">"Identity"</span>
+                <span class="card-title">"VPN"</span>
+                <span id="dash-vpn-status" class=status_badge_class>{status}</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">"Tunnel IP"</span>
+                <code class="info-value" id="dash-vpn-tunnel">{tunnel_ip}</code>
+            </div>
+            <div class="info-row">
+                <span class="info-label">"Peers"</span>
+                <span class="info-value" id="dash-vpn-peers">{peer_summary}</span>
+            </div>
+            <div class="metric-row">
+                <span class="metric-label">"TX"</span>
+                <span class="metric-value" id="dash-vpn-tx">{tx}</span>
+                <span class="metric-label">"RX"</span>
+                <span class="metric-value" id="dash-vpn-rx">{rx}</span>
             </div>
             <div class="info-row">
                 <span class="info-label">"Serial"</span>
                 <code class="info-value">{serial}</code>
             </div>
             <div class="info-row">
-                <span class="info-label">"VPN Hash"</span>
+                <span class="info-label">"Hash"</span>
                 <code class="info-value hash">{vpn_hash}</code>
             </div>
         </div>
+    }
+}
+
+fn vpn_status_badge_class(status: &str) -> &'static str {
+    match status {
+        "running" => "badge badge-ok",
+        "mock" => "badge badge-warn",
+        "error" => "badge badge-err",
+        _ => "badge",
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
     }
 }
 
