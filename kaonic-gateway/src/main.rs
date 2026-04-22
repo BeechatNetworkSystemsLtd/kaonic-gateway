@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 /// kaonic-gateway: Reticulum VPN gateway using kaonic radio hardware
 mod http;
 

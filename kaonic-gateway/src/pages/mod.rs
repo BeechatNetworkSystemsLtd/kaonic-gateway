@@ -3,6 +3,7 @@ use leptos::prelude::*;
 pub mod dashboard;
 pub mod media;
 pub mod network;
+pub mod plugins;
 pub mod radio;
 pub mod reticulum;
 pub mod update;

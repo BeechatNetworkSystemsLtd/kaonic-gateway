@@ -4,6 +4,7 @@ use axum::{response::IntoResponse, Json};
 use kaonic_gateway::app_types::{
     AtakBridgeStatusDto, FrameStatsDto, NetworkPortStatusDto, NetworkSnapshotDto,
     ReticulumSnapshotDto, RxFrameDto, ServiceStatusDto, SystemStatusDto, WsInterfacesDto,
+    WsReticulumSnapshotDto,
 };
 use kaonic_gateway::audio::{
     AudioCardSnapshot, AudioControlSnapshot, AudioControlState, AudioError, AudioOutput,
@@ -915,6 +916,14 @@ pub async fn build_all_radio_frames(state: &AppState) -> [Vec<RxFrameDto>; 2] {
 
 pub async fn build_reticulum_snapshot(state: &AppState) -> ReticulumSnapshotDto {
     state.reticulum.snapshot().await
+}
+
+pub async fn build_ws_reticulum_snapshot(state: &AppState) -> WsReticulumSnapshotDto {
+    let snapshot = state.reticulum.snapshot().await;
+    WsReticulumSnapshotDto {
+        incoming_links: snapshot.incoming_links,
+        outgoing_links: snapshot.outgoing_links,
+    }
 }
 
 pub async fn build_vpn_snapshot(state: &AppState) -> VpnSnapshot {

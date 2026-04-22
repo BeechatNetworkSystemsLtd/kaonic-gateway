@@ -116,6 +116,12 @@ pub struct ReticulumSnapshotDto {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WsReticulumSnapshotDto {
+    pub incoming_links: Vec<ReticulumLinkDto>,
+    pub outgoing_links: Vec<ReticulumLinkDto>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WsInterfacesDto {
     pub wlan0_ip: Option<String>,
     pub usb0_ip: Option<String>,
@@ -137,7 +143,7 @@ pub enum WsStatusEvent {
     System(SystemStatusDto),
     Services(Vec<ServiceStatusDto>),
     Vpn(VpnSnapshot),
-    Reticulum(ReticulumSnapshotDto),
+    Reticulum(WsReticulumSnapshotDto),
     RadioFrames(WsRadioFramesDto),
 }
 

@@ -7,9 +7,8 @@ use tokio::time::{interval, Duration};
 use kaonic_gateway::app_types::{FrameStatsDto, RxFrameDto, WsRadioFramesDto, WsStatusEvent};
 
 use super::handlers::{
-    build_atak_bridges, build_frame_stats, build_network_ports, build_radio_frames,
-    build_reticulum_snapshot, build_services, build_system_status, build_vpn_snapshot,
-    build_ws_interfaces,
+    build_atak_bridges, build_frame_stats, build_network_ports, build_radio_frames, build_services,
+    build_system_status, build_vpn_snapshot, build_ws_interfaces, build_ws_reticulum_snapshot,
 };
 use super::AppState;
 
@@ -85,7 +84,7 @@ async fn publish_periodic_events(state: &AppState) {
         .ws_events
         .send(WsStatusEvent::Vpn(build_vpn_snapshot(state).await));
     let _ = state.ws_events.send(WsStatusEvent::Reticulum(
-        build_reticulum_snapshot(state).await,
+        build_ws_reticulum_snapshot(state).await,
     ));
 }
 
@@ -99,7 +98,7 @@ async fn initial_events(state: &AppState) -> Vec<WsStatusEvent> {
         WsStatusEvent::Services(services),
         WsStatusEvent::NetworkPorts(network_ports),
         WsStatusEvent::Vpn(build_vpn_snapshot(state).await),
-        WsStatusEvent::Reticulum(build_reticulum_snapshot(state).await),
+        WsStatusEvent::Reticulum(build_ws_reticulum_snapshot(state).await),
         WsStatusEvent::RadioFrames(WsRadioFramesDto {
             module: 0,
             frames: build_radio_frames(state, 0).await,

@@ -7,8 +7,8 @@ use leptos_router::{
 
 use crate::components::navbar::Navbar;
 use crate::pages::{
-    dashboard::DashboardPage, media::MediaPage, network::NetworkPage, radio::RadioPage,
-    reticulum::ReticulumPage, update::SystemPage, vpn::VpnPage,
+    dashboard::DashboardPage, media::MediaPage, network::NetworkPage, plugins::PluginsPage,
+    radio::RadioPage, reticulum::ReticulumPage, update::SystemPage, vpn::VpnPage,
 };
 
 pub fn shell(options: leptos::config::LeptosOptions) -> impl IntoView {
@@ -43,6 +43,7 @@ pub fn App() -> impl IntoView {
                     <Route path=StaticSegment("radio") view=RadioPage/>
                     <Route path=StaticSegment("reticulum") view=ReticulumPage/>
                     <Route path=StaticSegment("vpn") view=VpnPage/>
+                    <Route path=StaticSegment("plugins") view=PluginsPage/>
                     <Route path=StaticSegment("settings") view=RadioPage/>
                     <Route path=StaticSegment("network") view=NetworkPage/>
                     <Route path=StaticSegment("media") view=MediaPage/>

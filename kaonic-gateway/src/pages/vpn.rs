@@ -462,25 +462,34 @@ fn VpnPeersCard(peers: Vec<VpnPeerSnapshot>) -> impl IntoView {
                                 <div class="vpn-peer-left">
                                     <span class=dot_class></span>
                                     <div class="vpn-peer-ident">
-                                        <span class=ip_class>{tunnel_ip}</span>
-                                        <span
-                                            class="vpn-peer-hash"
-                                            title=hash_full.clone()
-                                        >{hash_short}</span>
+                                        <div class="vpn-peer-field">
+                                            <span class="vpn-peer-field-label">"Tunnel"</span>
+                                            <span class=ip_class>{tunnel_ip}</span>
+                                        </div>
+                                        <div class="vpn-peer-field">
+                                            <span class="vpn-peer-field-label">"Peer"</span>
+                                            <span
+                                                class="vpn-peer-hash"
+                                                title=hash_full.clone()
+                                            >{hash_short}</span>
+                                        </div>
                                     </div>
                                 </div>
 
                                 // Announced route tags
                                 <div class="vpn-peer-routes">
-                                    {if peer.announced_routes.is_empty() {
-                                        view! {
-                                            <span class="badge reticulum-badge-soft" style="opacity:.6;">"no routes"</span>
-                                        }.into_any()
-                                    } else {
-                                        peer.announced_routes.iter().map(|r| view! {
-                                            <span class="vpn-route-tag">{r.clone()}</span>
-                                        }).collect_view().into_any()
-                                    }}
+                                    <span class="vpn-peer-section-label">"Routes"</span>
+                                    <div class="vpn-peer-routes-list">
+                                        {if peer.announced_routes.is_empty() {
+                                            view! {
+                                                <span class="badge reticulum-badge-soft" style="opacity:.6;">"no routes"</span>
+                                            }.into_any()
+                                        } else {
+                                            peer.announced_routes.iter().map(|r| view! {
+                                                <span class="vpn-route-tag">{r.clone()}</span>
+                                            }).collect_view().into_any()
+                                        }}
+                                    </div>
                                 </div>
 
                                 // Traffic: tx/rx speed + totals
@@ -503,8 +512,14 @@ fn VpnPeersCard(peers: Vec<VpnPeerSnapshot>) -> impl IntoView {
 
                                 // Meta: last seen + link state
                                 <div class="vpn-peer-meta">
-                                    <span class="vpn-peer-lastseen">{last_seen}</span>
-                                    <span class=state_badge>{peer.link_state.clone()}</span>
+                                    <div class="vpn-peer-field vpn-peer-field--meta">
+                                        <span class="vpn-peer-field-label">"Seen"</span>
+                                        <span class="vpn-peer-lastseen">{last_seen}</span>
+                                    </div>
+                                    <div class="vpn-peer-field vpn-peer-field--meta">
+                                        <span class="vpn-peer-field-label">"State"</span>
+                                        <span class=state_badge>{peer.link_state.clone()}</span>
+                                    </div>
                                 </div>
 
                                 // Ping
@@ -935,11 +950,20 @@ const VPN_WS_JS: &str = r#"
                 + '<div class="vpn-peer-left">'
                     + '<span class="' + peerDotClass(peer.link_state) + '"></span>'
                     + '<div class="vpn-peer-ident">'
-                        + '<span class="' + ipCls + '">' + esc(ip) + '</span>'
-                        + '<span class="vpn-peer-hash" title="' + esc(hash) + '">' + esc(sh) + '</span>'
+                        + '<div class="vpn-peer-field">'
+                            + '<span class="vpn-peer-field-label">Tunnel</span>'
+                            + '<span class="' + ipCls + '">' + esc(ip) + '</span>'
+                        + '</div>'
+                        + '<div class="vpn-peer-field">'
+                            + '<span class="vpn-peer-field-label">Peer</span>'
+                            + '<span class="vpn-peer-hash" title="' + esc(hash) + '">' + esc(sh) + '</span>'
+                        + '</div>'
                     + '</div>'
                 + '</div>'
-                + '<div class="vpn-peer-routes">' + routeHtml + '</div>'
+                + '<div class="vpn-peer-routes">'
+                    + '<span class="vpn-peer-section-label">Routes</span>'
+                    + '<div class="vpn-peer-routes-list">' + routeHtml + '</div>'
+                + '</div>'
                 + '<div class="vpn-peer-traffic">'
                     + '<div class="vpn-peer-traffic-row">'
                         + '<span class="vpn-peer-traffic-dir">TX</span>'
@@ -953,8 +977,14 @@ const VPN_WS_JS: &str = r#"
                     + '</div>'
                 + '</div>'
                 + '<div class="vpn-peer-meta">'
-                    + '<span class="vpn-peer-lastseen">' + esc(fmtRelative(peer.last_seen_ts)) + '</span>'
-                    + '<span class="' + stateBadgeCls + '">' + esc(peer.link_state || '\u2014') + '</span>'
+                    + '<div class="vpn-peer-field vpn-peer-field--meta">'
+                        + '<span class="vpn-peer-field-label">Seen</span>'
+                        + '<span class="vpn-peer-lastseen">' + esc(fmtRelative(peer.last_seen_ts)) + '</span>'
+                    + '</div>'
+                    + '<div class="vpn-peer-field vpn-peer-field--meta">'
+                        + '<span class="vpn-peer-field-label">State</span>'
+                        + '<span class="' + stateBadgeCls + '">' + esc(peer.link_state || '\u2014') + '</span>'
+                    + '</div>'
                 + '</div>'
                 + '<div class="vpn-peer-actions">'
                     + '<div class="vpn-peer-action-buttons">'

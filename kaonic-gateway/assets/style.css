@@ -841,6 +841,13 @@ select.field-input {
 
 @media (max-width: 900px) {
   .radio-split { grid-template-columns: 1fr; }
+  .plugins-layout { grid-template-columns: 1fr; }
+  .plugins-sidebar {
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    padding-right: 0;
+    padding-bottom: 18px;
+  }
 }
 
 .radio-panel {
@@ -848,6 +855,138 @@ select.field-input {
   flex-direction: column;
   gap: 16px;
   min-height: 0;
+}
+
+.plugins-intro-card {
+  margin-bottom: 20px;
+}
+
+.plugins-shell {
+  padding: 20px;
+}
+
+.plugins-layout {
+  display: grid;
+  grid-template-columns: minmax(260px, 340px) minmax(0, 1fr);
+  gap: 20px;
+  align-items: stretch;
+}
+
+.plugins-sidebar,
+.plugins-detail {
+  min-width: 0;
+}
+
+.plugins-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  border-right: 1px solid var(--border);
+  padding-right: 20px;
+}
+
+.plugins-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.plugins-list-item {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 14px 16px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color .15s, background .15s, box-shadow .15s;
+  text-align: left;
+}
+
+.plugins-list-item:hover,
+.plugins-list-item--active {
+  border-color: rgba(13,203,240,.45);
+  background: rgba(13,203,240,.08);
+  box-shadow: var(--glow);
+}
+
+.plugins-list-name {
+  font-weight: 700;
+  font-size: 15px;
+}
+
+.plugins-list-meta {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.plugins-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  min-height: 360px;
+}
+
+.plugins-detail-name {
+  font-size: 28px;
+  line-height: 1.15;
+  margin-top: 6px;
+}
+
+.plugins-detail-summary {
+  max-width: 72ch;
+}
+
+.plugins-detail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.plugins-delete-btn {
+  border-color: rgba(248,81,73,.35);
+  color: var(--danger);
+}
+
+.plugins-detail-grid {
+  display: grid;
+  gap: 4px;
+}
+
+.plugins-action-status {
+  min-height: 20px;
+  margin-top: 18px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.plugins-action-status.ok {
+  color: var(--ok);
+}
+
+.plugins-action-status.warn {
+  color: var(--warn);
+}
+
+.plugins-empty {
+  color: var(--text-muted);
+  font-size: 14px;
+  padding: 18px 0;
+}
+
+.plugins-empty--detail {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 260px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  background: rgba(255,255,255,.01);
 }
 
 .panel-title {
@@ -1939,7 +2078,26 @@ select.field-input {
 .vpn-peer-ident {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 6px;
+}
+
+.vpn-peer-field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.vpn-peer-field--meta {
+  align-items: flex-end;
+}
+
+.vpn-peer-field-label,
+.vpn-peer-section-label {
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--text-muted);
 }
 
 .vpn-peer-ip {
@@ -1964,6 +2122,14 @@ select.field-input {
 }
 
 .vpn-peer-routes {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  min-width: 0;
+}
+
+.vpn-peer-routes-list {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
@@ -2025,7 +2191,7 @@ select.field-input {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
-  gap: 5px;
+  gap: 8px;
   flex-shrink: 0;
 }
 

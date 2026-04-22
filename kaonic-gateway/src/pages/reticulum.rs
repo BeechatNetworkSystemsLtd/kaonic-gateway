@@ -2,15 +2,7 @@ use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use super::PageTitle;
-use crate::app_types::{ReticulumEventDto, ReticulumLinkDto, ReticulumSnapshotDto};
-
-fn format_timestamp(ts: u64) -> String {
-    let seconds = ts % 86_400;
-    let hours = seconds / 3_600;
-    let minutes = (seconds % 3_600) / 60;
-    let secs = seconds % 60;
-    format!("{hours:02}:{minutes:02}:{secs:02} UTC")
-}
+use crate::app_types::{ReticulumLinkDto, ReticulumSnapshotDto};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReticulumPageSnapshot {
@@ -91,11 +83,6 @@ const RETICULUM_WS_JS: &str = r#"
         if (el) { el.textContent = text; }
     }
 
-    function formatTime(ts) {
-        if (!ts) { return '—'; }
-        return new Date(ts * 1000).toLocaleTimeString();
-    }
-
     function formatHash(value) {
         var text = String(value == null ? '' : value).replace(/\s+/g, '');
         if (!text) { return '—'; }
@@ -128,22 +115,6 @@ const RETICULUM_WS_JS: &str = r#"
         if (text === 'incoming link') { return 'reticulum-badge-source-in'; }
         if (text === 'outgoing link') { return 'reticulum-badge-source-out'; }
         if (text === 'announce') { return 'reticulum-badge-source-announce'; }
-        return 'reticulum-badge-soft';
-    }
-
-    function directionBadgeClass(value) {
-        var text = String(value == null ? '' : value).toLowerCase();
-        if (text === 'in' || text === 'rx' || text === 'incoming') { return 'reticulum-badge-dir-in'; }
-        if (text === 'out' || text === 'tx' || text === 'outgoing') { return 'reticulum-badge-dir-out'; }
-        return 'reticulum-badge-soft';
-    }
-
-    function eventKindBadgeClass(value) {
-        var text = String(value == null ? '' : value).toLowerCase();
-        if (text === 'announce') { return 'reticulum-badge-kind-announce'; }
-        if (text === 'link') { return 'reticulum-badge-kind-link'; }
-        if (text === 'data' || text === 'packet') { return 'reticulum-badge-kind-data'; }
-        if (text === 'error') { return 'badge-err'; }
         return 'reticulum-badge-soft';
     }
 
@@ -183,25 +154,6 @@ const RETICULUM_WS_JS: &str = r#"
         }).join('');
     }
 
-    function renderEvents(events) {
-        var tbody = document.getElementById('reticulum-events');
-        if (!tbody) { return; }
-        if (!events || events.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="6" class="frames-empty">No Reticulum events yet</td></tr>';
-            return;
-        }
-        tbody.innerHTML = events.map(function(event) {
-            return '<tr>'
-                + '<td class="td-time">' + escapeHtml(formatTime(event.ts)) + '</td>'
-                + '<td>' + renderBadgeList([event.direction || '—'], directionBadgeClass) + '</td>'
-                + '<td>' + renderBadgeList([event.kind || '—'], eventKindBadgeClass) + '</td>'
-                + '<td class="td-hex td-hash">' + escapeHtml(formatHash(event.link_id || '—')) + '</td>'
-                + '<td class="td-hex td-hash">' + escapeHtml(formatHash(event.destination || '—')) + '</td>'
-                + '<td class="td-hex">' + escapeHtml(event.details || '—') + '</td>'
-                + '</tr>';
-        }).join('');
-    }
-
     function collectOpenDestinations(reticulum) {
         var map = {};
 
@@ -223,11 +175,6 @@ const RETICULUM_WS_JS: &str = r#"
         });
         (reticulum.outgoing_links || []).forEach(function(link) {
             upsert(link.destination, 'outgoing link', link.status);
-        });
-        (reticulum.events || []).forEach(function(event) {
-            if (event.kind === 'announce') {
-                upsert(event.destination, 'announce', event.kind);
-            }
         });
         return Object.values(map)
             .sort(function(a, b) { return a.destination.localeCompare(b.destination); })
@@ -318,13 +265,10 @@ const RETICULUM_WS_JS: &str = r#"
             liveState.reticulum = snapshot;
             var incoming = snapshot.incoming_links || [];
             var outgoing = snapshot.outgoing_links || [];
-            var events = snapshot.events || [];
             setText('reticulum-incoming-count', String(incoming.length));
             setText('reticulum-outgoing-count', String(outgoing.length));
-            setText('reticulum-events-count', String(events.length));
             renderLinks('reticulum-incoming-links', incoming, 'No incoming links seen');
             renderLinks('reticulum-outgoing-links', outgoing, 'No outgoing links seen');
-            renderEvents(events);
             renderOpenDestinations(snapshot);
         } catch (e) {}
     };
@@ -357,7 +301,6 @@ fn ReticulumContent(snapshot: ReticulumPageSnapshot) -> impl IntoView {
     let local_destinations_count = snapshot.local_destinations.len();
     let incoming_count = snapshot.reticulum.incoming_links.len();
     let outgoing_count = snapshot.reticulum.outgoing_links.len();
-    let events_count = snapshot.reticulum.events.len();
 
     view! {
         <div class="reticulum-summary">
@@ -368,10 +311,6 @@ fn ReticulumContent(snapshot: ReticulumPageSnapshot) -> impl IntoView {
             <div class="card stat-card">
                 <span class="stat-label">"Outgoing links"</span>
                 <span class="stat-value" id="reticulum-outgoing-count">{outgoing_count}</span>
-            </div>
-            <div class="card stat-card">
-                <span class="stat-label">"Recent events"</span>
-                <span class="stat-value" id="reticulum-events-count">{events_count}</span>
             </div>
             <div class="card stat-card">
                 <span class="stat-label">"Local hash"</span>
@@ -402,8 +341,6 @@ fn ReticulumContent(snapshot: ReticulumPageSnapshot) -> impl IntoView {
             <LocalDestinationsCard destinations=snapshot.local_destinations />
             <OpenDestinationsCard destinations=snapshot.open_destinations />
         </div>
-
-        <ReticulumEventsCard events=snapshot.reticulum.events />
     }
 }
 
@@ -456,60 +393,6 @@ fn ReticulumLinksCard(
                                             <td class="td-len">{link.packets}</td>
                                             <td class="td-len">{format!("{} B", link.bytes)}</td>
                                             <td class="td-time">{link.last_event}</td>
-                                        </tr>
-                                    }
-                                })
-                                .collect_view()
-                                .into_any()
-                        }}
-                    </tbody>
-                </table>
-            </div>
-        </div>
-    }
-}
-
-#[component]
-fn ReticulumEventsCard(events: Vec<ReticulumEventDto>) -> impl IntoView {
-    view! {
-        <div class="card reticulum-card reticulum-card--events">
-            <div class="card-header">
-                <span class="card-title">"Recent Events"</span>
-            </div>
-            <div class="reticulum-table-wrap">
-                <table class="frames-table">
-                    <thead>
-                        <tr>
-                            <th>"Time"</th>
-                            <th>"Source"</th>
-                            <th>"Kind"</th>
-                            <th>"Link"</th>
-                            <th>"Destination"</th>
-                            <th>"Details"</th>
-                        </tr>
-                    </thead>
-                    <tbody id="reticulum-events">
-                        {if events.is_empty() {
-                            view! {
-                                <tr>
-                                    <td colspan="6" class="frames-empty">"No Reticulum events yet"</td>
-                                </tr>
-                            }.into_any()
-                        } else {
-                            events
-                                .into_iter()
-                                .map(|event| {
-                                    let ts = format_timestamp(event.ts);
-                                    view! {
-                                        <tr>
-                                            <td class="td-time">{ts}</td>
-                                            <td>{render_badge_list(&[event.direction], direction_badge_class)}</td>
-                                            <td>{render_badge_list(&[event.kind], event_kind_badge_class)}</td>
-                                            <td class="td-hex td-hash">
-                                                {if event.link_id.is_empty() { "—".into() } else { format_hash(&event.link_id) }}
-                                            </td>
-                                            <td class="td-hex td-hash">{format_hash(&event.destination)}</td>
-                                            <td class="td-hex">{event.details}</td>
                                         </tr>
                                     }
                                 })
@@ -634,24 +517,6 @@ fn source_badge_class(value: &str) -> &'static str {
     }
 }
 
-fn direction_badge_class(value: &str) -> &'static str {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "in" | "rx" | "incoming" => "reticulum-badge-dir-in",
-        "out" | "tx" | "outgoing" => "reticulum-badge-dir-out",
-        _ => "reticulum-badge-soft",
-    }
-}
-
-fn event_kind_badge_class(value: &str) -> &'static str {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "announce" => "reticulum-badge-kind-announce",
-        "link" => "reticulum-badge-kind-link",
-        "data" | "packet" => "reticulum-badge-kind-data",
-        "error" => "badge-err",
-        _ => "reticulum-badge-soft",
-    }
-}
-
 fn destination_kind_badge_class(value: &str) -> &'static str {
     match value.trim().to_ascii_lowercase().as_str() {
         "vpn" => "reticulum-badge-kind-vpn",
@@ -737,13 +602,6 @@ fn collect_open_destinations(reticulum: &ReticulumSnapshotDto) -> Vec<Destinatio
         let entry = entries.entry(link.destination.clone()).or_default();
         push_unique(&mut entry.sources, "outgoing link");
         push_unique(&mut entry.statuses, &link.status);
-    }
-    for event in &reticulum.events {
-        if event.kind == "announce" && !event.destination.is_empty() {
-            let entry = entries.entry(event.destination.clone()).or_default();
-            push_unique(&mut entry.sources, "announce");
-            push_unique(&mut entry.statuses, "announce");
-        }
     }
     entries
         .into_iter()
