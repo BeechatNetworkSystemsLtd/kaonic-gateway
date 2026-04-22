@@ -77,6 +77,7 @@ pub async fn serve(state: AppState, addr: SocketAddr) {
             get(handlers::get_vpn_routes).put(handlers::put_vpn_routes),
         )
         .route("/api/vpn/ping", post(handlers::post_vpn_ping))
+        .route("/api/vpn/speed-test", post(handlers::post_vpn_speed_test))
         .route("/api/update/{target}/version", get(update::get_version))
         .route("/api/update/{target}/upload", post(update::upload_update))
         .route("/network/wifi/mode", post(handlers::post_wifi_mode))

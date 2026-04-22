@@ -98,12 +98,23 @@ impl KaonicCtrlInterface {
                                 let mut input = InputBuffer::new(bytes);
                                 match Packet::deserialize(&mut input) {
                                     Ok(packet) => {
+                                        log::trace!(
+                                            "kaonic_ctrl: rx module={} rssi={} {}",
+                                            module,
+                                            recv_module.rssi,
+                                            packet_log_summary(&packet)
+                                        );
                                         let _ = rx_channel
                                             .send(RxMessage { address: iface_address, packet })
                                             .await;
                                     }
                                     Err(err) => {
-                                        log::warn!("kaonic_ctrl: failed to deserialize packet: {err:?}");
+                                        log::warn!(
+                                            "kaonic_ctrl: rx deserialize failed module={} len={} preview={} err={err:?}",
+                                            module,
+                                            bytes.len(),
+                                            frame_preview(bytes)
+                                        );
                                     }
                                 }
                             }
@@ -122,7 +133,14 @@ impl KaonicCtrlInterface {
                         _ = cancel.cancelled() => break,
                         maybe_message = tx_channel.recv() => match maybe_message {
                             Some(message) => {
-                                let target = if is_high_priority(&message.packet) {
+                                let high_priority = is_high_priority(&message.packet);
+                                log::trace!(
+                                    "kaonic_ctrl: tx classify module={} priority={} {}",
+                                    module,
+                                    if high_priority { "high" } else { "normal" },
+                                    packet_log_summary(&message.packet)
+                                );
+                                let target = if high_priority {
                                     &high_tx
                                 } else {
                                     &normal_tx
@@ -185,6 +203,25 @@ fn is_high_priority(packet: &Packet) -> bool {
     )
 }
 
+fn packet_log_summary(packet: &Packet) -> String {
+    format!(
+        "type={:?} ctx={:?} dst={} len={}",
+        packet.header.packet_type,
+        packet.context,
+        packet.destination,
+        packet.data.len()
+    )
+}
+
+fn frame_preview(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .take(12)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 async fn transmit_message(
     radio_client: &Arc<Mutex<RadioClient>>,
     module: usize,
@@ -195,14 +232,31 @@ async fn transmit_message(
     let mut output = OutputBuffer::new(tx_buffer);
     if let Ok(_) = message.packet.serialize(&mut output) {
         let bytes = output.as_slice();
+        log::trace!(
+            "kaonic_ctrl: tx module={} {} frame_len={}",
+            module,
+            packet_log_summary(&message.packet),
+            bytes.len()
+        );
         let mut frame = Frame::<RADIO_FRAME_SIZE>::new();
         frame.copy_from_slice(bytes);
 
         if let Err(err) = radio_client.lock().await.transmit(module, &frame).await {
-            log::warn!("kaonic_ctrl: tx error: {err:?}");
+            log::warn!(
+                "kaonic_ctrl: tx failed module={} {} frame_len={} err={err:?}",
+                module,
+                packet_log_summary(&message.packet),
+                bytes.len()
+            );
         } else if let Some(observer) = tx_observer {
             observer(module, bytes);
         }
+    } else {
+        log::warn!(
+            "kaonic_ctrl: packet serialize failed module={} {}",
+            module,
+            packet_log_summary(&message.packet)
+        );
     }
     // Under sustained transmit load, explicitly yield so Reticulum
     // maintenance tasks get time to refresh links and process control traffic.

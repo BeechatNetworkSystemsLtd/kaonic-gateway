@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 #[cfg(target_os = "linux")]
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use super::AppState;
 
@@ -265,6 +266,89 @@ pub async fn post_vpn_ping(
     }))
 }
 
+pub async fn post_vpn_speed_test(
+    State(state): State<AppState>,
+    Json(request): Json<VpnSpeedTestRequest>,
+) -> Result<Json<VpnSpeedTestResponse>, (StatusCode, String)> {
+    let address = request.address.trim().parse::<Ipv4Addr>().map_err(|err| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid IPv4 address '{}': {err}", request.address.trim()),
+        )
+    })?;
+
+    let vpn = state
+        .vpn
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "vpn unavailable".into()))?;
+    let peer_ip = address.to_string();
+    let snapshot = vpn.snapshot().await;
+    if !snapshot
+        .peers
+        .iter()
+        .any(|peer| peer.tunnel_ip.as_deref() == Some(peer_ip.as_str()))
+    {
+        return Err((StatusCode::NOT_FOUND, "peer tunnel IP not found".into()));
+    }
+
+    let url = format!("http://{peer_ip}/");
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to build speed-test client: {err}"),
+            )
+        })?;
+
+    let started = Instant::now();
+    let response = client
+        .get(&url)
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
+        .send()
+        .await
+        .map_err(|err| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("speed-test request failed: {err}"),
+            )
+        })?;
+
+    if !response.status().is_success() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("speed-test returned {}", response.status()),
+        ));
+    }
+
+    let bytes = response.bytes().await.map_err(|err| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("failed to read speed-test body: {err}"),
+        )
+    })?;
+    let duration_ms = started.elapsed().as_millis().max(1) as u64;
+    let bytes_len = bytes.len() as u64;
+    let bps = ((bytes_len as u128) * 8 * 1000 / duration_ms as u128) as u64;
+
+    log::info!(
+        "vpn speed-test peer={} bytes={} duration_ms={} bps={}",
+        peer_ip,
+        bytes_len,
+        duration_ms,
+        bps
+    );
+
+    Ok(Json(VpnSpeedTestResponse {
+        ok: true,
+        bytes: bytes_len,
+        duration_ms,
+        bps,
+    }))
+}
+
 #[derive(Serialize)]
 pub struct VpnRoutesResponse {
     pub tunnel_ip: Option<String>,
@@ -319,6 +403,11 @@ pub struct VpnPingRequest {
 }
 
 #[derive(Deserialize)]
+pub struct VpnSpeedTestRequest {
+    pub address: String,
+}
+
+#[derive(Deserialize)]
 pub struct ServiceActionRequest {
     pub unit: String,
 }
@@ -342,6 +431,14 @@ pub struct SystemActionResponse {
 pub struct VpnPingResponse {
     pub ok: bool,
     pub latency: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct VpnSpeedTestResponse {
+    pub ok: bool,
+    pub bytes: u64,
+    pub duration_ms: u64,
+    pub bps: u64,
 }
 
 struct PingAttempt {
@@ -777,11 +874,16 @@ pub fn build_frame_stats(state: &AppState, module: usize) -> FrameStatsDto {
     use std::sync::atomic::Ordering;
 
     let module = module.min(1);
+    let rx_bytes = state.frame_stats[module].rx_bytes.load(Ordering::Relaxed);
+    let tx_bytes = state.frame_stats[module].tx_bytes.load(Ordering::Relaxed);
+    let (rx_bps, tx_bps) = state.frame_stats[module].rates(rx_bytes, tx_bytes);
     FrameStatsDto {
         rx_frames: state.frame_stats[module].rx_frames.load(Ordering::Relaxed),
-        rx_bytes: state.frame_stats[module].rx_bytes.load(Ordering::Relaxed),
+        rx_bytes,
+        rx_bps,
         tx_frames: state.frame_stats[module].tx_frames.load(Ordering::Relaxed),
-        tx_bytes: state.frame_stats[module].tx_bytes.load(Ordering::Relaxed),
+        tx_bytes,
+        tx_bps,
         last_rssi: if state.frame_stats[module].rx_frames.load(Ordering::Relaxed) > 0 {
             Some(state.frame_stats[module].last_rssi.load(Ordering::Relaxed) as i8)
         } else {

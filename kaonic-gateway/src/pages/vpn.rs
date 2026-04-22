@@ -138,6 +138,14 @@ fn serial_test_ip(route: &str) -> Option<String> {
     Some(format!("{a}.{b}.{c}.1"))
 }
 
+fn default_advertised_route_strings(routes: Vec<String>) -> Vec<String> {
+    if routes.is_empty() {
+        vec!["192.168.10.0/24".into()]
+    } else {
+        routes
+    }
+}
+
 // ── Page ──────────────────────────────────────────────────────────────────────
 
 #[component]
@@ -396,17 +404,6 @@ fn VpnLaptopSetupCard(installed_routes: Vec<String>) -> impl IntoView {
                     }).collect_view().into_any()
                 }}
             </div>
-            {if has_routes {
-                view! {
-                    <p class="vpn-setup-note" style="margin-top:10px;">
-                        "The wget example reads the remote Kaonic serial from "
-                        <code style="font-family:var(--font-mono);font-size:11px;">"/api/serial"</code>
-                        "."
-                    </p>
-                }.into_any()
-            } else {
-                view! { <span></span> }.into_any()
-            }}
         </div>
     }
 }
@@ -451,6 +448,7 @@ fn VpnPeersCard(peers: Vec<VpnPeerSnapshot>) -> impl IntoView {
                         let last_seen = format_relative_time(peer.last_seen_ts);
                         let ping_ip = peer.tunnel_ip.clone().unwrap_or_default();
                         let ping_disabled = !has_ip;
+                        let speed_disabled = !has_ip;
                         let tx_bps_str = format_bps(peer.tx_bps);
                         let rx_bps_str = format_bps(peer.rx_bps);
                         let tx_bytes_str = format_bytes(peer.tx_bytes);
@@ -511,17 +509,31 @@ fn VpnPeersCard(peers: Vec<VpnPeerSnapshot>) -> impl IntoView {
 
                                 // Ping
                                 <div class="vpn-peer-actions">
-                                    <button
-                                        type="button"
-                                        class="btn-secondary vpn-ping-btn"
-                                        data-vpn-ping
-                                        data-peer-key=hash_full.clone()
-                                        data-peer-ip=ping_ip
-                                        disabled=ping_disabled
-                                    >"Ping"</button>
+                                    <div class="vpn-peer-action-buttons">
+                                        <button
+                                            type="button"
+                                            class="btn-secondary vpn-ping-btn"
+                                            data-vpn-ping
+                                            data-peer-key=hash_full.clone()
+                                            data-peer-ip=ping_ip.clone()
+                                            disabled=ping_disabled
+                                        >"Ping"</button>
+                                        <button
+                                            type="button"
+                                            class="btn-secondary vpn-speed-btn"
+                                            data-vpn-speed-test
+                                            data-peer-key=hash_full.clone()
+                                            data-peer-ip=ping_ip
+                                            disabled=speed_disabled
+                                        >"Test speed"</button>
+                                    </div>
                                     <div
                                         class="vpn-ping-status"
                                         data-vpn-ping-status=hash_full
+                                    ></div>
+                                    <div
+                                        class="vpn-ping-status"
+                                        data-vpn-speed-status=peer.destination.clone()
                                     ></div>
                                 </div>
                             </div>
@@ -635,7 +647,7 @@ fn VpnDebugSection(local_hash: String, vpn: VpnSnapshot) -> impl IntoView {
 
 #[component]
 fn VpnRouteEditorModal(advertised_routes: Vec<String>) -> impl IntoView {
-    let advertised_text = advertised_routes.join("\n");
+    let advertised_text = default_advertised_route_strings(advertised_routes).join("\n");
     view! {
         <div class="modal-backdrop" id="vpn-routes-modal" hidden>
             <div class="modal-card">
@@ -671,6 +683,7 @@ fn VpnRouteEditorModal(advertised_routes: Vec<String>) -> impl IntoView {
 const VPN_WS_JS: &str = r#"
 (function() {
     var pingState = Object.create(null);
+    var speedState = Object.create(null);
 
     // ── Utilities ──────────────────────────────────────────────────────────
 
@@ -841,7 +854,11 @@ const VPN_WS_JS: &str = r#"
     function setAdvertisedRoutes(routes) {
         var input = document.getElementById('vpn-routes-editor-input');
         if (!input || document.body.classList.contains('modal-open')) { return; }
-        input.value = (routes || []).join('\n');
+        routes = Array.isArray(routes) ? routes.filter(function(route) {
+            return String(route || '').trim().length > 0;
+        }) : [];
+        if (routes.length === 0) { routes = ['192.168.10.0/24']; }
+        input.value = routes.join('\n');
     }
 
     // ── Laptop setup card ───────────────────────────────────────────────────
@@ -898,9 +915,13 @@ const VPN_WS_JS: &str = r#"
                 : '<span class="badge reticulum-badge-soft" style="opacity:.6">no routes</span>';
             var pingKey = hash;
             var ps  = pingState[pingKey] || {};
-            var busy = !!ps.busy;
-            var pingDisabled = !hasIp || busy;
+            var ss  = speedState[pingKey] || {};
+            var pingBusy = !!ps.busy;
+            var speedBusy = !!ss.busy;
+            var pingDisabled = !hasIp || pingBusy;
+            var speedDisabled = !hasIp || speedBusy;
             var pingStatusCls = 'vpn-ping-status' + (ps.kind ? ' ' + ps.kind : '');
+            var speedStatusCls = 'vpn-ping-status' + (ss.kind ? ' ' + ss.kind : '');
             var stateBadgeCls = 'badge ' + vpnBadgeClass(peer.link_state || '\u2014');
 
             var txBps   = fmtBps(peer.tx_bps);
@@ -936,14 +957,25 @@ const VPN_WS_JS: &str = r#"
                     + '<span class="' + stateBadgeCls + '">' + esc(peer.link_state || '\u2014') + '</span>'
                 + '</div>'
                 + '<div class="vpn-peer-actions">'
-                    + '<button type="button" class="btn-secondary vpn-ping-btn" data-vpn-ping'
-                        + ' data-peer-key="' + esc(pingKey) + '"'
-                        + ' data-peer-ip="' + esc(peer.tunnel_ip || '') + '"'
-                        + (pingDisabled ? ' disabled' : '') + '>'
-                    + esc(busy ? 'Pinging\u2026' : 'Ping')
-                    + '</button>'
+                    + '<div class="vpn-peer-action-buttons">'
+                        + '<button type="button" class="btn-secondary vpn-ping-btn" data-vpn-ping'
+                            + ' data-peer-key="' + esc(pingKey) + '"'
+                            + ' data-peer-ip="' + esc(peer.tunnel_ip || '') + '"'
+                            + (pingDisabled ? ' disabled' : '') + '>'
+                        + esc(pingBusy ? 'Pinging\u2026' : 'Ping')
+                        + '</button>'
+                        + '<button type="button" class="btn-secondary vpn-speed-btn" data-vpn-speed-test'
+                            + ' data-peer-key="' + esc(pingKey) + '"'
+                            + ' data-peer-ip="' + esc(peer.tunnel_ip || '') + '"'
+                            + (speedDisabled ? ' disabled' : '') + '>'
+                        + esc(speedBusy ? 'Testing\u2026' : 'Test speed')
+                        + '</button>'
+                    + '</div>'
                     + '<div class="' + pingStatusCls + '" data-vpn-ping-status="' + esc(pingKey) + '">'
                     + esc(ps.text || '')
+                    + '</div>'
+                    + '<div class="' + speedStatusCls + '" data-vpn-speed-status="' + esc(pingKey) + '">'
+                    + esc(ss.text || '')
                     + '</div>'
                 + '</div>'
                 + '</div>';
@@ -1103,6 +1135,62 @@ const VPN_WS_JS: &str = r#"
                 if (st) {
                     st.textContent = pingState[key].text || '';
                     st.className = 'vpn-ping-status' + (pingState[key].kind ? ' ' + pingState[key].kind : '');
+                }
+            });
+            return;
+        }
+
+        // Speed test
+        var speedBtn = target.closest('[data-vpn-speed-test]');
+        if (speedBtn) {
+            var speedKey = speedBtn.getAttribute('data-peer-key') || '';
+            var speedIp  = speedBtn.getAttribute('data-peer-ip') || '';
+            if (!speedKey || !speedIp || speedIp === '\u2014') { return; }
+
+            speedState[speedKey] = { text: 'Testing\u2026', kind: 'pending', busy: true };
+            speedBtn.disabled = true;
+            speedBtn.textContent = 'Testing\u2026';
+            var speedStatusEl = document.querySelector('[data-vpn-speed-status="' + speedKey + '"]');
+            if (speedStatusEl) {
+                speedStatusEl.textContent = 'Testing\u2026';
+                speedStatusEl.className = 'vpn-ping-status pending';
+            }
+
+            fetch('/api/vpn/speed-test', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ address: speedIp })
+            }).then(function(resp) {
+                return resp.text().then(function(t) {
+                    var d = {};
+                    try { d = JSON.parse(t); } catch (_) { d = {}; }
+                    if (!resp.ok) {
+                        throw new Error((d && d.error) || 'failed');
+                    }
+                    return d;
+                });
+            }).then(function(d) {
+                var bytes = Number(d && d.bytes) || 0;
+                var durationMs = Number(d && d.duration_ms) || 0;
+                var bps = Number(d && d.bps) || 0;
+                speedState[speedKey] = {
+                    text: fmtBytes(bytes) + ' in ' + durationMs + ' ms · ' + fmtBps(bps),
+                    kind: d && d.ok ? 'ok' : 'err',
+                    busy: false
+                };
+            }).catch(function() {
+                speedState[speedKey] = {
+                    text: 'failed',
+                    kind: 'err',
+                    busy: false
+                };
+            }).finally(function() {
+                var btn = document.querySelector('[data-vpn-speed-test][data-peer-key="' + speedKey + '"]');
+                var st  = document.querySelector('[data-vpn-speed-status="' + speedKey + '"]');
+                if (btn) { btn.disabled = false; btn.textContent = 'Test speed'; }
+                if (st) {
+                    st.textContent = speedState[speedKey].text || '';
+                    st.className = 'vpn-ping-status' + (speedState[speedKey].kind ? ' ' + speedState[speedKey].kind : '');
                 }
             });
             return;

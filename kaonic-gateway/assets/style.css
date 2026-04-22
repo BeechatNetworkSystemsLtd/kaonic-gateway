@@ -1494,6 +1494,10 @@ select.field-input {
   min-width: 88px;
 }
 
+.vpn-speed-btn {
+  min-width: 110px;
+}
+
 .vpn-ping-status {
   min-height: 20px;
   margin-top: 8px;
@@ -2038,6 +2042,13 @@ select.field-input {
   gap: 4px;
   flex-shrink: 0;
   min-width: 80px;
+}
+
+.vpn-peer-action-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
 }
 
 /* Empty peers state */

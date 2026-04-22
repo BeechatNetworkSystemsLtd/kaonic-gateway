@@ -1628,7 +1628,7 @@ dependencies = [
 [[package]]
 name = "kaonic-ctrl"
 version = "0.1.1"
-source = "git+https://github.com/BeechatNetworkSystemsLtd/kaonic-radio#6c8a67ac8893dc4db3105721dd6b60e66cf66267"
+source = "git+https://github.com/BeechatNetworkSystemsLtd/kaonic-radio#60d5345479b7b2e17c7f2caa941080e96fcf2324"
 dependencies = [
  "kaonic-frame",
  "kaonic-net",
@@ -1649,7 +1649,7 @@ dependencies = [
 [[package]]
 name = "kaonic-frame"
 version = "0.1.0"
-source = "git+https://github.com/BeechatNetworkSystemsLtd/kaonic-radio#6c8a67ac8893dc4db3105721dd6b60e66cf66267"
+source = "git+https://github.com/BeechatNetworkSystemsLtd/kaonic-radio#60d5345479b7b2e17c7f2caa941080e96fcf2324"
 dependencies = [
  "crc",
 ]
@@ -1661,6 +1661,7 @@ dependencies = [
  "axum 0.8.9",
  "cidr 0.2.3",
  "clap",
+ "crc32fast",
  "env_logger 0.11.10",
  "if-addrs",
  "kaonic-ctrl",
@@ -1692,7 +1693,7 @@ dependencies = [
 [[package]]
 name = "kaonic-net"
 version = "0.1.0"
-source = "git+https://github.com/BeechatNetworkSystemsLtd/kaonic-radio#6c8a67ac8893dc4db3105721dd6b60e66cf66267"
+source = "git+https://github.com/BeechatNetworkSystemsLtd/kaonic-radio#60d5345479b7b2e17c7f2caa941080e96fcf2324"
 dependencies = [
  "crc",
  "kaonic-frame",
@@ -2564,7 +2565,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 [[package]]
 name = "radio-common"
 version = "0.1.0"
-source = "git+https://github.com/BeechatNetworkSystemsLtd/kaonic-radio#6c8a67ac8893dc4db3105721dd6b60e66cf66267"
+source = "git+https://github.com/BeechatNetworkSystemsLtd/kaonic-radio#60d5345479b7b2e17c7f2caa941080e96fcf2324"
 dependencies = [
  "serde",
 ]

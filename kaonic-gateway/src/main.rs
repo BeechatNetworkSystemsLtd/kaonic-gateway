@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
+use crc32fast::hash as crc32_hash;
 use env_logger;
 use http::{AppState, SharedSettings};
 use kaonic_gateway::gateway_reticulum::GatewayReticulum;
@@ -40,6 +41,10 @@ fn frame_ascii_preview(data: &[u8]) -> String {
             _ => '.',
         })
         .collect()
+}
+
+fn frame_crc32(data: &[u8]) -> String {
+    format!("{:08x}", crc32_hash(data))
 }
 
 fn unix_timestamp_secs() -> u64 {
@@ -93,7 +98,7 @@ async fn async_main() -> Result<(), process::ExitCode> {
 
     env_logger::Builder::new()
         .parse_filters(
-            "warn,kaonic_gateway=trace,kaonic_vpn=info,kaonic_reticulum=trace,reticulum=trace",
+            "warn,kaonic_gateway=trace,kaonic_vpn=debug,kaonic_reticulum=warn,reticulum=warn",
         )
         .parse_default_env()
         .init();
@@ -252,6 +257,7 @@ async fn async_main() -> Result<(), process::ExitCode> {
                                 len: recv.frame.len,
                                 hex: frame_preview(recv.frame.as_slice()),
                                 ascii: frame_ascii_preview(recv.frame.as_slice()),
+                                crc32: frame_crc32(recv.frame.as_slice()),
                                 ts: unix_timestamp_secs(),
                             };
                             frame_stats[module]
@@ -288,6 +294,7 @@ async fn async_main() -> Result<(), process::ExitCode> {
                                 len: payload.len() as u16,
                                 hex: frame_preview(payload.as_slice()),
                                 ascii: frame_ascii_preview(payload.as_slice()),
+                                crc32: frame_crc32(payload.as_slice()),
                                 ts: unix_timestamp_secs(),
                             };
                             frame_stats[module]

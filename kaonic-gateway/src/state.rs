@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI32, AtomicU64};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use tokio::sync::{broadcast, Mutex as TokioMutex};
 
@@ -37,12 +38,60 @@ fn ws_event_bus() -> broadcast::Sender<WsStatusEvent> {
 }
 
 #[derive(Default)]
+struct FrameRateState {
+    last_sample: Option<Instant>,
+    last_rx_bytes: u64,
+    last_tx_bytes: u64,
+    rx_bps: u64,
+    tx_bps: u64,
+}
+
 pub struct FrameStats {
     pub rx_frames: AtomicU64,
     pub rx_bytes: AtomicU64,
     pub tx_frames: AtomicU64,
     pub tx_bytes: AtomicU64,
     pub last_rssi: AtomicI32,
+    rate: Mutex<FrameRateState>,
+}
+
+impl Default for FrameStats {
+    fn default() -> Self {
+        Self {
+            rx_frames: AtomicU64::new(0),
+            rx_bytes: AtomicU64::new(0),
+            tx_frames: AtomicU64::new(0),
+            tx_bytes: AtomicU64::new(0),
+            last_rssi: AtomicI32::new(0),
+            rate: Mutex::new(FrameRateState::default()),
+        }
+    }
+}
+
+impl FrameStats {
+    pub fn rates(&self, rx_bytes: u64, tx_bytes: u64) -> (u64, u64) {
+        let mut rate = self.rate.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+
+        if let Some(last_sample) = rate.last_sample {
+            let elapsed = now.duration_since(last_sample).as_secs_f64();
+            if elapsed >= 0.2 {
+                rate.rx_bps =
+                    ((rx_bytes.saturating_sub(rate.last_rx_bytes)) as f64 / elapsed) as u64;
+                rate.tx_bps =
+                    ((tx_bytes.saturating_sub(rate.last_tx_bytes)) as f64 / elapsed) as u64;
+                rate.last_sample = Some(now);
+                rate.last_rx_bytes = rx_bytes;
+                rate.last_tx_bytes = tx_bytes;
+            }
+        } else {
+            rate.last_sample = Some(now);
+            rate.last_rx_bytes = rx_bytes;
+            rate.last_tx_bytes = tx_bytes;
+        }
+
+        (rate.rx_bps, rate.tx_bps)
+    }
 }
 
 /// Shared application state — injected as leptos context for server functions.

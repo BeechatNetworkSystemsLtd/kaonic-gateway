@@ -379,8 +379,10 @@ impl VpnRuntime {
             local_routes,
             tx_packets: metrics.tx_packets,
             tx_bytes: metrics.tx_bytes,
+            tx_bps: metrics.tx_bps,
             rx_packets: metrics.rx_packets,
             rx_bytes: metrics.rx_bytes,
+            rx_bps: metrics.rx_bps,
             drop_packets: metrics.drop_packets,
             last_tx_ts: metrics.last_tx_ts,
             last_rx_ts: metrics.last_rx_ts,
@@ -749,7 +751,7 @@ fn spawn_tun_rx(
                                 peer.mark_tx();
                                 peer.metrics.record_tx(packet.len());
                             }
-                            log::info!(
+                            log::debug!(
                                 "vpn tx peer={} src={} dst={} len={} packets={}",
                                 peer_hash,
                                 packet_source(packet)
@@ -896,7 +898,7 @@ async fn handle_link_data(
             if let Some(peer) = credited {
                 peer.metrics.record_rx(data.len());
                 peer.mark_seen();
-                log::info!(
+                log::debug!(
                     "vpn rx peer={} src={} dst={} len={}",
                     peer.hash,
                     src_ip
@@ -908,7 +910,7 @@ async fn handle_link_data(
                     data.len()
                 );
             } else {
-                log::info!(
+                log::warn!(
                     "vpn rx peer=unknown src={} dst={} len={}",
                     src_ip
                         .map(|ip| ip.to_string())

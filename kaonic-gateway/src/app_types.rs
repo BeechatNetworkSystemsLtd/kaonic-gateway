@@ -33,6 +33,7 @@ pub struct RxFrameDto {
     pub len: u16,
     pub hex: String, // hex preview of first 16 bytes
     pub ascii: String,
+    pub crc32: String,
     pub ts: u64, // unix timestamp (seconds)
 }
 
@@ -40,8 +41,10 @@ pub struct RxFrameDto {
 pub struct FrameStatsDto {
     pub rx_frames: u64,
     pub rx_bytes: u64,
+    pub rx_bps: u64,
     pub tx_frames: u64,
     pub tx_bytes: u64,
+    pub tx_bps: u64,
     pub last_rssi: Option<i8>,
 }
 
@@ -231,7 +234,7 @@ impl Default for GatewaySettingsDto {
         Self {
             network: "10.0.0.0/24".into(),
             peers: vec![],
-            advertised_routes: vec![],
+            advertised_routes: vec!["192.168.10.0/24".into()],
             announce_freq_secs: 1,
             radio_modules: [
                 RadioModuleConfigDto::default(),

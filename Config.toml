@@ -10,7 +10,7 @@ peers = [
 
 # Extra local LAN subnets to advertise into the VPN even if they are not auto-detected.
 advertised_routes = [
-  # "192.168.10.0/24",
+  "192.168.10.0/24",
 ]
 
 # How often to re-announce our VPN destination on the network (seconds).

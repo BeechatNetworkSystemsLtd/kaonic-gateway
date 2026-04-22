@@ -102,6 +102,9 @@ const RADIO_WS_JS: &str = r#"
     function formatKBytes(bytes) {
         return (bytes / 1024).toFixed(1);
     }
+    function formatRate(bytesPerSecond) {
+        return (bytesPerSecond / 1024).toFixed(1);
+    }
     function formatFrameTime(ts) {
         return new Date(ts * 1000).toLocaleTimeString([], {
             hour: '2-digit',
@@ -141,17 +144,16 @@ const RADIO_WS_JS: &str = r#"
                 if (!tbody || !stats || !rssi) return;
                 var list = d.frames || [];
                 var totals = d.stats || {};
-                var rxCount = Number(totals.rx_frames) || 0;
-                var rxBytes = Number(totals.rx_bytes) || 0;
-                var txCount = Number(totals.tx_frames) || 0;
-                var txBytes = Number(totals.tx_bytes) || 0;
-                stats.textContent = 'RX: ' + rxCount + ' frames, ' + formatKBytes(rxBytes)
-                    + ' KB | TX: ' + txCount + ' frames, ' + formatKBytes(txBytes) + ' KB';
+                var rxBps = Number(totals.rx_bps) || 0;
+                var txBps = Number(totals.tx_bps) || 0;
+                stats.textContent = 'RX: ' + formatRate(rxBps) + ' KB/s | TX: '
+                    + formatRate(txBps) + ' KB/s | Total: '
+                    + formatRate(rxBps + txBps) + ' KB/s';
                     rssi.textContent = totals.last_rssi !== null && totals.last_rssi !== undefined
                         ? 'Last RSSI: ' + totals.last_rssi + ' dBm'
                         : 'Last RSSI: —';
                 if (list.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="6" class="frames-empty">No frames observed</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="7" class="frames-empty">No frames observed</td></tr>';
                     return;
                 }
                 tbody.innerHTML = list.map(function(f) {
@@ -163,7 +165,8 @@ const RADIO_WS_JS: &str = r#"
                             + '<td class="' + rssiClass(f) + '">' + f.rssi + ' dBm</td>'
                             + '<td class="td-len">' + f.len + ' B</td>'
                             + '<td class="td-hex td-preview">' + (f.hex || '—') + '</td>'
-                            + '<td class="td-hex td-preview">' + (f.ascii || '—') + '</td></tr>';
+                            + '<td class="td-hex td-preview">' + (f.ascii || '—') + '</td>'
+                            + '<td class="td-hex td-preview">' + (f.crc32 || '—') + '</td></tr>';
                 }).join('');
             } catch(e) {}
         };
@@ -227,18 +230,19 @@ fn RadioPanel(index: usize, module: RadioModuleConfigDto) -> impl IntoView {
                                 <th>"Len"</th>
                                 <th>"Preview"</th>
                                 <th>"ASCII"</th>
+                                <th>"CRC32"</th>
                             </tr>
                         </thead>
                         <tbody id=format!("rx-frames-{index}")>
                             <tr>
-                                <td colspan="6" class="frames-empty">"Waiting for frames…"</td>
+                                <td colspan="7" class="frames-empty">"Waiting for frames…"</td>
                             </tr>
                         </tbody>
                     </table>
                 </div>
                 <div class="frames-stats">
                     <span id=format!("rx-stats-summary-{index}") class="frames-stats-summary">
-                        "RX: 0 frames, 0.0 KB | TX: 0 frames, 0.0 KB"
+                        "RX: 0.0 KB/s | TX: 0.0 KB/s | Total: 0.0 KB/s"
                     </span>
                     <span id=format!("rx-stats-rssi-{index}") class="frames-stats-rssi">
                         "Last RSSI: —"
