@@ -135,58 +135,73 @@ const WS_SCRIPT: &str = r#"
     ws.onmessage = function(e) {
       try {
         if (shouldPauseLiveUpdates()) { return; }
-        var s = JSON.parse(e.data);
-        var sys = s.system || {};
-        var cpu = (sys.cpu_percent || 0);
-        var ramUsed = sys.ram_used_mb || 0;
-        var ramTotal = sys.ram_total_mb || 0;
-        var ramPct = ramTotal > 0 ? Math.round(ramUsed * 100 / ramTotal) : 0;
-        var fsFree = sys.fs_free_mb || 0;
-        var fsTotal = sys.fs_total_mb || 0;
-        var fsUsed = Math.max(0, fsTotal - fsFree);
-        var fsPct = fsTotal > 0 ? Math.round((fsTotal - fsFree) * 100 / fsTotal) : 0;
-        set('os-val', sys.os_details || 'Unknown');
-        set('cpu-pct', cpu.toFixed(1) + '%');
-        bar('cpu-bar', cpu.toFixed(0));
-        set('ram-val', ramUsed + ' / ' + ramTotal + ' MB');
-        bar('ram-bar', ramPct);
-        set('fs-val', formatStorageMb(fsUsed) + ' / ' + formatStorageMb(fsTotal) + ' used');
-        bar('fs-bar', fsPct);
-        (s.services || []).forEach(function(svc, i) {
-          set('service-status-' + i, svc.status || 'unknown');
-          var badge = document.getElementById('service-badge-' + i);
-          if (badge) {
-            badge.textContent = serviceBadgeLabel(svc);
-            badge.className = 'badge ' + serviceBadgeClass(svc);
-          }
-        });
-        var activeServices = (s.services || []).filter(function(svc) {
-          return (svc.load_state || '') === 'loaded' && (svc.active_state || '') === 'active';
-        }).length;
-        set('services-count', activeServices + '/' + ((s.services || []).length) + ' active');
-        renderNetworkPorts(s.network_ports || []);
-        var vpn = s.vpn || {};
-        var vpnStatus = (vpn.status || 'unknown');
-        var vpnBadge = document.getElementById('dash-vpn-status');
-        if (vpnBadge) {
-          vpnBadge.textContent = vpnStatus;
-          vpnBadge.className = vpnStatusBadgeClass(vpnStatus);
+        var msg = JSON.parse(e.data) || {};
+        var data = msg.data || {};
+        if (msg.type === 'system') {
+          var sys = data;
+          var cpu = (sys.cpu_percent || 0);
+          var ramUsed = sys.ram_used_mb || 0;
+          var ramTotal = sys.ram_total_mb || 0;
+          var ramPct = ramTotal > 0 ? Math.round(ramUsed * 100 / ramTotal) : 0;
+          var fsFree = sys.fs_free_mb || 0;
+          var fsTotal = sys.fs_total_mb || 0;
+          var fsUsed = Math.max(0, fsTotal - fsFree);
+          var fsPct = fsTotal > 0 ? Math.round((fsTotal - fsFree) * 100 / fsTotal) : 0;
+          set('os-val', sys.os_details || 'Unknown');
+          set('cpu-pct', cpu.toFixed(1) + '%');
+          bar('cpu-bar', cpu.toFixed(0));
+          set('ram-val', ramUsed + ' / ' + ramTotal + ' MB');
+          bar('ram-bar', ramPct);
+          set('fs-val', formatStorageMb(fsUsed) + ' / ' + formatStorageMb(fsTotal) + ' used');
+          bar('fs-bar', fsPct);
+          return;
         }
-        set('dash-vpn-tunnel', vpn.local_tunnel_ip || '—');
-        var peers = vpn.peers || [];
-        var active = peers.filter(function(p) { return (p.link_state || '') === 'active'; }).length;
-        set('dash-vpn-peers', active + '/' + peers.length + ' linked');
-        set('dash-vpn-tx', formatBytes(vpn.tx_bytes || 0));
-        set('dash-vpn-rx', formatBytes(vpn.rx_bytes || 0));
-        (s.atak_bridges || []).forEach(function(b, i) {
-          set('bridge-rx-' + i, '\u2193 ' + b.rx_packets);
-          set('bridge-tx-' + i, '\u2191 ' + b.tx_packets);
-          var badge = document.getElementById('bridge-badge-' + i);
-          if (badge) {
-            badge.textContent = b.dest_hash ? 'linked' : 'waiting';
-            badge.className = b.dest_hash ? 'badge badge-ok' : 'badge badge-warn';
+        if (msg.type === 'services') {
+          data.forEach(function(svc, i) {
+            set('service-status-' + i, svc.status || 'unknown');
+            var badge = document.getElementById('service-badge-' + i);
+            if (badge) {
+              badge.textContent = serviceBadgeLabel(svc);
+              badge.className = 'badge ' + serviceBadgeClass(svc);
+            }
+          });
+          var activeServices = data.filter(function(svc) {
+            return (svc.load_state || '') === 'loaded' && (svc.active_state || '') === 'active';
+          }).length;
+          set('services-count', activeServices + '/' + data.length + ' active');
+          return;
+        }
+        if (msg.type === 'network_ports') {
+          renderNetworkPorts(data || []);
+          return;
+        }
+        if (msg.type === 'vpn') {
+          var vpn = data || {};
+          var vpnStatus = (vpn.status || 'unknown');
+          var vpnBadge = document.getElementById('dash-vpn-status');
+          if (vpnBadge) {
+            vpnBadge.textContent = vpnStatus;
+            vpnBadge.className = vpnStatusBadgeClass(vpnStatus);
           }
-        });
+          set('dash-vpn-tunnel', vpn.local_tunnel_ip || '—');
+          var peers = vpn.peers || [];
+          var active = peers.filter(function(p) { return (p.link_state || '') === 'active'; }).length;
+          set('dash-vpn-peers', active + '/' + peers.length + ' linked');
+          set('dash-vpn-tx', formatBytes(vpn.tx_bytes || 0));
+          set('dash-vpn-rx', formatBytes(vpn.rx_bytes || 0));
+          return;
+        }
+        if (msg.type === 'atak_bridges') {
+          data.forEach(function(b, i) {
+            set('bridge-rx-' + i, '\u2193 ' + b.rx_packets);
+            set('bridge-tx-' + i, '\u2191 ' + b.tx_packets);
+            var badge = document.getElementById('bridge-badge-' + i);
+            if (badge) {
+              badge.textContent = b.dest_hash ? 'linked' : 'waiting';
+              badge.className = b.dest_hash ? 'badge badge-ok' : 'badge badge-warn';
+            }
+          });
+        }
       } catch(err) { console.warn('ws parse error', err); }
     };
     ws.onclose = function() { setTimeout(connect, 3000); };

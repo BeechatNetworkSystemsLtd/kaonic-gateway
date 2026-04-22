@@ -103,8 +103,19 @@ pub fn sync_route_translations(
     run(
         ipt,
         &[
-            "-t", "mangle", "-A", MSS, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS",
-            "--set-mss", &mss,
+            "-t",
+            "mangle",
+            "-A",
+            MSS,
+            "-p",
+            "tcp",
+            "--tcp-flags",
+            "SYN,RST",
+            "SYN",
+            "-j",
+            "TCPMSS",
+            "--set-mss",
+            &mss,
         ],
     )?;
 

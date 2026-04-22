@@ -60,6 +60,7 @@ const RETICULUM_WS_JS: &str = r#"
 (function() {
     var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     var ws = new WebSocket(proto + '//' + location.host + '/api/ws/status');
+    var liveState = { vpn: {}, atak_bridges: [], reticulum: {} };
 
     function shouldPauseLiveUpdates() {
         if (document.body.classList.contains('modal-open')) { return true; }
@@ -299,18 +300,30 @@ const RETICULUM_WS_JS: &str = r#"
     ws.onmessage = function(ev) {
         try {
             if (shouldPauseLiveUpdates()) { return; }
-            var payload = JSON.parse(ev.data) || {};
-            var snapshot = payload.reticulum || {};
+            var msg = JSON.parse(ev.data) || {};
+            if (msg.type === 'vpn') {
+                liveState.vpn = msg.data || {};
+                setText('reticulum-local-destinations-count', String(collectLocalDestinations(liveState).length));
+                renderLocalDestinations(liveState);
+                return;
+            }
+            if (msg.type === 'atak_bridges') {
+                liveState.atak_bridges = msg.data || [];
+                setText('reticulum-local-destinations-count', String(collectLocalDestinations(liveState).length));
+                renderLocalDestinations(liveState);
+                return;
+            }
+            if (msg.type !== 'reticulum') { return; }
+            var snapshot = msg.data || {};
+            liveState.reticulum = snapshot;
             var incoming = snapshot.incoming_links || [];
             var outgoing = snapshot.outgoing_links || [];
             var events = snapshot.events || [];
             setText('reticulum-incoming-count', String(incoming.length));
             setText('reticulum-outgoing-count', String(outgoing.length));
             setText('reticulum-events-count', String(events.length));
-            setText('reticulum-local-destinations-count', String(collectLocalDestinations(payload).length));
             renderLinks('reticulum-incoming-links', incoming, 'No incoming links seen');
             renderLinks('reticulum-outgoing-links', outgoing, 'No outgoing links seen');
-            renderLocalDestinations(payload);
             renderEvents(events);
             renderOpenDestinations(snapshot);
         } catch (e) {}

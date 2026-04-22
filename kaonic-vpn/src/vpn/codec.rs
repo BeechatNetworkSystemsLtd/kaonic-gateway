@@ -96,7 +96,8 @@ pub fn encode_announce(routes: &[Ipv4Cidr]) -> Result<Vec<u8>, CodecError> {
     let mut out = Vec::with_capacity(8 + routes.len() * 6);
     out.extend_from_slice(ANNOUNCE_MAGIC);
     out.push(ANNOUNCE_VERSION);
-    rmp_serde::encode::write_named(&mut out, &body).map_err(|e| CodecError::Encode(e.to_string()))?;
+    rmp_serde::encode::write_named(&mut out, &body)
+        .map_err(|e| CodecError::Encode(e.to_string()))?;
     Ok(out)
 }
 

@@ -1,6 +1,6 @@
-mod handlers;
+pub(crate) mod handlers;
 mod update;
-mod ws;
+pub(crate) mod ws;
 
 use std::net::SocketAddr;
 
@@ -30,6 +30,8 @@ pub async fn serve(state: AppState, addr: SocketAddr) {
         .site_pkg_dir("pkg")
         .site_addr(addr)
         .build();
+
+    ws::spawn_status_publishers(state.clone());
 
     let routes = generate_route_list(kaonic_gateway::app::App);
 

@@ -4,6 +4,7 @@ mod http;
 use std::path::Path;
 use std::process;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use env_logger;
@@ -16,7 +17,7 @@ use kaonic_gateway::settings::Settings;
 use kaonic_vpn::{VpnConfig, VpnRuntime};
 use log;
 use reticulum::identity::PrivateIdentity;
-use reticulum::transport::{Transport, TransportConfig};
+use reticulum::transport::{TimerConfig, Transport, TransportConfig};
 use std::sync::Mutex;
 use tokio;
 use tokio_util::sync::CancellationToken;
@@ -29,6 +30,16 @@ fn frame_preview(data: &[u8]) -> String {
         .map(|b| format!("{b:02x}"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn frame_ascii_preview(data: &[u8]) -> String {
+    data.iter()
+        .take(16)
+        .map(|b| match b {
+            0x20..=0x7e => char::from(*b),
+            _ => '.',
+        })
+        .collect()
 }
 
 fn unix_timestamp_secs() -> u64 {
@@ -81,7 +92,9 @@ async fn async_main() -> Result<(), process::ExitCode> {
         });
 
     env_logger::Builder::new()
-        .parse_filters("warn,kaonic_gateway=trace,kaonic_vpn=info,kaonic_reticulum=warn,rns_vpn=warn,reticulum=warn")
+        .parse_filters(
+            "warn,kaonic_gateway=trace,kaonic_vpn=info,kaonic_reticulum=trace,reticulum=trace",
+        )
         .parse_default_env()
         .init();
 
@@ -145,6 +158,20 @@ async fn async_main() -> Result<(), process::ExitCode> {
 
     let mut transport_cfg = TransportConfig::new("kaonic-gateway", &id, true);
     transport_cfg.set_retransmit(true);
+    transport_cfg.set_timer_config(TimerConfig {
+        in_link_stale: Duration::from_secs(30),
+        in_link_close: Duration::from_secs(15),
+        out_link_restart: Duration::from_secs(45),
+        out_link_stale: Duration::from_secs(30),
+        out_link_close: Duration::from_secs(15),
+        out_link_repeat: Duration::from_secs(10),
+        out_link_keep: Duration::from_secs(5),
+        ..TimerConfig::default()
+    });
+    // Lossy radio interfaces can miss several keep-alive round-trips under
+    // load, so keep links alive longer before marking them stale and restart
+    // stale out-links after 45 s instead of forcing a full re-handshake sooner.
+    transport_cfg.set_restart_outlinks(true);
     let transport = Arc::new(tokio::sync::Mutex::new(Transport::new(transport_cfg)));
     let reticulum = Arc::new(GatewayReticulum::new());
     reticulum.attach(transport.clone()).await;
@@ -202,11 +229,13 @@ async fn async_main() -> Result<(), process::ExitCode> {
 
     // Spawn frame listener — fills per-module ring buffers used by the WS feed.
     {
+        use http::ws::publish_radio_frames;
         use kaonic_gateway::app_types::RxFrameDto;
         use kaonic_gateway::state::RX_BUF_SIZE;
         use std::sync::atomic::Ordering;
         use tokio::sync::broadcast::error::RecvError;
 
+        let ws_state = app_state.clone();
         let rx_bufs = app_state.rx_buffers.clone();
         let frame_stats = app_state.frame_stats.clone();
         let mut rx = radio_client.lock().await.module_receive();
@@ -222,6 +251,7 @@ async fn async_main() -> Result<(), process::ExitCode> {
                                 rssi: recv.rssi,
                                 len: recv.frame.len,
                                 hex: frame_preview(recv.frame.as_slice()),
+                                ascii: frame_ascii_preview(recv.frame.as_slice()),
                                 ts: unix_timestamp_secs(),
                             };
                             frame_stats[module]
@@ -236,6 +266,14 @@ async fn async_main() -> Result<(), process::ExitCode> {
                             let mut buf = rx_bufs[module].lock().await;
                             buf.push_front(entry);
                             buf.truncate(RX_BUF_SIZE);
+                            let frames = buf.iter().cloned().collect();
+                            drop(buf);
+                            publish_radio_frames(
+                                &ws_state,
+                                module,
+                                frames,
+                                http::handlers::build_frame_stats(&ws_state, module),
+                            );
                         }
                         Err(RecvError::Lagged(_)) => continue,
                         Err(_) => break,
@@ -249,6 +287,7 @@ async fn async_main() -> Result<(), process::ExitCode> {
                                 rssi: 0,
                                 len: payload.len() as u16,
                                 hex: frame_preview(payload.as_slice()),
+                                ascii: frame_ascii_preview(payload.as_slice()),
                                 ts: unix_timestamp_secs(),
                             };
                             frame_stats[module]
@@ -260,6 +299,14 @@ async fn async_main() -> Result<(), process::ExitCode> {
                             let mut buf = rx_bufs[module].lock().await;
                             buf.push_front(entry);
                             buf.truncate(RX_BUF_SIZE);
+                            let frames = buf.iter().cloned().collect();
+                            drop(buf);
+                            publish_radio_frames(
+                                &ws_state,
+                                module,
+                                frames,
+                                http::handlers::build_frame_stats(&ws_state, module),
+                            );
                         }
                         None => break,
                     }

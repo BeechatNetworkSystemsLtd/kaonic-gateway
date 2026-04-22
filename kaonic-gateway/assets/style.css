@@ -919,6 +919,10 @@ select.field-input {
 .td-rssi-bad  { color: #ef4444; }
 .td-len   { color: var(--text-muted); font-family: var(--mono); }
 .td-hex   { font-family: var(--mono); color: var(--text); word-break: break-all; }
+.td-preview {
+  font-size: 12px;
+  line-height: 1.25;
+}
 
 .frames-stats {
   display: flex;

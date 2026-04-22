@@ -18,7 +18,7 @@ use cidr::Ipv4Cidr;
 use etherparse::IpSlice;
 use if_addrs::{get_if_addrs, IfAddr};
 use parking_lot::RwLock as PlRwLock;
-use reticulum::destination::link::LinkEvent;
+use reticulum::destination::link::{LinkEvent, LinkStatus};
 use reticulum::destination::DestinationName;
 use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
@@ -37,15 +37,24 @@ use super::peer::{LinkState, Peer, PeerRegistry};
 use super::platform::{self, LocalRouteTranslation};
 use super::router::{RouteTable, Router};
 use super::tun::{self, SharedTun, TUN_MTU};
-use super::types::{
-    VpnPeerSnapshot, VpnRouteMappingSnapshot, VpnRouteSnapshot, VpnSnapshot,
-};
+use super::types::{VpnPeerSnapshot, VpnRouteMappingSnapshot, VpnRouteSnapshot, VpnSnapshot};
 
 /// Peer routes are dropped this long after the last announce. Keeps a small
 /// grace window so a single missed announce does not flap the kernel route.
 const ROUTE_GRACE_SECS: u64 = 45;
 /// Watchdog cadence.
 const WATCHDOG_SECS: u64 = 10;
+/// Give a link this long to finish its handshake before we tear it down and
+/// try again. Reticulum keeps re-sending the link request every 6 s on its
+/// own, but it never gives up on a stuck Pending link, so a lost proof reply
+/// would leave us wedged forever without this timeout.
+const LINK_PENDING_TIMEOUT_SECS: u64 = 10;
+/// After a forced close, wait briefly before opening a fresh link so control
+/// traffic can settle and duplicate reopen attempts collapse together.
+const LINK_RECONNECT_COOLDOWN_SECS: u64 = 3;
+/// When a peer is not currently Active, briefly pause TUN TX so the transport
+/// is not hammered with packets it cannot deliver yet.
+const TUN_TX_BACKOFF_MILLIS: u64 = 100;
 
 // ── Status ───────────────────────────────────────────────────────────────────
 
@@ -204,11 +213,32 @@ impl VpnRuntime {
         // Initial route sync so the kernel sees our advertised routes on disk.
         runtime.sync_routes();
 
-        spawn_announce_tx(runtime.clone(), transport.clone(), destination.clone(), config.announce_freq_secs, cancel.clone());
+        spawn_announce_tx(
+            runtime.clone(),
+            transport.clone(),
+            destination.clone(),
+            config.announce_freq_secs,
+            cancel.clone(),
+        );
         spawn_announce_rx(runtime.clone(), transport.clone(), cancel.clone());
-        spawn_out_link_events(runtime.clone(), transport.clone(), tun.clone(), cancel.clone());
-        spawn_in_link_events(runtime.clone(), transport.clone(), tun.clone(), cancel.clone());
-        spawn_tun_rx(runtime.clone(), transport.clone(), tun.clone(), cancel.clone());
+        spawn_out_link_events(
+            runtime.clone(),
+            transport.clone(),
+            tun.clone(),
+            cancel.clone(),
+        );
+        spawn_in_link_events(
+            runtime.clone(),
+            transport.clone(),
+            tun.clone(),
+            cancel.clone(),
+        );
+        spawn_tun_rx(
+            runtime.clone(),
+            transport.clone(),
+            tun.clone(),
+            cancel.clone(),
+        );
         spawn_watchdog(runtime.clone(), transport, cancel);
 
         Ok(runtime)
@@ -281,7 +311,11 @@ impl VpnRuntime {
                 remote_routes.push(VpnRouteSnapshot {
                     network: key,
                     owner: peer.hash.to_hex_string(),
-                    status: if conflict { "conflict".into() } else { "active".into() },
+                    status: if conflict {
+                        "conflict".into()
+                    } else {
+                        "active".into()
+                    },
                     last_seen_ts: last_seen,
                     installed: installed && !conflict,
                 });
@@ -291,7 +325,11 @@ impl VpnRuntime {
         remote_routes.sort_by(|a, b| a.network.cmp(&b.network));
 
         // Local route mappings (for the exported/local subnet table in the UI).
-        let translations = local_route_translations(&slow.local_routes, &self.destination, self.route_aliasing_enabled);
+        let translations = local_route_translations(
+            &slow.local_routes,
+            &self.destination,
+            self.route_aliasing_enabled,
+        );
         let mut local_routes: Vec<String> = translations
             .iter()
             .map(|t| {
@@ -312,9 +350,17 @@ impl VpnRuntime {
                 mapped_subnet: t.exported.to_string(),
             })
             .collect();
-        route_mappings.sort_by(|a, b| a.subnet.cmp(&b.subnet).then(a.mapped_subnet.cmp(&b.mapped_subnet)));
+        route_mappings.sort_by(|a, b| {
+            a.subnet
+                .cmp(&b.subnet)
+                .then(a.mapped_subnet.cmp(&b.mapped_subnet))
+        });
 
-        let mut advertised: Vec<String> = slow.advertised_routes.iter().map(ToString::to_string).collect();
+        let mut advertised: Vec<String> = slow
+            .advertised_routes
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         advertised.sort();
 
         // subnets from the router snapshot give us the full "active route set"
@@ -366,10 +412,15 @@ impl VpnRuntime {
         let table = self.router.snapshot();
         let (interface, local_routes, aliasing) = {
             let slow = self.slow.read();
-            (self.interface_name.clone(), slow.local_routes.clone(), self.route_aliasing_enabled)
+            (
+                self.interface_name.clone(),
+                slow.local_routes.clone(),
+                self.route_aliasing_enabled,
+            )
         };
         let translations = local_route_translations(&local_routes, &self.destination, aliasing);
-        let local_conflicts = conflicting_local_routes(&translations, table.subnets().iter().map(|(c, _)| *c));
+        let local_conflicts =
+            conflicting_local_routes(&translations, table.subnets().iter().map(|(c, _)| *c));
 
         let desired: BTreeSet<String> = table
             .subnets()
@@ -417,10 +468,14 @@ impl VpnRuntime {
 
     fn exported_routes(&self) -> Vec<Ipv4Cidr> {
         let slow = self.slow.read();
-        local_route_translations(&slow.local_routes, &self.destination, self.route_aliasing_enabled)
-            .into_iter()
-            .map(|t| t.exported)
-            .collect()
+        local_route_translations(
+            &slow.local_routes,
+            &self.destination,
+            self.route_aliasing_enabled,
+        )
+        .into_iter()
+        .map(|t| t.exported)
+        .collect()
     }
 
     fn refresh_local_routes(&self) {
@@ -429,7 +484,11 @@ impl VpnRuntime {
         slow.local_routes = merge_routes(&discovered, &slow.advertised_routes);
     }
 
-    fn handle_peer_announce(&self, desc: reticulum::destination::DestinationDesc, routes: Vec<Ipv4Cidr>) -> bool {
+    fn handle_peer_announce(
+        &self,
+        desc: reticulum::destination::DestinationDesc,
+        routes: Vec<Ipv4Cidr>,
+    ) -> bool {
         let hash = desc.address_hash;
         if hash == self.destination {
             return false;
@@ -522,15 +581,16 @@ fn spawn_announce_rx(
                         }
                         match decode_announce(app_data) {
                             Ok(routes) => {
-                                let new_peer = runtime.handle_peer_announce(desc, routes);
-                                if new_peer {
-                                    // Trigger outbound link the first time we see a peer.
-                                    let transport = transport.clone();
-                                    let runtime = runtime.clone();
-                                    tokio::spawn(async move {
-                                        request_out_link(&runtime, &transport, desc).await;
-                                    });
-                                }
+                                runtime.handle_peer_announce(desc, routes);
+                                // Announces are the primary trigger for opening
+                                // a fresh outbound link after a disconnect. If a
+                                // link is already active/pending, request_out_link
+                                // reuses it without restarting the attempt.
+                                let transport = transport.clone();
+                                let runtime = runtime.clone();
+                                tokio::spawn(async move {
+                                    request_out_link(&runtime, &transport, desc).await;
+                                });
                             }
                             Err(err) => {
                                 runtime.record_peer_error(desc.address_hash, err.to_string());
@@ -562,6 +622,12 @@ fn spawn_out_link_events(
                         match event.event {
                             LinkEvent::Activated => {
                                 runtime.set_link_state(peer_hash, LinkState::Active);
+                                if let Some(peer) = runtime.peers.get(&peer_hash) {
+                                    peer.clear_link_attempt();
+                                    peer.finish_link_request();
+                                    peer.clear_reconnect_cooldown();
+                                    peer.reconnect_attempts.store(0, Ordering::Relaxed);
+                                }
                                 if let Some(link) = transport.lock().await.find_out_link(&peer_hash).await {
                                     runtime.out_links.insert(peer_hash, link);
                                 }
@@ -574,6 +640,11 @@ fn spawn_out_link_events(
                             LinkEvent::Closed => {
                                 runtime.set_link_state(peer_hash, LinkState::Closed);
                                 runtime.out_links.remove(&peer_hash);
+                                if let Some(peer) = runtime.peers.get(&peer_hash) {
+                                    peer.clear_link_attempt();
+                                    peer.finish_link_request();
+                                    peer.set_reconnect_cooldown(LINK_RECONNECT_COOLDOWN_SECS);
+                                }
                                 log::warn!("vpn peer={} out-link closed", peer_hash);
                             }
                             LinkEvent::Data(payload) => {
@@ -651,26 +722,45 @@ fn spawn_tun_rx(
                             runtime.record_drop();
                             continue;
                         };
+                        if let Some(peer) = runtime.peers.get(&peer_hash) {
+                            if tun_tx_requires_backoff(peer.state()) {
+                                runtime.record_drop();
+                                tokio::time::sleep(Duration::from_millis(TUN_TX_BACKOFF_MILLIS)).await;
+                                tokio::task::yield_now().await;
+                                continue;
+                            }
+                        }
                         let sent = transport.lock().await.send_to_out_links(&peer_hash, packet).await;
                         if sent.is_empty() {
                             runtime.record_drop();
-                            // No active link — request one for next time.
-                            if let Some(peer) = runtime.peers.get(&peer_hash) {
-                                if let Some(desc) = peer.desc() {
-                                    let transport = transport.clone();
-                                    let runtime = runtime.clone();
-                                    tokio::spawn(async move {
-                                        request_out_link(&runtime, &transport, desc).await;
-                                    });
-                                }
-                            }
+                            log::warn!(
+                                "vpn tx drop peer={} src={} dst={} len={} no-active-link",
+                                peer_hash,
+                                packet_source(packet)
+                                    .map(|ip| ip.to_string())
+                                    .unwrap_or_else(|| "unknown".into()),
+                                dst_ip,
+                                packet.len()
+                            );
+                            tokio::time::sleep(Duration::from_millis(TUN_TX_BACKOFF_MILLIS)).await;
                         } else {
                             runtime.metrics.record_tx(packet.len());
                             if let Some(peer) = runtime.peers.get(&peer_hash) {
                                 peer.mark_tx();
                                 peer.metrics.record_tx(packet.len());
                             }
+                            log::info!(
+                                "vpn tx peer={} src={} dst={} len={} packets={}",
+                                peer_hash,
+                                packet_source(packet)
+                                    .map(|ip| ip.to_string())
+                                    .unwrap_or_else(|| "unknown".into()),
+                                dst_ip,
+                                packet.len(),
+                                sent.len()
+                            );
                         }
+                        tokio::task::yield_now().await;
                     }
                     Err(err) => {
                         runtime.set_error(format!("vpn tun recv: {err}"));
@@ -710,25 +800,42 @@ fn spawn_watchdog(
                         runtime.sync_routes();
                     }
 
-                    // Reconnect peers whose outbound link is dead.
+                    // Rescue peers whose current transport link has been stuck
+                    // too long by closing it locally and waiting for a fresh
+                    // announce before starting the next outbound attempt.
                     for peer in runtime.peers.all() {
                         if peer.hash == runtime.destination {
                             continue;
                         }
-                        if matches!(peer.state(), LinkState::Active) {
+                        let existing = transport.lock().await.find_out_link(&peer.hash).await;
+                        let Some(link) = existing else {
+                            continue;
+                        };
+                        let (status, link_age_secs) = {
+                            let link = link.lock().await;
+                            (link.status(), link.elapsed().as_secs())
+                        };
+                        sync_peer_link_state(&peer, status);
+                        if !out_link_needs_reset(status, link_age_secs) {
                             continue;
                         }
-                        if transport.lock().await.find_out_link(&peer.hash).await.is_some() {
+                        log::warn!(
+                            "vpn peer={} out-link {status:?} for {link_age_secs}s; closing until next announce",
+                            peer.hash
+                        );
+                        drop(link);
+                        if let Err(err) = transport.lock().await.link_close(peer.hash).await {
+                            log::warn!(
+                                "vpn peer={} failed to close stuck out-link: {err:?}",
+                                peer.hash
+                            );
                             continue;
                         }
-                        if let Some(desc) = peer.desc() {
-                            peer.set_state(LinkState::Pending);
-                            let transport = transport.clone();
-                            let runtime = runtime.clone();
-                            tokio::spawn(async move {
-                                request_out_link(&runtime, &transport, desc).await;
-                            });
-                        }
+                        runtime.out_links.remove(&peer.hash);
+                        peer.set_state(LinkState::Closed);
+                        peer.clear_link_attempt();
+                        peer.finish_link_request();
+                        peer.set_reconnect_cooldown(LINK_RECONNECT_COOLDOWN_SECS);
                     }
                 }
             }
@@ -749,7 +856,9 @@ async fn handle_link_data(
         // hash; in-link events do not (they are filtered on our local
         // destination and we cannot attribute them from the frame alone), so
         // we just drop unattributed CTRL frames.
-        let Some(hash) = sender_hint else { return; };
+        let Some(hash) = sender_hint else {
+            return;
+        };
         match decode_ctrl(data) {
             Ok(Ctrl::Hello { routes }) | Ok(Ctrl::Routes { routes }) => {
                 let cidrs: Vec<Ipv4Cidr> = routes.iter().filter_map(|s| s.to_cidr().ok()).collect();
@@ -777,16 +886,38 @@ async fn handle_link_data(
     match tun.send(data).await {
         Ok(_) => {
             runtime.metrics.record_rx(data.len());
-            let credited = sender_hint
-                .and_then(|h| runtime.peers.get(&h))
-                .or_else(|| {
-                    let src = packet_source(data)?;
-                    let owner = runtime.router.snapshot().resolve(src)?;
-                    runtime.peers.get(&owner)
-                });
+            let src_ip = packet_source(data);
+            let dst_ip = packet_destination(data);
+            let credited = sender_hint.and_then(|h| runtime.peers.get(&h)).or_else(|| {
+                let src = src_ip?;
+                let owner = runtime.router.snapshot().resolve(src)?;
+                runtime.peers.get(&owner)
+            });
             if let Some(peer) = credited {
                 peer.metrics.record_rx(data.len());
                 peer.mark_seen();
+                log::info!(
+                    "vpn rx peer={} src={} dst={} len={}",
+                    peer.hash,
+                    src_ip
+                        .map(|ip| ip.to_string())
+                        .unwrap_or_else(|| "unknown".into()),
+                    dst_ip
+                        .map(|ip| ip.to_string())
+                        .unwrap_or_else(|| "unknown".into()),
+                    data.len()
+                );
+            } else {
+                log::info!(
+                    "vpn rx peer=unknown src={} dst={} len={}",
+                    src_ip
+                        .map(|ip| ip.to_string())
+                        .unwrap_or_else(|| "unknown".into()),
+                    dst_ip
+                        .map(|ip| ip.to_string())
+                        .unwrap_or_else(|| "unknown".into()),
+                    data.len()
+                );
             }
         }
         Err(err) => runtime.set_error(format!("vpn tun send: {err}")),
@@ -799,12 +930,85 @@ async fn request_out_link(
     desc: reticulum::destination::DestinationDesc,
 ) {
     let hash = desc.address_hash;
-    if let Some(peer) = runtime.peers.get(&hash) {
+    let peer = runtime.peers.get(&hash);
+    let existing = transport.lock().await.find_out_link(&hash).await;
+    let existing_status = if let Some(link) = existing.as_ref() {
+        Some(link.lock().await.status())
+    } else {
+        None
+    };
+
+    if should_reuse_existing_out_link(existing_status) {
+        if let Some(link) = existing {
+            runtime.out_links.insert(hash, link);
+        }
+        return;
+    }
+
+    if let Some(peer) = peer.as_ref() {
+        let now = now_secs();
+        if link_request_on_cooldown(peer, now) {
+            log::debug!(
+                "vpn peer={} reconnect cooldown {}s active; skipping new out-link",
+                hash,
+                peer.reconnect_cooldown_until().saturating_sub(now)
+            );
+            return;
+        }
+        if !peer.try_begin_link_request() {
+            log::debug!("vpn peer={} link request already in flight", hash);
+            return;
+        }
         peer.set_state(LinkState::Pending);
         peer.reconnect_attempts.fetch_add(1, Ordering::Relaxed);
+        peer.mark_link_attempt();
     }
     let link = transport.lock().await.link(desc).await;
     runtime.out_links.insert(hash, link);
+    if let Some(peer) = peer.as_ref() {
+        peer.finish_link_request();
+    }
+}
+
+fn should_reuse_existing_out_link(existing_status: Option<LinkStatus>) -> bool {
+    matches!(
+        existing_status,
+        Some(LinkStatus::Pending | LinkStatus::Handshake | LinkStatus::Active | LinkStatus::Stale)
+    )
+}
+
+fn out_link_needs_reset(status: LinkStatus, link_age_secs: u64) -> bool {
+    match status {
+        LinkStatus::Pending | LinkStatus::Handshake => link_age_secs >= LINK_PENDING_TIMEOUT_SECS,
+        LinkStatus::Stale | LinkStatus::Closed | LinkStatus::Active => false,
+    }
+}
+
+fn link_request_on_cooldown(peer: &Peer, now: u64) -> bool {
+    peer.reconnect_cooldown_until() > now
+}
+
+fn tun_tx_requires_backoff(state: LinkState) -> bool {
+    !matches!(state, LinkState::Active)
+}
+
+fn sync_peer_link_state(peer: &Peer, status: LinkStatus) {
+    match status {
+        LinkStatus::Active => {
+            peer.set_state(LinkState::Active);
+            peer.clear_link_attempt();
+            peer.finish_link_request();
+            peer.clear_reconnect_cooldown();
+            peer.reconnect_attempts.store(0, Ordering::Relaxed);
+        }
+        LinkStatus::Pending | LinkStatus::Handshake | LinkStatus::Stale => {
+            peer.set_state(LinkState::Pending);
+        }
+        LinkStatus::Closed => {
+            peer.set_state(LinkState::Closed);
+            peer.finish_link_request();
+        }
+    }
 }
 
 // ── Packet parsing ───────────────────────────────────────────────────────────
@@ -846,7 +1050,11 @@ fn local_route_translations(
         .iter()
         .map(|r| LocalRouteTranslation {
             local: *r,
-            exported: if aliasing { export_local_route(destination, *r) } else { *r },
+            exported: if aliasing {
+                export_local_route(destination, *r)
+            } else {
+                *r
+            },
         })
         .collect()
 }
@@ -864,7 +1072,9 @@ fn export_local_route(destination: &AddressHash, route: Ipv4Cidr) -> Ipv4Cidr {
     for byte in route.first_address().octets() {
         seed = seed.wrapping_mul(131).wrapping_add(u32::from(byte));
     }
-    seed = seed.wrapping_mul(31).wrapping_add(u32::from(route.network_length()));
+    seed = seed
+        .wrapping_mul(31)
+        .wrapping_add(u32::from(route.network_length()));
 
     let mut third = 100 + (seed % 155) as u8;
     let oct = route.first_address().octets();
@@ -915,7 +1125,9 @@ fn discover_local_routes(exclude: Option<&str>) -> Vec<Ipv4Cidr> {
         if should_skip_interface(&iface.name, exclude) {
             continue;
         }
-        let IfAddr::V4(addr) = iface.addr else { continue };
+        let IfAddr::V4(addr) = iface.addr else {
+            continue;
+        };
         if addr.prefixlen == 0 {
             continue;
         }
@@ -961,7 +1173,10 @@ fn validate_network(network: Ipv4Cidr) -> Result<(), VpnRuntimeError> {
     Ok(())
 }
 
-fn derive_tunnel_ip(network: Ipv4Cidr, destination: &AddressHash) -> Result<Ipv4Addr, VpnRuntimeError> {
+fn derive_tunnel_ip(
+    network: Ipv4Cidr,
+    destination: &AddressHash,
+) -> Result<Ipv4Addr, VpnRuntimeError> {
     validate_network(network)?;
     let host_bits = 32 - u32::from(network.network_length());
     let usable = (1u64 << host_bits) - 2;
@@ -1013,8 +1228,14 @@ mod tests {
 
     #[test]
     fn merge_routes_unions_inputs() {
-        let d = vec!["192.168.10.0/24".parse().unwrap(), "10.50.0.0/24".parse().unwrap()];
-        let a = vec!["10.50.0.0/24".parse().unwrap(), "172.16.1.0/24".parse().unwrap()];
+        let d = vec![
+            "192.168.10.0/24".parse().unwrap(),
+            "10.50.0.0/24".parse().unwrap(),
+        ];
+        let a = vec![
+            "10.50.0.0/24".parse().unwrap(),
+            "172.16.1.0/24".parse().unwrap(),
+        ];
         let m = merge_routes(&d, &a);
         assert_eq!(m.len(), 3);
     }
@@ -1036,5 +1257,80 @@ mod tests {
         assert!(conflicts.contains("192.168.10.0/24"));
         assert!(conflicts.contains("192.168.142.0/24"));
         assert!(!conflicts.contains("192.168.177.0/24"));
+    }
+
+    #[test]
+    fn fresh_attempts_start_when_no_reusable_link_exists() {
+        assert!(!should_reuse_existing_out_link(None));
+        assert!(!should_reuse_existing_out_link(Some(LinkStatus::Closed)));
+    }
+
+    #[test]
+    fn reusable_link_states_do_not_restart_attempts() {
+        assert!(should_reuse_existing_out_link(Some(LinkStatus::Pending)));
+        assert!(should_reuse_existing_out_link(Some(LinkStatus::Handshake)));
+        assert!(should_reuse_existing_out_link(Some(LinkStatus::Active)));
+        assert!(should_reuse_existing_out_link(Some(LinkStatus::Stale)));
+    }
+
+    #[test]
+    fn stale_and_closed_links_are_left_to_transport_recovery() {
+        assert!(!out_link_needs_reset(LinkStatus::Stale, 0));
+        assert!(!out_link_needs_reset(LinkStatus::Closed, 0));
+    }
+
+    #[test]
+    fn pending_links_only_reset_after_timeout() {
+        assert!(!out_link_needs_reset(
+            LinkStatus::Pending,
+            LINK_PENDING_TIMEOUT_SECS - 1
+        ));
+        assert!(out_link_needs_reset(
+            LinkStatus::Pending,
+            LINK_PENDING_TIMEOUT_SECS
+        ));
+        assert!(out_link_needs_reset(
+            LinkStatus::Handshake,
+            LINK_PENDING_TIMEOUT_SECS
+        ));
+    }
+
+    #[test]
+    fn tun_tx_only_runs_without_backoff_when_link_is_active() {
+        assert!(tun_tx_requires_backoff(LinkState::Configured));
+        assert!(tun_tx_requires_backoff(LinkState::Pending));
+        assert!(tun_tx_requires_backoff(LinkState::Closed));
+        assert!(!tun_tx_requires_backoff(LinkState::Active));
+    }
+
+    #[test]
+    fn reconnect_cooldown_blocks_new_attempts_until_expiry() {
+        let peer = Peer::new(
+            hash("971a7ac9b42ce6e0faa131bb3c2e7852"),
+            "10.20.0.2".parse().unwrap(),
+            LinkState::Closed,
+        );
+        peer.set_reconnect_cooldown(LINK_RECONNECT_COOLDOWN_SECS);
+        let cooldown_until = peer.reconnect_cooldown_until();
+        assert!(link_request_on_cooldown(
+            &peer,
+            cooldown_until.saturating_sub(1)
+        ));
+        assert!(!link_request_on_cooldown(&peer, cooldown_until));
+    }
+
+    #[test]
+    fn only_one_link_request_can_be_started_at_a_time() {
+        let peer = Peer::new(
+            hash("fb08aff16ec6f5ccf0d3eb179028e9c3"),
+            "10.20.0.3".parse().unwrap(),
+            LinkState::Closed,
+        );
+        assert!(peer.try_begin_link_request());
+        assert!(peer.link_request_in_flight());
+        assert!(!peer.try_begin_link_request());
+        peer.finish_link_request();
+        assert!(!peer.link_request_in_flight());
+        assert!(peer.try_begin_link_request());
     }
 }

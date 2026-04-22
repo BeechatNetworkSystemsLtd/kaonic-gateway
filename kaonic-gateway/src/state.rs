@@ -3,11 +3,11 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI32, AtomicU64};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{broadcast, Mutex as TokioMutex};
 
 use kaonic_vpn::VpnRuntime;
 
-use crate::app_types::{NetworkPortStatusDto, RxFrameDto, ServiceStatusDto};
+use crate::app_types::{NetworkPortStatusDto, RxFrameDto, ServiceStatusDto, WsStatusEvent};
 use crate::atak::BridgeMetrics;
 use crate::audio::AudioService;
 use crate::gateway_reticulum::SharedGatewayReticulum;
@@ -29,6 +29,11 @@ fn empty_rx_buffer() -> RxFrameBuffer {
 
 fn empty_frame_stats() -> SharedFrameStats {
     Arc::new(FrameStats::default())
+}
+
+fn ws_event_bus() -> broadcast::Sender<WsStatusEvent> {
+    let (tx, _) = broadcast::channel(256);
+    tx
 }
 
 #[derive(Default)]
@@ -55,6 +60,7 @@ pub struct AppState {
     pub radio_client: Option<SharedRadioClient>,
     pub reticulum: SharedGatewayReticulum,
     pub serial: String,
+    pub ws_events: broadcast::Sender<WsStatusEvent>,
     /// Ring buffers of recent frame events, one per module (index 0 = A, 1 = B).
     pub rx_buffers: [RxFrameBuffer; 2],
     pub frame_stats: [SharedFrameStats; 2],
@@ -86,6 +92,7 @@ impl AppState {
             radio_client,
             reticulum,
             serial,
+            ws_events: ws_event_bus(),
             rx_buffers: [empty_rx_buffer(), empty_rx_buffer()],
             frame_stats: [empty_frame_stats(), empty_frame_stats()],
         }

@@ -2,8 +2,8 @@ use axum::extract::{Form, Path, State};
 use axum::http::{header, StatusCode};
 use axum::{response::IntoResponse, Json};
 use kaonic_gateway::app_types::{
-    FrameStatsDto, NetworkPortStatusDto, NetworkSnapshotDto, ReticulumSnapshotDto, RxFrameDto,
-    ServiceStatusDto,
+    AtakBridgeStatusDto, FrameStatsDto, NetworkPortStatusDto, NetworkSnapshotDto,
+    ReticulumSnapshotDto, RxFrameDto, ServiceStatusDto, SystemStatusDto, WsInterfacesDto,
 };
 use kaonic_gateway::audio::{
     AudioCardSnapshot, AudioControlSnapshot, AudioControlState, AudioError, AudioOutput,
@@ -671,31 +671,13 @@ fn map_network_error(err: NetworkError) -> (StatusCode, String) {
 // ── /api/status ─────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
-pub struct AtakBridgeStatus {
-    port: u16,
-    dest_hash: String,
-    rx_packets: u64,
-    tx_packets: u64,
-}
-
-#[derive(Serialize)]
-pub struct SystemStatus {
-    cpu_percent: f32,
-    ram_used_mb: u64,
-    ram_total_mb: u64,
-    fs_free_mb: u64,
-    fs_total_mb: u64,
-    os_details: String,
-}
-
-#[derive(Serialize)]
 pub struct StatusResponse {
     vpn_hash: String,
     wlan0_ip: Option<String>,
     usb0_ip: Option<String>,
-    atak_bridges: Vec<AtakBridgeStatus>,
+    atak_bridges: Vec<AtakBridgeStatusDto>,
     network_ports: Vec<NetworkPortStatusDto>,
-    system: SystemStatus,
+    system: SystemStatusDto,
     services: Vec<ServiceStatusDto>,
     radio_modules: Vec<RadioModuleConfig>,
     reticulum: ReticulumSnapshotDto,
@@ -712,19 +694,6 @@ pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
 /// Build a `StatusResponse` from shared application state. Used by both the REST handler
 /// and the WebSocket streamer.
 pub async fn build_status(state: &AppState) -> StatusResponse {
-    use std::sync::atomic::Ordering;
-
-    let atak_bridges = state
-        .atak_metrics
-        .iter()
-        .map(|m| AtakBridgeStatus {
-            port: m.port,
-            dest_hash: m.dest_hash.get().cloned().unwrap_or_default(),
-            rx_packets: m.rx_packets.load(Ordering::Relaxed),
-            tx_packets: m.tx_packets.load(Ordering::Relaxed),
-        })
-        .collect();
-
     let radio_modules = state
         .settings
         .lock()
@@ -732,50 +701,23 @@ pub async fn build_status(state: &AppState) -> StatusResponse {
         .and_then(|s| s.load_config().ok())
         .map(|c| c.radio.module_configs.to_vec())
         .unwrap_or_default();
-    let services = read_gateway_services();
-    let network_ports = state.network_ports(&services);
-
-    let rx_frames = [
-        state.rx_buffers[0].lock().await.iter().cloned().collect(),
-        state.rx_buffers[1].lock().await.iter().cloned().collect(),
-    ];
-    let frame_stats = [
-        FrameStatsDto {
-            rx_frames: state.frame_stats[0].rx_frames.load(Ordering::Relaxed),
-            rx_bytes: state.frame_stats[0].rx_bytes.load(Ordering::Relaxed),
-            tx_frames: state.frame_stats[0].tx_frames.load(Ordering::Relaxed),
-            tx_bytes: state.frame_stats[0].tx_bytes.load(Ordering::Relaxed),
-            last_rssi: if state.frame_stats[0].rx_frames.load(Ordering::Relaxed) > 0 {
-                Some(state.frame_stats[0].last_rssi.load(Ordering::Relaxed) as i8)
-            } else {
-                None
-            },
-        },
-        FrameStatsDto {
-            rx_frames: state.frame_stats[1].rx_frames.load(Ordering::Relaxed),
-            rx_bytes: state.frame_stats[1].rx_bytes.load(Ordering::Relaxed),
-            tx_frames: state.frame_stats[1].tx_frames.load(Ordering::Relaxed),
-            tx_bytes: state.frame_stats[1].tx_bytes.load(Ordering::Relaxed),
-            last_rssi: if state.frame_stats[1].rx_frames.load(Ordering::Relaxed) > 0 {
-                Some(state.frame_stats[1].last_rssi.load(Ordering::Relaxed) as i8)
-            } else {
-                None
-            },
-        },
-    ];
-    let reticulum = state.reticulum.snapshot().await;
-    let vpn = match &state.vpn {
-        Some(vpn) => vpn.snapshot().await,
-        None => VpnSnapshot::default(),
-    };
+    let services = build_services();
+    let network_ports = build_network_ports(state, &services);
+    let interfaces = build_ws_interfaces();
+    let atak_bridges = build_atak_bridges(state);
+    let system = build_system_status().await;
+    let rx_frames = build_all_radio_frames(state).await;
+    let frame_stats = build_all_frame_stats(state);
+    let reticulum = build_reticulum_snapshot(state).await;
+    let vpn = build_vpn_snapshot(state).await;
 
     StatusResponse {
         vpn_hash: state.vpn_hash.clone(),
-        wlan0_ip: read_interface_ipv4("wlan0"),
-        usb0_ip: read_interface_ipv4("usb0"),
+        wlan0_ip: interfaces.wlan0_ip,
+        usb0_ip: interfaces.usb0_ip,
         atak_bridges,
         network_ports,
-        system: read_system_status_async().await,
+        system,
         services,
         radio_modules,
         reticulum,
@@ -785,15 +727,97 @@ pub async fn build_status(state: &AppState) -> StatusResponse {
     }
 }
 
-async fn read_system_status_async() -> SystemStatus {
+pub fn build_ws_interfaces() -> WsInterfacesDto {
+    WsInterfacesDto {
+        wlan0_ip: read_interface_ipv4("wlan0"),
+        usb0_ip: read_interface_ipv4("usb0"),
+    }
+}
+
+pub fn build_atak_bridges(state: &AppState) -> Vec<AtakBridgeStatusDto> {
+    use std::sync::atomic::Ordering;
+
+    state
+        .atak_metrics
+        .iter()
+        .map(|m| AtakBridgeStatusDto {
+            port: m.port,
+            dest_hash: m.dest_hash.get().cloned().unwrap_or_default(),
+            rx_packets: m.rx_packets.load(Ordering::Relaxed),
+            tx_packets: m.tx_packets.load(Ordering::Relaxed),
+        })
+        .collect()
+}
+
+pub fn build_services() -> Vec<ServiceStatusDto> {
+    read_gateway_services()
+}
+
+pub fn build_network_ports(
+    state: &AppState,
+    services: &[ServiceStatusDto],
+) -> Vec<NetworkPortStatusDto> {
+    state.network_ports(services)
+}
+
+pub async fn build_system_status() -> SystemStatusDto {
     let (ram_used_mb, ram_total_mb) = read_mem_mb();
     let (fs_free_mb, fs_total_mb) = read_fs_mb();
-    SystemStatus {
+    SystemStatusDto {
         cpu_percent: read_cpu_percent_async().await,
         ram_used_mb,
         ram_total_mb,
         fs_free_mb,
         fs_total_mb,
         os_details: read_os_details(),
+    }
+}
+
+pub fn build_frame_stats(state: &AppState, module: usize) -> FrameStatsDto {
+    use std::sync::atomic::Ordering;
+
+    let module = module.min(1);
+    FrameStatsDto {
+        rx_frames: state.frame_stats[module].rx_frames.load(Ordering::Relaxed),
+        rx_bytes: state.frame_stats[module].rx_bytes.load(Ordering::Relaxed),
+        tx_frames: state.frame_stats[module].tx_frames.load(Ordering::Relaxed),
+        tx_bytes: state.frame_stats[module].tx_bytes.load(Ordering::Relaxed),
+        last_rssi: if state.frame_stats[module].rx_frames.load(Ordering::Relaxed) > 0 {
+            Some(state.frame_stats[module].last_rssi.load(Ordering::Relaxed) as i8)
+        } else {
+            None
+        },
+    }
+}
+
+pub fn build_all_frame_stats(state: &AppState) -> [FrameStatsDto; 2] {
+    [build_frame_stats(state, 0), build_frame_stats(state, 1)]
+}
+
+pub async fn build_radio_frames(state: &AppState, module: usize) -> Vec<RxFrameDto> {
+    let module = module.min(1);
+    state.rx_buffers[module]
+        .lock()
+        .await
+        .iter()
+        .cloned()
+        .collect()
+}
+
+pub async fn build_all_radio_frames(state: &AppState) -> [Vec<RxFrameDto>; 2] {
+    [
+        build_radio_frames(state, 0).await,
+        build_radio_frames(state, 1).await,
+    ]
+}
+
+pub async fn build_reticulum_snapshot(state: &AppState) -> ReticulumSnapshotDto {
+    state.reticulum.snapshot().await
+}
+
+pub async fn build_vpn_snapshot(state: &AppState) -> VpnSnapshot {
+    match &state.vpn {
+        Some(vpn) => vpn.snapshot().await,
+        None => VpnSnapshot::default(),
     }
 }

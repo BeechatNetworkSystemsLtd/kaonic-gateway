@@ -999,12 +999,16 @@ const VPN_WS_JS: &str = r#"
         ws.onmessage = function(ev) {
             try {
                 if (shouldPause()) { return; }
-                var payload = JSON.parse(ev.data) || {};
-                var vpn = payload.vpn || {};
-
+                var msg = JSON.parse(ev.data) || {};
+                if (msg.type === 'interfaces') {
+                    var interfaces = msg.data || {};
+                    setText('vpn-wlan0-ip', interfaces.wlan0_ip || '\u2014');
+                    setText('vpn-usb0-ip', interfaces.usb0_ip || '\u2014');
+                    return;
+                }
+                if (msg.type !== 'vpn') { return; }
+                var vpn = msg.data || {};
                 updateBanner(vpn);
-                setText('vpn-wlan0-ip', payload.wlan0_ip || '\u2014');
-                setText('vpn-usb0-ip', payload.usb0_ip || '\u2014');
                 renderLocalRoutesList(vpn.local_routes || []);
                 setAdvertisedRoutes(vpn.advertised_routes || []);
                 renderSetupCommands(vpn.remote_routes || []);

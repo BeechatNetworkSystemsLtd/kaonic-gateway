@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use cidr::Ipv4Cidr;
@@ -50,6 +50,17 @@ pub struct Peer {
     pub route_expires_ts: AtomicU64,
     pub last_tx_ts: AtomicU64,
     pub reconnect_attempts: AtomicU32,
+    /// Wall-clock seconds when the current out-link request attempt started.
+    /// Zero when no attempt is in flight (i.e. link is Active or absent).
+    /// The watchdog uses this to detect links that never activate — reticulum
+    /// keeps re-sending the link request forever on its own, so without a
+    /// timeout on our side a lost proof reply would wedge the peer permanently.
+    pub link_attempt_ts: AtomicU64,
+    /// Guards the actual transport.link() call so announce-driven opens and
+    /// watchdog recovery do not overlap.
+    pub link_request_in_flight: AtomicBool,
+    /// Earliest wall-clock second when a new out-link request may start.
+    pub reconnect_cooldown_until_ts: AtomicU64,
     pub last_error: RwLock<Option<String>>,
     /// Per-peer traffic counters + cached tx_bps/rx_bps.
     pub metrics: Metrics,
@@ -67,9 +78,51 @@ impl Peer {
             route_expires_ts: AtomicU64::new(0),
             last_tx_ts: AtomicU64::new(0),
             reconnect_attempts: AtomicU32::new(0),
+            link_attempt_ts: AtomicU64::new(0),
+            link_request_in_flight: AtomicBool::new(false),
+            reconnect_cooldown_until_ts: AtomicU64::new(0),
             last_error: RwLock::new(None),
             metrics: Metrics::default(),
         })
+    }
+
+    /// Stamp the start time of a fresh link-request attempt. Unconditional:
+    /// a forced teardown + re-request should reset the clock so the watchdog
+    /// times the *new* attempt, not the wedged old one.
+    pub fn mark_link_attempt(&self) {
+        self.link_attempt_ts.store(now_secs(), Ordering::Relaxed);
+    }
+
+    pub fn clear_link_attempt(&self) {
+        self.link_attempt_ts.store(0, Ordering::Relaxed);
+    }
+
+    pub fn try_begin_link_request(&self) -> bool {
+        self.link_request_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub fn finish_link_request(&self) {
+        self.link_request_in_flight.store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub fn link_request_in_flight(&self) -> bool {
+        self.link_request_in_flight.load(Ordering::Acquire)
+    }
+
+    pub fn set_reconnect_cooldown(&self, delay_secs: u64) {
+        self.reconnect_cooldown_until_ts
+            .store(now_secs().saturating_add(delay_secs), Ordering::Relaxed);
+    }
+
+    pub fn clear_reconnect_cooldown(&self) {
+        self.reconnect_cooldown_until_ts.store(0, Ordering::Relaxed);
+    }
+
+    pub fn reconnect_cooldown_until(&self) -> u64 {
+        self.reconnect_cooldown_until_ts.load(Ordering::Relaxed)
     }
 
     pub fn set_state(&self, state: LinkState) {
@@ -106,10 +159,6 @@ impl Peer {
 
     pub fn set_desc(&self, desc: DestinationDesc) {
         *self.desc.write() = Some(desc);
-    }
-
-    pub fn desc(&self) -> Option<DestinationDesc> {
-        *self.desc.read()
     }
 }
 

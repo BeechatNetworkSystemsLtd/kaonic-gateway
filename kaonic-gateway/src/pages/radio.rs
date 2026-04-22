@@ -131,40 +131,40 @@ const RADIO_WS_JS: &str = r#"
         ws.onmessage = function(ev) {
             try {
                 if (shouldPauseLiveUpdates()) { return; }
-                var d = JSON.parse(ev.data);
-                var frames = d.rx_frames || [[], []];
-                var frameStats = d.frame_stats || [{}, {}];
-                [0, 1].forEach(function(i) {
-                    var tbody = document.getElementById('rx-frames-' + i);
-                    var stats = document.getElementById('rx-stats-summary-' + i);
-                    var rssi = document.getElementById('rx-stats-rssi-' + i);
-                    if (!tbody || !stats || !rssi) return;
-                    var list = frames[i] || [];
-                    var totals = frameStats[i] || {};
-                    var rxCount = Number(totals.rx_frames) || 0;
-                    var rxBytes = Number(totals.rx_bytes) || 0;
-                    var txCount = Number(totals.tx_frames) || 0;
-                    var txBytes = Number(totals.tx_bytes) || 0;
-                    stats.textContent = 'RX: ' + rxCount + ' frames, ' + formatKBytes(rxBytes)
-                        + ' KB | TX: ' + txCount + ' frames, ' + formatKBytes(txBytes) + ' KB';
+                var msg = JSON.parse(ev.data) || {};
+                if (msg.type !== 'radio_frames') { return; }
+                var d = msg.data || {};
+                var i = Number(d.module) || 0;
+                var tbody = document.getElementById('rx-frames-' + i);
+                var stats = document.getElementById('rx-stats-summary-' + i);
+                var rssi = document.getElementById('rx-stats-rssi-' + i);
+                if (!tbody || !stats || !rssi) return;
+                var list = d.frames || [];
+                var totals = d.stats || {};
+                var rxCount = Number(totals.rx_frames) || 0;
+                var rxBytes = Number(totals.rx_bytes) || 0;
+                var txCount = Number(totals.tx_frames) || 0;
+                var txBytes = Number(totals.tx_bytes) || 0;
+                stats.textContent = 'RX: ' + rxCount + ' frames, ' + formatKBytes(rxBytes)
+                    + ' KB | TX: ' + txCount + ' frames, ' + formatKBytes(txBytes) + ' KB';
                     rssi.textContent = totals.last_rssi !== null && totals.last_rssi !== undefined
                         ? 'Last RSSI: ' + totals.last_rssi + ' dBm'
                         : 'Last RSSI: —';
-                    if (list.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="5" class="frames-empty">No frames observed</td></tr>';
-                        return;
-                    }
-                    tbody.innerHTML = list.map(function(f) {
-                        var t = formatFrameTime(f.ts);
-                        var dir = f.direction === 'tx' ? '\u2191' : '\u2193';
-                        var trxClass = f.direction === 'tx' ? 'td-trx td-trx-tx' : 'td-trx td-trx-rx';
-                        return '<tr><td class="' + trxClass + '">' + dir + '</td>'
-                             + '<td class="td-time">' + t + '</td>'
-                               + '<td class="' + rssiClass(f) + '">' + f.rssi + ' dBm</td>'
-                               + '<td class="td-len">' + f.len + ' B</td>'
-                               + '<td class="td-hex">' + (f.hex || '—') + '</td></tr>';
-                    }).join('');
-                });
+                if (list.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="6" class="frames-empty">No frames observed</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = list.map(function(f) {
+                    var t = formatFrameTime(f.ts);
+                    var dir = f.direction === 'tx' ? '\u2191' : '\u2193';
+                    var trxClass = f.direction === 'tx' ? 'td-trx td-trx-tx' : 'td-trx td-trx-rx';
+                    return '<tr><td class="' + trxClass + '">' + dir + '</td>'
+                         + '<td class="td-time">' + t + '</td>'
+                            + '<td class="' + rssiClass(f) + '">' + f.rssi + ' dBm</td>'
+                            + '<td class="td-len">' + f.len + ' B</td>'
+                            + '<td class="td-hex td-preview">' + (f.hex || '—') + '</td>'
+                            + '<td class="td-hex td-preview">' + (f.ascii || '—') + '</td></tr>';
+                }).join('');
             } catch(e) {}
         };
         ws.onclose = function() {
@@ -226,11 +226,12 @@ fn RadioPanel(index: usize, module: RadioModuleConfigDto) -> impl IntoView {
                                 <th>"RSSI"</th>
                                 <th>"Len"</th>
                                 <th>"Preview"</th>
+                                <th>"ASCII"</th>
                             </tr>
                         </thead>
                         <tbody id=format!("rx-frames-{index}")>
                             <tr>
-                                <td colspan="5" class="frames-empty">"Waiting for frames…"</td>
+                                <td colspan="6" class="frames-empty">"Waiting for frames…"</td>
                             </tr>
                         </tbody>
                     </table>

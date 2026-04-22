@@ -32,7 +32,8 @@ pub struct RxFrameDto {
     pub rssi: i8,
     pub len: u16,
     pub hex: String, // hex preview of first 16 bytes
-    pub ts: u64,     // unix timestamp (seconds)
+    pub ascii: String,
+    pub ts: u64, // unix timestamp (seconds)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -109,6 +110,32 @@ pub struct ReticulumSnapshotDto {
     pub incoming_links: Vec<ReticulumLinkDto>,
     pub outgoing_links: Vec<ReticulumLinkDto>,
     pub events: Vec<ReticulumEventDto>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WsInterfacesDto {
+    pub wlan0_ip: Option<String>,
+    pub usb0_ip: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WsRadioFramesDto {
+    pub module: usize,
+    pub frames: Vec<RxFrameDto>,
+    pub stats: FrameStatsDto,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum WsStatusEvent {
+    Interfaces(WsInterfacesDto),
+    AtakBridges(Vec<AtakBridgeStatusDto>),
+    NetworkPorts(Vec<NetworkPortStatusDto>),
+    System(SystemStatusDto),
+    Services(Vec<ServiceStatusDto>),
+    Vpn(VpnSnapshot),
+    Reticulum(ReticulumSnapshotDto),
+    RadioFrames(WsRadioFramesDto),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
