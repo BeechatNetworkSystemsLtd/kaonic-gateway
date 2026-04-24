@@ -1,5 +1,5 @@
 pub(crate) mod handlers;
-mod update;
+mod installer;
 pub(crate) mod ws;
 
 use std::net::SocketAddr;
@@ -8,7 +8,7 @@ use axum::extract::Path;
 use axum::http::header;
 use axum::response::IntoResponse;
 use axum::{
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use leptos::config::LeptosOptions;
@@ -78,8 +78,33 @@ pub async fn serve(state: AppState, addr: SocketAddr) {
         )
         .route("/api/vpn/ping", post(handlers::post_vpn_ping))
         .route("/api/vpn/speed-test", post(handlers::post_vpn_speed_test))
-        .route("/api/update/{target}/version", get(update::get_version))
-        .route("/api/update/{target}/upload", post(update::upload_update))
+        .route(
+            "/api/installer/{target}/version",
+            get(installer::get_version),
+        )
+        .route(
+            "/api/installer/{target}/upload",
+            post(installer::upload_update),
+        )
+        .route("/api/plugins", get(installer::list_plugins))
+        .route("/api/plugins/install", post(installer::install_plugin))
+        .route(
+            "/api/plugins/{plugin_id}/upload",
+            post(installer::upload_plugin),
+        )
+        .route(
+            "/api/plugins/{plugin_id}/start",
+            post(installer::start_plugin),
+        )
+        .route(
+            "/api/plugins/{plugin_id}/stop",
+            post(installer::stop_plugin),
+        )
+        .route(
+            "/api/plugins/{plugin_id}/restart",
+            post(installer::restart_plugin),
+        )
+        .route("/api/plugins/{plugin_id}", delete(installer::delete_plugin))
         .route("/network/wifi/mode", post(handlers::post_wifi_mode))
         .route("/network/wifi/connect", post(handlers::post_wifi_connect))
         .route("/api/ws/status", get(ws::ws_status))

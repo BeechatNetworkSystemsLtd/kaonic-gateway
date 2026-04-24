@@ -933,6 +933,14 @@ select.field-input {
   min-height: 360px;
 }
 
+.plugins-detail-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  justify-content: flex-end;
+}
+
 .plugins-detail-name {
   font-size: 28px;
   line-height: 1.15;
@@ -972,6 +980,10 @@ select.field-input {
 
 .plugins-action-status.warn {
   color: var(--warn);
+}
+
+.plugins-file-input {
+  display: none;
 }
 
 .plugins-empty {

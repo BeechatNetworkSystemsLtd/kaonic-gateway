@@ -6,6 +6,7 @@ use std::{fs, io};
 use sha2::{Digest, Sha256};
 
 /// Describes one updatable target on the system.
+#[derive(Debug)]
 pub struct Target {
     /// Short name used in API paths ("commd" or "gateway").
     pub name: &'static str,

@@ -33,7 +33,7 @@ async fn fetch_versions() -> Result<Versions, ServerFnError> {
     let client = reqwest::Client::new();
 
     let commd = match client
-        .get(format!("{BASE}/api/update/commd/version"))
+        .get(format!("{BASE}/api/installer/commd/version"))
         .send()
         .await
     {
@@ -48,7 +48,7 @@ async fn fetch_versions() -> Result<Versions, ServerFnError> {
     };
 
     let gateway = match client
-        .get(format!("{BASE}/api/update/gateway/version"))
+        .get(format!("{BASE}/api/installer/gateway/version"))
         .send()
         .await
     {
@@ -103,7 +103,7 @@ function kaonic_upload(target, inputId, statusId) {
     form.append('file', input.files[0]);
     status.textContent = 'Uploading…';
     status.className = 'update-status pending';
-    fetch('/api/update/' + target + '/upload', { method: 'POST', body: form })
+    fetch('/api/installer/' + target + '/upload', { method: 'POST', body: form })
         .then(function(r) { return r.json(); })
         .then(function(d) {
             status.textContent = d.detail || 'Done';

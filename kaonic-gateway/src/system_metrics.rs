@@ -4,7 +4,7 @@ pub const GATEWAY_SERVICE_UNITS: [&str; 4] = [
     "kaonic-commd.service",
     "kaonic-factory.service",
     "kaonic-gateway.service",
-    "kaonic-update.service",
+    "kaonic-installer.service",
 ];
 
 pub async fn read_cpu_percent_async() -> f32 {
@@ -229,7 +229,7 @@ fn service_brief_name(unit: &str) -> &'static str {
         "kaonic-commd.service" => "Radio control",
         "kaonic-factory.service" => "Factory setup",
         "kaonic-gateway.service" => "Web gateway",
-        "kaonic-update.service" => "Update agent",
+        "kaonic-installer.service" => "Installer agent",
         _ => "Service",
     }
 }

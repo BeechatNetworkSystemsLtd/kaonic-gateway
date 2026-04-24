@@ -77,6 +77,33 @@ pub struct ServiceStatusDto {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PluginSummaryDto {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub version: String,
+    pub service: String,
+    pub developer: String,
+    pub binary_name: String,
+    pub bin_path: Option<String>,
+    pub sha256: String,
+    pub install_dir: String,
+    pub package_path: String,
+    pub official: bool,
+    pub enabled: bool,
+    pub removable: bool,
+    pub target_name: Option<String>,
+    pub status: String,
+    pub installed_at: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PluginMessageDto {
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NetworkPortStatusDto {
     pub name: String,
     pub protocol: String,

@@ -19,7 +19,7 @@ async fn fetch_topbar_info() -> Result<TopbarInfo, ServerFnError> {
     let state = leptos::context::use_context::<AppState>()
         .ok_or_else(|| ServerFnError::new("missing AppState"))?;
     let gateway_version = match reqwest::Client::new()
-        .get("http://127.0.0.1:8682/api/update/gateway/version")
+        .get("http://127.0.0.1:8682/api/installer/gateway/version")
         .send()
         .await
     {
