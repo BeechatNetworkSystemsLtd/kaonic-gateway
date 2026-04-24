@@ -1,0 +1,13 @@
+[Unit]
+Description=Kaonic Sample Plugin
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/etc/kaonic/plugins/kaonic-plugin-sample/current/kaonic-plugin-sample
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

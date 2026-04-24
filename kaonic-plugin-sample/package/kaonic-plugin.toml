@@ -1,0 +1,6 @@
+name = "Kaonic Sample Plugin"
+description = "Reference plugin package used to prototype installer-side plugin lifecycle management."
+version = "0.1.0"
+service = "kaonic-plugin-sample.service"
+developer = "Beechat Network Systems Ltd"
+bin_path = "/usr/bin/kaonic-plugin-sample"
