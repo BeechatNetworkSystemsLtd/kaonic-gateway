@@ -1,8 +1,10 @@
 #![recursion_limit = "512"]
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{Multipart, Path, State};
@@ -11,6 +13,7 @@ use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use clap::Parser;
+use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 
@@ -25,6 +28,7 @@ const PLUGINS_DIR: &str = "/etc/kaonic/plugins";
 const PLUGINS_DB: &str = "/etc/kaonic/plugins/kaonic-plugins.db";
 const SYSTEMD_DIR: &str = "/etc/systemd/system";
 const MAX_UPLOAD_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
+const SYSTEMD_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 
 /// kaonic-installer: standalone installer server for kaonic packages and plugins.
 #[derive(Parser)]
@@ -42,6 +46,7 @@ struct AppState {
     plugins_db: PathBuf,
     systemd_dir: PathBuf,
     cert_path: PathBuf,
+    systemd_cache: Arc<RwLock<HashMap<String, plugins::PluginSystemdStatus>>>,
 }
 
 fn make_targets(meta_dir: &str, bin_dir: &str) -> (Arc<Target>, Arc<Target>) {
@@ -78,25 +83,18 @@ async fn main() {
     validate_on_boot(&commd);
     validate_on_boot(&gateway);
 
+    let systemd_cache = Arc::new(RwLock::new(HashMap::new()));
+    let plugins_root = PathBuf::from(PLUGINS_DIR);
     let state = AppState {
         core_plugins: vec![
-            plugins::CorePluginSpec::new(
-                commd.clone(),
-                "Kaonic Radio Driver",
-                "Built-in radio control service managed by the platform installer.",
-                "Beechat Network Systems Ltd",
-            ),
-            plugins::CorePluginSpec::new(
-                gateway.clone(),
-                "Kaonic Gateway",
-                "Built-in Kaonic web gateway service managed by the platform installer.",
-                "Beechat Network Systems Ltd",
-            ),
+            plugins::CorePluginSpec::new(commd.clone(), &plugins_root),
+            plugins::CorePluginSpec::new(gateway.clone(), &plugins_root),
         ],
-        plugins_root: PathBuf::from(PLUGINS_DIR),
+        plugins_root,
         plugins_db: PathBuf::from(PLUGINS_DB),
         systemd_dir: PathBuf::from(SYSTEMD_DIR),
         cert_path: PathBuf::from(META_DIR).join("beechat-ota.pub.pem"),
+        systemd_cache,
     };
 
     if let Err(err) = plugins::initialize_store(
@@ -110,6 +108,10 @@ async fn main() {
     } else if let Err(err) = plugins::log_boot_inventory(&state.plugins_root, &state.plugins_db) {
         log::error!("failed to log plugin boot inventory: {err}");
     }
+    if let Err(err) = refresh_systemd_cache(&state).await {
+        log::error!("failed to refresh cached plugin systemd state: {err}");
+    }
+    tokio::spawn(run_systemd_refresh_loop(state.clone()));
 
     let app = Router::new()
         .route("/api/plugins", get(handle_plugins_list))
@@ -138,19 +140,10 @@ async fn main() {
 
 async fn handle_plugins_list(State(state): State<AppState>) -> impl IntoResponse {
     log::debug!("listing plugins");
-    let plugins_root = state.plugins_root.clone();
     let plugins_db = state.plugins_db.clone();
-    let cert_path = state.cert_path.clone();
-    let core_plugins = state.core_plugins.clone();
-    let systemd_dir = state.systemd_dir.clone();
+    let systemd_cache = state.systemd_cache.read().await.clone();
     match tokio::task::spawn_blocking(move || {
-        plugins::list_plugins(
-            &plugins_root,
-            &plugins_db,
-            &systemd_dir,
-            Some(&cert_path),
-            &core_plugins,
-        )
+        plugins::list_plugins_with_cached_status(&plugins_db, &systemd_cache)
     })
     .await
     {
@@ -204,6 +197,9 @@ async fn handle_plugin_install(
     {
         Ok(Ok(response)) => {
             log::info!("plugin install completed detail={}", response.detail);
+            if let Err(err) = refresh_systemd_cache(&state).await {
+                log::warn!("failed to refresh cached plugin systemd state after install: {err}");
+            }
             Json(response).into_response()
         }
         Ok(Err(err)) => plugin_error_response("install plugin", err),
@@ -259,6 +255,9 @@ async fn handle_plugin_upload(
                 plugin_id,
                 response.detail
             );
+            if let Err(err) = refresh_systemd_cache(&state).await {
+                log::warn!("failed to refresh cached plugin systemd state after update: {err}");
+            }
             Json(response).into_response()
         }
         Ok(Err(err)) => plugin_error_response(&format!("update plugin {plugin_id}"), err),
@@ -314,6 +313,9 @@ async fn handle_plugin_delete(
                 plugin_id,
                 response.detail
             );
+            if let Err(err) = refresh_systemd_cache(&state).await {
+                log::warn!("failed to refresh cached plugin systemd state after delete: {err}");
+            }
             Json(response).into_response()
         }
         Ok(Err(err)) => plugin_error_response(&format!("delete plugin {plugin_id}"), err),
@@ -348,6 +350,13 @@ async fn handle_plugin_action(
                 action_name,
                 response.detail
             );
+            if let Err(err) = refresh_systemd_cache(&state).await {
+                log::warn!(
+                    "failed to refresh cached plugin systemd state after action={} plugin_id={}: {err}",
+                    action_name,
+                    plugin_id
+                );
+            }
             Json(response).into_response()
         }
         Ok(Err(err)) => plugin_error_response(
@@ -367,6 +376,32 @@ async fn handle_plugin_action(
                 .into_response()
         }
     }
+}
+
+async fn run_systemd_refresh_loop(state: AppState) {
+    let mut interval = tokio::time::interval(SYSTEMD_REFRESH_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        if let Err(err) = refresh_systemd_cache(&state).await {
+            log::warn!("background plugin systemd refresh failed: {err}");
+        }
+    }
+}
+
+async fn refresh_systemd_cache(state: &AppState) -> Result<(), plugins::PluginError> {
+    let plugins_db = state.plugins_db.clone();
+
+    let cache = tokio::task::spawn_blocking(move || plugins::refresh_systemd_status_cache(&plugins_db))
+        .await
+    .map_err(|err| plugins::PluginError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        detail: format!("plugin cache task panic: {err}"),
+    })??;
+
+    *state.systemd_cache.write().await = cache;
+    Ok(())
 }
 
 async fn read_upload_bytes(mut multipart: Multipart) -> Result<Bytes, axum::response::Response> {

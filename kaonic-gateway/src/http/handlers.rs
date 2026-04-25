@@ -10,7 +10,7 @@ use kaonic_gateway::audio::{
     AudioCardSnapshot, AudioControlSnapshot, AudioControlState, AudioError, AudioOutput,
 };
 use kaonic_gateway::config::GatewayConfig;
-use kaonic_gateway::network::{read_interface_ipv4, NetworkError, WifiMode};
+use kaonic_gateway::network::{read_interface_ipv4, NetworkError, WifiAntenna, WifiMode};
 use kaonic_gateway::radio::{transmit_test_frame, RadioModuleConfig};
 use kaonic_gateway::system_metrics::{
     is_gateway_service_unit, read_cpu_percent_async, read_fs_mb, read_gateway_services,
@@ -704,6 +704,11 @@ pub struct WifiModeForm {
 }
 
 #[derive(Deserialize)]
+pub struct WifiAntennaForm {
+    pub antenna: String,
+}
+
+#[derive(Deserialize)]
 pub struct WifiConnectForm {
     pub ssid: String,
     pub psk: String,
@@ -723,6 +728,25 @@ pub async fn post_wifi_mode(
     state
         .network
         .set_wifi_mode(mode)
+        .await
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(map_network_error)
+}
+
+pub async fn post_wifi_antenna(
+    State(state): State<AppState>,
+    Form(form): Form<WifiAntennaForm>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let antenna = WifiAntenna::parse(&form.antenna).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            NetworkError::InvalidAntenna(form.antenna).to_string(),
+        )
+    })?;
+
+    state
+        .network
+        .set_wifi_antenna(antenna)
         .await
         .map(|_| StatusCode::NO_CONTENT)
         .map_err(map_network_error)
@@ -754,6 +778,7 @@ pub async fn get_network_snapshot(
 fn map_network_error(err: NetworkError) -> (StatusCode, String) {
     let status = match err {
         NetworkError::InvalidMode(_)
+        | NetworkError::InvalidAntenna(_)
         | NetworkError::InvalidSsid
         | NetworkError::InvalidPsk
         | NetworkError::MissingStaConfig => StatusCode::BAD_REQUEST,

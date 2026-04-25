@@ -7,7 +7,6 @@ const PLUGINS_JS: &str = r#"
     var state = {
         selectedId: '',
         plugins: [],
-        systemdSamples: {},
         installerVersion: '',
         loadError: '',
         loading: false,
@@ -168,34 +167,6 @@ const PLUGINS_JS: &str = r#"
         return formatFileSize(Number(size));
     }
 
-    function formatCpuLoad(value) {
-        if (value == null || Number.isNaN(Number(value))) { return '—'; }
-        return (Math.round(Number(value) * 10) / 10).toFixed(1) + '%';
-    }
-
-    function enrichRealtimeMetrics(plugins) {
-        var now = Date.now();
-        plugins.forEach(function(plugin) {
-            var status = plugin && plugin.systemd_status;
-            if (!status) { return; }
-            var cpuNow = status.cpu_usage_nsec;
-            var previous = state.systemdSamples[plugin.id];
-            var cpuLoadPercent = null;
-            if (previous && cpuNow != null && previous.cpuUsageNsec != null) {
-                var elapsedMs = now - previous.timestamp;
-                var cpuDelta = Number(cpuNow) - Number(previous.cpuUsageNsec);
-                if (elapsedMs > 0 && cpuDelta >= 0) {
-                    cpuLoadPercent = (cpuDelta / (elapsedMs * 1000000)) * 100;
-                }
-            }
-            status.cpu_load_percent = cpuLoadPercent;
-            state.systemdSamples[plugin.id] = {
-                timestamp: now,
-                cpuUsageNsec: cpuNow
-            };
-        });
-    }
-
     function setModalFeedback(text, kind) {
         state.modal.feedback = text || '';
         state.modal.feedbackKind = kind || '';
@@ -328,7 +299,6 @@ const PLUGINS_JS: &str = r#"
             .then(function(plugins) {
                 state.plugins = Array.isArray(plugins) ? plugins : [];
                 state.loadError = '';
-                enrichRealtimeMetrics(state.plugins);
                 ensureSelection();
                 render();
             })
@@ -421,7 +391,7 @@ const PLUGINS_JS: &str = r#"
                 + '<div class=\"plugins-runtime-card\">'
                     + '<div class=\"card-header\">'
                         + '<span class=\"card-title\">Live Service State</span>'
-                        + '<span class=\"badge\">Auto refresh 5s</span>'
+                        + '<span class=\"badge\">Auto refresh 15s</span>'
                     + '</div>'
                     + '<div class=\"plugins-runtime-grid\">'
                         + '<div class=\"info-row\"><span class=\"info-label\">Active state</span><span class=\"info-value\">' + escaped(detailValue(plugin.systemd_status.active_state)) + '</span></div>'
@@ -430,7 +400,6 @@ const PLUGINS_JS: &str = r#"
                         + '<div class=\"info-row\"><span class=\"info-label\">Main PID</span><span class=\"info-value\">' + escaped(detailValue(plugin.systemd_status.main_pid)) + '</span></div>'
                         + '<div class=\"info-row\"><span class=\"info-label\">Tasks</span><span class=\"info-value\">' + escaped(detailValue(plugin.systemd_status.tasks_current)) + '</span></div>'
                         + '<div class=\"info-row\"><span class=\"info-label\">Memory</span><span class=\"info-value\">' + escaped(formatMemorySize(plugin.systemd_status.memory_current)) + '</span></div>'
-                        + '<div class=\"info-row\"><span class=\"info-label\">CPU load</span><span class=\"info-value\">' + escaped(formatCpuLoad(plugin.systemd_status.cpu_load_percent)) + '</span></div>'
                     + '</div>'
                 + '</div>';
         }
@@ -685,7 +654,7 @@ const PLUGINS_JS: &str = r#"
             return;
         }
         loadPlugins('', '', { background: true });
-    }, 5000);
+    }, 15000);
 
     loadInstallerVersion();
     loadPlugins();
