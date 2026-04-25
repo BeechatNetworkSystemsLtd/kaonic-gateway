@@ -3,8 +3,10 @@ use leptos_router::components::A;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
-struct NavbarVersionInfo {
+struct NavbarPluginInfo {
+    id: String,
     version: Option<String>,
+    target_name: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -19,15 +21,23 @@ async fn fetch_topbar_info() -> Result<TopbarInfo, ServerFnError> {
     let state = leptos::context::use_context::<AppState>()
         .ok_or_else(|| ServerFnError::new("missing AppState"))?;
     let gateway_version = match reqwest::Client::new()
-        .get("http://127.0.0.1:8682/api/installer/gateway/version")
+        .get("http://127.0.0.1:8682/api/plugins")
         .send()
         .await
     {
         Ok(resp) => resp
-            .json::<NavbarVersionInfo>()
+            .json::<Vec<NavbarPluginInfo>>()
             .await
             .ok()
-            .and_then(|info| info.version)
+            .and_then(|plugins| {
+                plugins
+                    .into_iter()
+                    .find(|plugin| {
+                        plugin.target_name.as_deref() == Some("gateway")
+                            || plugin.id == "kaonic-gateway"
+                    })
+                    .and_then(|plugin| plugin.version)
+            })
             .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
         Err(_) => env!("CARGO_PKG_VERSION").to_string(),
     };

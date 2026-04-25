@@ -8,21 +8,6 @@ use reqwest::Method;
 
 const UPDATE_BASE: &str = "http://127.0.0.1:8682";
 
-/// Proxy GET /api/installer/{target}/version → kaonic-installer
-pub async fn get_version(Path(target): Path<String>) -> impl IntoResponse {
-    proxy_get(format!("{UPDATE_BASE}/api/installer/{target}/version")).await
-}
-
-/// Proxy POST /api/installer/{target}/upload → kaonic-installer (streams multipart body)
-pub async fn upload_update(Path(target): Path<String>, req: Request<Body>) -> impl IntoResponse {
-    proxy_request(
-        Method::POST,
-        format!("{UPDATE_BASE}/api/installer/{target}/upload"),
-        Some(req),
-    )
-    .await
-}
-
 pub async fn list_plugins() -> impl IntoResponse {
     proxy_get(format!("{UPDATE_BASE}/api/plugins")).await
 }

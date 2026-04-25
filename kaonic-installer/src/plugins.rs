@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Cursor, Read};
@@ -24,7 +25,7 @@ pub enum PluginAction {
 }
 
 impl PluginAction {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Start => "start",
             Self::Stop => "stop",
@@ -112,7 +113,15 @@ struct PluginManifest {
     service: String,
     developer: String,
     #[serde(default)]
+    github_url: Option<String>,
+    #[serde(default)]
     bin_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PluginManifestFile {
+    #[serde(rename = "kaonic-plugin")]
+    plugin: PluginManifest,
 }
 
 #[derive(Debug, Clone)]
@@ -126,7 +135,14 @@ struct PluginPackage {
     sha256: String,
     binary_bytes: Vec<u8>,
     service_bytes: Vec<u8>,
+    custom_files: Vec<PluginPackageFile>,
     signature_bytes: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+struct PluginPackageFile {
+    relative_path: PathBuf,
+    bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +153,7 @@ struct PluginRecord {
     version: String,
     service: String,
     developer: String,
+    github_url: Option<String>,
     binary_name: String,
     bin_path: Option<String>,
     sha256: String,
@@ -158,6 +175,7 @@ pub struct PluginSummary {
     pub version: String,
     pub service: String,
     pub developer: String,
+    pub github_url: Option<String>,
     pub binary_name: String,
     pub bin_path: Option<String>,
     pub sha256: String,
@@ -168,8 +186,20 @@ pub struct PluginSummary {
     pub removable: bool,
     pub target_name: Option<String>,
     pub status: String,
+    pub systemd_status: PluginSystemdStatus,
     pub installed_at: u64,
     pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PluginSystemdStatus {
+    pub active_state: String,
+    pub sub_state: String,
+    pub unit_file_state: String,
+    pub main_pid: Option<u32>,
+    pub tasks_current: Option<u64>,
+    pub memory_current: Option<u64>,
+    pub cpu_usage_nsec: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -180,13 +210,21 @@ pub struct PluginMessage {
 pub fn initialize_store(
     plugins_root: &Path,
     db_path: &Path,
+    systemd_dir: &Path,
     cert_path: Option<&Path>,
     core_plugins: &[CorePluginSpec],
 ) -> PluginResult<()> {
+    log::debug!(
+        "initializing plugin store root={} db={} core_plugins={}",
+        plugins_root.display(),
+        db_path.display(),
+        core_plugins.len()
+    );
     fs::create_dir_all(plugins_root)
         .map_err(|err| PluginError::internal(format!("create plugin root: {err}")))?;
     let conn = open_db(db_path)?;
     init_db(&conn)?;
+    recover_plugins_after_interruption(plugins_root, &conn, systemd_dir, cert_path)?;
     discover_plugins(plugins_root, &conn, cert_path)?;
     sync_core_plugins(&conn, core_plugins)?;
     Ok(())
@@ -195,14 +233,16 @@ pub fn initialize_store(
 pub fn list_plugins(
     plugins_root: &Path,
     db_path: &Path,
+    systemd_dir: &Path,
     cert_path: Option<&Path>,
     core_plugins: &[CorePluginSpec],
 ) -> PluginResult<Vec<PluginSummary>> {
-    initialize_store(plugins_root, db_path, cert_path, core_plugins)?;
+    initialize_store(plugins_root, db_path, systemd_dir, cert_path, core_plugins)?;
+    log::debug!("loading plugin summaries from {}", db_path.display());
     let conn = open_db(db_path)?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, name, description, version, service, developer, binary_name, bin_path, sha256, install_dir, package_path, official, enabled, removable, target_name, installed_at, updated_at
+            "SELECT id, name, description, version, service, developer, github_url, binary_name, bin_path, sha256, install_dir, package_path, official, enabled, removable, target_name, installed_at, updated_at
              FROM plugins
              ORDER BY name COLLATE NOCASE, id",
         )
@@ -217,17 +257,18 @@ pub fn list_plugins(
                 version: row.get(3)?,
                 service: row.get(4)?,
                 developer: row.get(5)?,
-                binary_name: row.get(6)?,
-                bin_path: row.get(7)?,
-                sha256: row.get(8)?,
-                install_dir: row.get(9)?,
-                package_path: row.get(10)?,
-                official: row.get::<_, i64>(11)? != 0,
-                enabled: row.get::<_, i64>(12)? != 0,
-                removable: row.get::<_, i64>(13)? != 0,
-                target_name: row.get(14)?,
-                installed_at: row.get(15)?,
-                updated_at: row.get(16)?,
+                github_url: row.get(6)?,
+                binary_name: row.get(7)?,
+                bin_path: row.get(8)?,
+                sha256: row.get(9)?,
+                install_dir: row.get(10)?,
+                package_path: row.get(11)?,
+                official: row.get::<_, i64>(12)? != 0,
+                enabled: row.get::<_, i64>(13)? != 0,
+                removable: row.get::<_, i64>(14)? != 0,
+                target_name: row.get(15)?,
+                installed_at: row.get(16)?,
+                updated_at: row.get(17)?,
             })
         })
         .map_err(|err| PluginError::internal(format!("query plugins: {err}")))?;
@@ -235,29 +276,99 @@ pub fn list_plugins(
     let mut records = Vec::new();
     for row in rows {
         let record = row.map_err(|err| PluginError::internal(format!("read plugin row: {err}")))?;
+        let systemd_status = read_service_systemd_status(&record.service);
+        let current_sha256 =
+            sha256_file(&current_binary_path(&record)).unwrap_or_else(|_| record.sha256.clone());
         records.push(PluginSummary {
-            status: read_service_status(&record.service),
+            status: summarize_service_status(&systemd_status),
             id: record.id,
             name: record.name,
             description: record.description,
             version: record.version,
             service: record.service,
             developer: record.developer,
+            github_url: record.github_url,
             binary_name: record.binary_name,
             bin_path: record.bin_path,
-            sha256: record.sha256,
+            sha256: current_sha256,
             install_dir: record.install_dir,
             package_path: record.package_path,
             official: record.official,
             enabled: record.enabled,
             removable: record.removable,
             target_name: record.target_name,
+            systemd_status,
             installed_at: record.installed_at,
             updated_at: record.updated_at,
         });
     }
 
     Ok(records)
+}
+
+pub fn log_boot_inventory(plugins_root: &Path, db_path: &Path) -> PluginResult<()> {
+    let conn = open_db(db_path)?;
+    init_db(&conn)?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, name, version, service, removable, target_name, install_dir, package_path
+             FROM plugins
+             ORDER BY name COLLATE NOCASE, id",
+        )
+        .map_err(|err| PluginError::internal(format!("prepare boot inventory query: {err}")))?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)? != 0,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })
+        .map_err(|err| PluginError::internal(format!("query boot inventory: {err}")))?;
+
+    let mut plugins = Vec::new();
+    for row in rows {
+        plugins.push(
+            row.map_err(|err| PluginError::internal(format!("read boot inventory row: {err}")))?,
+        );
+    }
+
+    log::info!("boot inventory: {} registered plugins", plugins.len());
+    for (id, name, version, service, removable, target_name, install_dir, package_path) in plugins {
+        log::debug!(
+            "boot plugin id={} name={} version={} service={} removable={} target_name={:?} install_dir={} package_path={}",
+            id,
+            name,
+            version,
+            service,
+            removable,
+            target_name,
+            install_dir,
+            package_path
+        );
+    }
+
+    let mut physical_files = Vec::new();
+    collect_plugin_paths(plugins_root, plugins_root, &mut physical_files)?;
+    physical_files.sort();
+
+    log::info!(
+        "boot inventory: {} physical entries under {}",
+        physical_files.len(),
+        plugins_root.display()
+    );
+    for path in physical_files {
+        log::debug!("boot file {}", path);
+    }
+
+    Ok(())
 }
 
 pub fn install_plugin(
@@ -268,10 +379,23 @@ pub fn install_plugin(
     core_plugins: &[CorePluginSpec],
     zip_bytes: &[u8],
 ) -> PluginResult<PluginMessage> {
-    initialize_store(plugins_root, db_path, Some(cert_path), core_plugins)?;
+    initialize_store(plugins_root, db_path, systemd_dir, Some(cert_path), core_plugins)?;
     let package = parse_plugin_package(zip_bytes)?;
+    log::info!(
+        "installing plugin id={} version={} service={} payload_bytes={}",
+        package.id,
+        package.manifest.version,
+        package.service_name,
+        zip_bytes.len()
+    );
     let conn = open_db(db_path)?;
     let existing = load_plugin(&conn, &package.id)?;
+    log::debug!(
+        "plugin install state id={} existing={} enabled_preference={}",
+        package.id,
+        existing.is_some(),
+        existing.as_ref().map(|record| record.enabled).unwrap_or(true)
+    );
     ensure_service_available(&conn, &package.service_name, Some(&package.id))?;
     ensure_bin_path_available(&conn, package.bin_path.as_deref(), Some(&package.id))?;
 
@@ -285,6 +409,8 @@ pub fn install_plugin(
     let service_path = systemd_dir.join(&package.service_name);
     let binary_path = current_dir.join(&package.binary_name);
     let binary_target = binary_path.clone();
+    let normalized_service_bytes =
+        normalize_service_working_directory(&package.service_bytes, &current_dir)?;
     let now = now_secs();
     let official = evaluate_official(
         cert_path,
@@ -327,6 +453,7 @@ pub fn install_plugin(
 
     let install_result = (|| -> PluginResult<()> {
         if current_dir.exists() {
+            log::debug!("removing previous plugin files from {}", current_dir.display());
             fs::remove_dir_all(&current_dir).map_err(|err| {
                 PluginError::internal(format!("remove previous plugin files: {err}"))
             })?;
@@ -338,11 +465,12 @@ pub fn install_plugin(
             .map_err(|err| PluginError::internal(format!("write plugin binary: {err}")))?;
         make_executable(&binary_path)
             .map_err(|err| PluginError::internal(format!("chmod plugin binary: {err}")))?;
+        install_custom_files(&current_dir, &package.custom_files)?;
         fs::write(&package_path, zip_bytes)
             .map_err(|err| PluginError::internal(format!("persist plugin package: {err}")))?;
         fs::write(&manifest_path, package.manifest_raw.as_bytes())
             .map_err(|err| PluginError::internal(format!("persist plugin manifest: {err}")))?;
-        fs::write(&stored_service_path, &package.service_bytes)
+        fs::write(&stored_service_path, &normalized_service_bytes)
             .map_err(|err| PluginError::internal(format!("persist plugin service: {err}")))?;
         fs::write(&stored_hash_path, format!("{}\n", package.sha256))
             .map_err(|err| PluginError::internal(format!("persist plugin checksum: {err}")))?;
@@ -357,8 +485,13 @@ pub fn install_plugin(
 
         fs::create_dir_all(systemd_dir)
             .map_err(|err| PluginError::internal(format!("create systemd dir: {err}")))?;
-        fs::write(&service_path, &package.service_bytes)
+        fs::write(&service_path, &normalized_service_bytes)
             .map_err(|err| PluginError::internal(format!("install systemd unit: {err}")))?;
+        log::debug!(
+            "installed plugin unit id={} unit_path={}",
+            package.id,
+            service_path.display()
+        );
         daemon_reload()?;
         install_bin_path(
             package.bin_path.as_deref(),
@@ -376,6 +509,7 @@ pub fn install_plugin(
         }
 
         if should_start {
+            log::debug!("starting plugin service id={} service={}", package.id, package.service_name);
             systemctl("start", &package.service_name)
                 .map_err(|err| PluginError::internal(format!("start plugin service: {err}")))?;
             if !poll_running(&package.service_name, 10, Duration::from_secs(1)) {
@@ -394,6 +528,7 @@ pub fn install_plugin(
                 version: package.manifest.version.clone(),
                 service: package.service_name.clone(),
                 developer: package.manifest.developer.clone(),
+                github_url: normalize_github_url(package.manifest.github_url.as_deref()),
                 binary_name: package.binary_name.clone(),
                 bin_path: package.bin_path.clone(),
                 sha256: package.sha256.clone(),
@@ -415,6 +550,7 @@ pub fn install_plugin(
     })();
 
     if let Err(err) = install_result {
+        log::error!("plugin install failed id={} detail={}", package.id, err);
         let _ = systemctl("stop", &package.service_name);
         let _ = rollback_install(
             &plugin_dir,
@@ -429,6 +565,12 @@ pub fn install_plugin(
     }
 
     cleanup_rollback(&rollback_dir);
+    log::info!(
+        "plugin install completed id={} version={} updated={}",
+        package.id,
+        package.manifest.version,
+        existing.is_some()
+    );
     Ok(PluginMessage {
         detail: if existing.is_some() {
             format!(
@@ -453,6 +595,13 @@ pub fn control_plugin(
     init_db(&conn)?;
     let plugin = load_plugin(&conn, plugin_id)?
         .ok_or_else(|| PluginError::not_found(format!("unknown plugin: {plugin_id}")))?;
+    log::info!(
+        "controlling plugin id={} name={} action={} service={}",
+        plugin_id,
+        plugin.name,
+        action.as_str(),
+        plugin.service
+    );
 
     systemctl(action.as_str(), &plugin.service)
         .map_err(|err| PluginError::internal(format!("{} service: {err}", action.as_str())))?;
@@ -469,6 +618,12 @@ pub fn control_plugin(
     }
 
     update_plugin_enabled(&conn, plugin_id, enabled)?;
+    log::info!(
+        "plugin control completed id={} action={} enabled={}",
+        plugin_id,
+        action.as_str(),
+        enabled
+    );
     Ok(PluginMessage {
         detail: format!("{} {}", plugin.name, action.as_str()),
     })
@@ -484,7 +639,13 @@ pub fn delete_plugin(
     init_db(&conn)?;
     let plugin = load_plugin(&conn, plugin_id)?
         .ok_or_else(|| PluginError::not_found(format!("unknown plugin: {plugin_id}")))?;
-    if !plugin.removable {
+    log::info!(
+        "deleting plugin id={} name={} service={}",
+        plugin_id,
+        plugin.name,
+        plugin.service
+    );
+    if plugin.target_name.is_some() || !plugin.removable {
         return Err(PluginError::bad_request(format!(
             "plugin {} is built-in and cannot be removed",
             plugin.name
@@ -512,6 +673,7 @@ pub fn delete_plugin(
     }
     conn.execute("DELETE FROM plugins WHERE id = ?1", params![plugin_id])
         .map_err(|err| PluginError::internal(format!("delete plugin record: {err}")))?;
+    log::info!("deleted plugin id={} name={}", plugin_id, plugin.name);
 
     Ok(PluginMessage {
         detail: format!("Deleted plugin {}", plugin.name),
@@ -527,10 +689,16 @@ pub fn upload_plugin_update(
     plugin_id: &str,
     zip_bytes: &[u8],
 ) -> PluginResult<PluginMessage> {
-    initialize_store(plugins_root, db_path, Some(cert_path), core_plugins)?;
+    initialize_store(plugins_root, db_path, systemd_dir, Some(cert_path), core_plugins)?;
     let conn = open_db(db_path)?;
     let plugin = load_plugin(&conn, plugin_id)?
         .ok_or_else(|| PluginError::not_found(format!("unknown plugin: {plugin_id}")))?;
+    log::info!(
+        "uploading plugin update id={} built_in={} payload_bytes={}",
+        plugin_id,
+        plugin.target_name.is_some(),
+        zip_bytes.len()
+    );
 
     if let Some(target_name) = plugin.target_name.as_deref() {
         let spec = core_plugins
@@ -541,6 +709,11 @@ pub fn upload_plugin_update(
                     "missing built-in target mapping for plugin {plugin_id}"
                 ))
             })?;
+        log::info!(
+            "dispatching built-in plugin update id={} target={}",
+            plugin_id,
+            target_name
+        );
         let detail = apply_update(&spec.target, zip_bytes)
             .map_err(PluginError::internal)?;
         sync_core_plugins(&conn, core_plugins)?;
@@ -548,6 +721,11 @@ pub fn upload_plugin_update(
     }
 
     let package = parse_plugin_package(zip_bytes)?;
+    log::debug!(
+        "parsed plugin update package id={} version={}",
+        package.id,
+        package.manifest.version
+    );
     if package.id != plugin_id {
         return Err(PluginError::bad_request(format!(
             "plugin package targets {}, expected {plugin_id}",
@@ -567,8 +745,14 @@ pub fn upload_plugin_update(
 fn parse_plugin_package(zip_bytes: &[u8]) -> PluginResult<PluginPackage> {
     let mut archive = ZipArchive::new(Cursor::new(zip_bytes))
         .map_err(|err| PluginError::bad_request(format!("bad plugin ZIP: {err}")))?;
+    log::debug!(
+        "parsing plugin ZIP payload_bytes={} entries={}",
+        zip_bytes.len(),
+        archive.len()
+    );
     let manifest_raw = read_zip_entry_text(&mut archive, MANIFEST_NAME)?;
-    let manifest: PluginManifest = toml::from_str(&manifest_raw)
+    let manifest: PluginManifest = toml::from_str::<PluginManifestFile>(&manifest_raw)
+        .map(|file| file.plugin)
         .map_err(|err| PluginError::bad_request(format!("bad plugin manifest: {err}")))?;
     validate_manifest(&manifest)?;
 
@@ -584,8 +768,18 @@ fn parse_plugin_package(zip_bytes: &[u8]) -> PluginResult<PluginPackage> {
         .to_string();
     validate_sha256_text(&sha256)?;
     verify_sha256(&binary_bytes, &sha256, "plugin package binary")?;
+    let custom_files = read_custom_files(&mut archive, &binary_name)?;
     let signature_name = format!("{binary_name}.sign");
     let signature_bytes = read_optional_zip_entry_bytes(&mut archive, &signature_name)?;
+    log::debug!(
+        "parsed plugin manifest id={} version={} service={} has_signature={} has_bin_path={} custom_files={}",
+        id,
+        manifest.version,
+        service_name,
+        signature_bytes.is_some(),
+        bin_path.is_some(),
+        custom_files.len()
+    );
 
     Ok(PluginPackage {
         manifest,
@@ -597,6 +791,7 @@ fn parse_plugin_package(zip_bytes: &[u8]) -> PluginResult<PluginPackage> {
         sha256,
         binary_bytes,
         service_bytes,
+        custom_files,
         signature_bytes,
     })
 }
@@ -606,6 +801,7 @@ fn discover_plugins(
     conn: &Connection,
     cert_path: Option<&Path>,
 ) -> PluginResult<()> {
+    log::debug!("scanning plugin root for discovery path={}", plugins_root.display());
     let entries = fs::read_dir(plugins_root)
         .map_err(|err| PluginError::internal(format!("scan plugin root: {err}")))?;
 
@@ -666,6 +862,84 @@ fn discover_plugins(
     Ok(())
 }
 
+fn recover_plugins_after_interruption(
+    plugins_root: &Path,
+    conn: &Connection,
+    systemd_dir: &Path,
+    cert_path: Option<&Path>,
+) -> PluginResult<()> {
+    let entries = fs::read_dir(plugins_root)
+        .map_err(|err| PluginError::internal(format!("scan plugin root for recovery: {err}")))?;
+
+    for entry in entries {
+        let entry = entry
+            .map_err(|err| PluginError::internal(format!("read recovery directory entry: {err}")))?;
+        if !entry
+            .file_type()
+            .map_err(|err| PluginError::internal(format!("inspect recovery entry type: {err}")))?
+            .is_dir()
+        {
+            continue;
+        }
+
+        let plugin_id = entry.file_name().to_string_lossy().into_owned();
+        if plugin_id.starts_with('.') {
+            continue;
+        }
+
+        let plugin_dir = entry.path();
+        let rollback_dir = plugin_dir.join(".rollback");
+        if !rollback_dir.exists() {
+            continue;
+        }
+
+        let existing = load_plugin(conn, &plugin_id)?;
+        match discover_plugin_record(&plugin_dir, cert_path) {
+            Ok(_) => {
+                log::warn!(
+                    "cleaning stale rollback data for plugin id={} path={}",
+                    plugin_id,
+                    rollback_dir.display()
+                );
+                cleanup_rollback(&rollback_dir);
+            }
+            Err(current_err) => match discover_plugin_record(&rollback_dir, cert_path) {
+                Ok(rollback_record) => {
+                    log::warn!(
+                        "recovering plugin id={} after interrupted update: {}",
+                        plugin_id,
+                        current_err
+                    );
+                    let attempted_target = existing
+                        .as_ref()
+                        .map(current_binary_path)
+                        .unwrap_or_else(|| plugin_binary_target(&plugin_dir, &rollback_record.binary_name));
+                    rollback_install(
+                        &plugin_dir,
+                        &rollback_dir,
+                        &systemd_dir.join(&rollback_record.service),
+                        &rollback_record.service,
+                        existing.as_ref().and_then(|record| record.bin_path.as_deref()),
+                        &attempted_target,
+                        existing.as_ref(),
+                    )?;
+                    log::info!("recovered plugin id={} from rollback state", plugin_id);
+                }
+                Err(rollback_err) => {
+                    log::error!(
+                        "plugin id={} has invalid current state after power loss and rollback is unusable: current={} rollback={}",
+                        plugin_id,
+                        current_err,
+                        rollback_err
+                    );
+                }
+            },
+        }
+    }
+
+    Ok(())
+}
+
 fn discover_plugin_record(
     plugin_dir: &Path,
     cert_path: Option<&Path>,
@@ -673,7 +947,8 @@ fn discover_plugin_record(
     let manifest_path = plugin_dir.join(MANIFEST_NAME);
     let manifest_raw = fs::read_to_string(&manifest_path)
         .map_err(|err| PluginError::internal(format!("read plugin manifest: {err}")))?;
-    let manifest: PluginManifest = toml::from_str(&manifest_raw)
+    let manifest: PluginManifest = toml::from_str::<PluginManifestFile>(&manifest_raw)
+        .map(|file| file.plugin)
         .map_err(|err| PluginError::bad_request(format!("bad plugin manifest: {err}")))?;
     validate_manifest(&manifest)?;
 
@@ -748,6 +1023,7 @@ fn discover_plugin_record(
         version: manifest.version,
         service: service_name.clone(),
         developer: manifest.developer,
+        github_url: normalize_github_url(manifest.github_url.as_deref()),
         binary_name,
         bin_path: normalize_bin_path(manifest.bin_path.as_deref())?,
         sha256,
@@ -779,6 +1055,7 @@ fn validate_manifest(manifest: &PluginManifest) -> PluginResult<()> {
             "plugin developer must not be empty",
         ));
     }
+    let _ = normalize_github_url(manifest.github_url.as_deref());
     normalize_bin_path(manifest.bin_path.as_deref())?;
     derive_binary_name(manifest.service.trim()).map(|_| ())
 }
@@ -873,12 +1150,63 @@ fn read_optional_zip_entry_bytes<R: io::Read + io::Seek>(
     }
 }
 
+fn read_custom_files<R: io::Read + io::Seek>(
+    archive: &mut ZipArchive<R>,
+    binary_name: &str,
+) -> PluginResult<Vec<PluginPackageFile>> {
+    let mut files = Vec::new();
+    let mut seen_paths = HashSet::new();
+
+    for index in 0..archive.len() {
+        let mut file = archive
+            .by_index(index)
+            .map_err(|err| PluginError::bad_request(format!("read plugin archive entry: {err}")))?;
+        let entry_name = file.name().to_string();
+        validate_zip_name(&entry_name)?;
+        if !entry_name.starts_with("files/") {
+            continue;
+        }
+        if file.is_dir() || entry_name == "files/" {
+            continue;
+        }
+
+        let relative = Path::new(&entry_name)
+            .strip_prefix("files")
+            .map_err(|_| PluginError::bad_request(format!("plugin package contains invalid path {entry_name}")))?;
+        let relative = normalize_custom_file_path(relative)?;
+        if relative == Path::new(binary_name) {
+            return Err(PluginError::bad_request(format!(
+                "custom plugin file {} conflicts with the plugin binary",
+                relative.display()
+            )));
+        }
+        let relative_key = relative.to_string_lossy().into_owned();
+        if !seen_paths.insert(relative_key.clone()) {
+            return Err(PluginError::bad_request(format!(
+                "plugin package contains duplicate custom file {}",
+                relative.display()
+            )));
+        }
+
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(|err| {
+            PluginError::bad_request(format!("read custom plugin file {}: {err}", relative.display()))
+        })?;
+        files.push(PluginPackageFile {
+            relative_path: PathBuf::from(relative_key),
+            bytes,
+        });
+    }
+
+    Ok(files)
+}
+
 fn validate_zip_name(name: &str) -> PluginResult<()> {
     let path = Path::new(name);
     for component in path.components() {
         if matches!(
             component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            Component::CurDir | Component::ParentDir | Component::RootDir | Component::Prefix(_)
         ) {
             return Err(PluginError::bad_request(format!(
                 "plugin package contains invalid path {name}"
@@ -886,6 +1214,39 @@ fn validate_zip_name(name: &str) -> PluginResult<()> {
         }
     }
     Ok(())
+}
+
+fn normalize_custom_file_path(path: &Path) -> PluginResult<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(value) => {
+                let segment = value.to_str().ok_or_else(|| {
+                    PluginError::bad_request("plugin custom file path must be valid utf-8")
+                })?;
+                if segment.is_empty() {
+                    return Err(PluginError::bad_request(
+                        "plugin custom file path must not contain empty segments",
+                    ));
+                }
+                normalized.push(value);
+            }
+            Component::CurDir | Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(PluginError::bad_request(format!(
+                    "plugin custom file path {} is invalid",
+                    path.display()
+                )))
+            }
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        return Err(PluginError::bad_request(
+            "plugin custom file path must not be empty",
+        ));
+    }
+
+    Ok(normalized)
 }
 
 fn normalize_bin_path(bin_path: Option<&str>) -> PluginResult<Option<String>> {
@@ -909,8 +1270,117 @@ fn normalize_bin_path(bin_path: Option<&str>) -> PluginResult<Option<String>> {
     Ok(Some(path.to_string_lossy().into_owned()))
 }
 
+fn normalize_github_url(github_url: Option<&str>) -> Option<String> {
+    github_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn collect_plugin_paths(root: &Path, current: &Path, out: &mut Vec<String>) -> PluginResult<()> {
+    let entries = fs::read_dir(current)
+        .map_err(|err| PluginError::internal(format!("scan plugin inventory path: {err}")))?;
+
+    for entry in entries {
+        let entry =
+            entry.map_err(|err| PluginError::internal(format!("read plugin inventory entry: {err}")))?;
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(path.as_path())
+            .display()
+            .to_string();
+        out.push(relative);
+
+        if entry
+            .file_type()
+            .map_err(|err| PluginError::internal(format!("inspect plugin inventory entry: {err}")))?
+            .is_dir()
+        {
+            collect_plugin_paths(root, &path, out)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn plugin_binary_target(install_dir: &Path, binary_name: &str) -> PathBuf {
     install_dir.join("current").join(binary_name)
+}
+
+fn current_binary_path(record: &PluginRecord) -> PathBuf {
+    let install_dir = Path::new(&record.install_dir);
+    if record.target_name.is_some() && !record.removable {
+        install_dir.join(&record.binary_name)
+    } else {
+        plugin_binary_target(install_dir, &record.binary_name)
+    }
+}
+
+fn normalize_service_working_directory(service_bytes: &[u8], current_dir: &Path) -> PluginResult<Vec<u8>> {
+    let service_text = std::str::from_utf8(service_bytes).map_err(|err| {
+        PluginError::bad_request(format!("plugin service file is not utf-8: {err}"))
+    })?;
+    let working_directory = format!("WorkingDirectory={}", current_dir.display());
+    let mut output = Vec::new();
+    let mut saw_service_section = false;
+    let mut in_service_section = false;
+    let mut replaced_working_directory = false;
+
+    for line in service_text.lines() {
+        let trimmed = line.trim();
+        let is_section = trimmed.starts_with('[') && trimmed.ends_with(']');
+        if is_section {
+            if in_service_section && !replaced_working_directory {
+                output.push(working_directory.clone());
+                replaced_working_directory = true;
+            }
+            in_service_section = trimmed.eq_ignore_ascii_case("[Service]");
+            if in_service_section {
+                saw_service_section = true;
+            }
+            output.push(line.to_string());
+            continue;
+        }
+
+        if in_service_section && trimmed.starts_with("WorkingDirectory=") {
+            if !replaced_working_directory {
+                output.push(working_directory.clone());
+                replaced_working_directory = true;
+            }
+            continue;
+        }
+
+        output.push(line.to_string());
+    }
+
+    if !saw_service_section {
+        return Err(PluginError::bad_request(
+            "plugin service file must contain a [Service] section",
+        ));
+    }
+    if in_service_section && !replaced_working_directory {
+        output.push(working_directory);
+    }
+
+    let mut normalized = output.join("\n");
+    if normalized.is_empty() || !normalized.ends_with('\n') {
+        normalized.push('\n');
+    }
+    Ok(normalized.into_bytes())
+}
+
+fn install_custom_files(current_dir: &Path, files: &[PluginPackageFile]) -> PluginResult<()> {
+    for file in files {
+        let target_path = current_dir.join(&file.relative_path);
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| PluginError::internal(format!("create custom file parent: {err}")))?;
+        }
+        fs::write(&target_path, &file.bytes)
+            .map_err(|err| PluginError::internal(format!("write custom plugin file: {err}")))?;
+    }
+    Ok(())
 }
 
 fn rollback_symlink_info_path(rollback_dir: &Path) -> PathBuf {
@@ -1079,9 +1549,14 @@ fn evaluate_official(
     signature_bytes: Option<&[u8]>,
 ) -> PluginResult<bool> {
     let Some(signature) = signature_bytes else {
+        log::debug!("plugin signature missing; marking package as community");
         return Ok(false);
     };
     if !cert_path.exists() {
+        log::debug!(
+            "official plugin cert missing at {}; treating signature as community",
+            cert_path.display()
+        );
         return Ok(false);
     }
 
@@ -1093,6 +1568,10 @@ fn evaluate_official(
         .map_err(|err| PluginError::internal(format!("write temp plugin binary: {err}")))?;
     fs::write(&sig_path, signature)
         .map_err(|err| PluginError::internal(format!("write temp plugin signature: {err}")))?;
+    log::debug!(
+        "verifying plugin signature using cert={}",
+        cert_path.display()
+    );
     verify_signature(&bin_path, &sig_path, cert_path)?;
     Ok(true)
 }
@@ -1301,6 +1780,7 @@ fn init_db(conn: &Connection) -> PluginResult<()> {
             version TEXT NOT NULL,
             service TEXT NOT NULL UNIQUE,
             developer TEXT NOT NULL,
+            github_url TEXT,
             binary_name TEXT NOT NULL,
             bin_path TEXT,
             sha256 TEXT NOT NULL DEFAULT '',
@@ -1330,6 +1810,12 @@ fn init_db(conn: &Connection) -> PluginResult<()> {
     ensure_column_exists(
         conn,
         "plugins",
+        "github_url",
+        "ALTER TABLE plugins ADD COLUMN github_url TEXT",
+    )?;
+    ensure_column_exists(
+        conn,
+        "plugins",
         "target_name",
         "ALTER TABLE plugins ADD COLUMN target_name TEXT",
     )?;
@@ -1354,7 +1840,7 @@ fn init_db(conn: &Connection) -> PluginResult<()> {
 
 fn load_plugin(conn: &Connection, plugin_id: &str) -> PluginResult<Option<PluginRecord>> {
     conn.query_row(
-        "SELECT id, name, description, version, service, developer, binary_name, bin_path, sha256, install_dir, package_path, official, enabled, removable, target_name, installed_at, updated_at
+        "SELECT id, name, description, version, service, developer, github_url, binary_name, bin_path, sha256, install_dir, package_path, official, enabled, removable, target_name, installed_at, updated_at
          FROM plugins
          WHERE id = ?1",
         params![plugin_id],
@@ -1366,17 +1852,18 @@ fn load_plugin(conn: &Connection, plugin_id: &str) -> PluginResult<Option<Plugin
                 version: row.get(3)?,
                 service: row.get(4)?,
                 developer: row.get(5)?,
-                binary_name: row.get(6)?,
-                bin_path: row.get(7)?,
-                sha256: row.get(8)?,
-                install_dir: row.get(9)?,
-                package_path: row.get(10)?,
-                official: row.get::<_, i64>(11)? != 0,
-                enabled: row.get::<_, i64>(12)? != 0,
-                removable: row.get::<_, i64>(13)? != 0,
-                target_name: row.get(14)?,
-                installed_at: row.get(15)?,
-                updated_at: row.get(16)?,
+                github_url: row.get(6)?,
+                binary_name: row.get(7)?,
+                bin_path: row.get(8)?,
+                sha256: row.get(9)?,
+                install_dir: row.get(10)?,
+                package_path: row.get(11)?,
+                official: row.get::<_, i64>(12)? != 0,
+                enabled: row.get::<_, i64>(13)? != 0,
+                removable: row.get::<_, i64>(14)? != 0,
+                target_name: row.get(15)?,
+                installed_at: row.get(16)?,
+                updated_at: row.get(17)?,
             })
         },
     )
@@ -1465,6 +1952,12 @@ fn sync_core_plugins(conn: &Connection, core_plugins: &[CorePluginSpec]) -> Plug
             hash_path.as_path(),
         ])
         .unwrap_or(installed_at);
+        log::debug!(
+            "syncing built-in plugin id={} target={} service={}",
+            spec.plugin_id,
+            spec.target.name,
+            spec.target.service
+        );
 
         upsert_plugin(
             conn,
@@ -1475,6 +1968,7 @@ fn sync_core_plugins(conn: &Connection, core_plugins: &[CorePluginSpec]) -> Plug
                 version,
                 service: spec.target.service.to_string(),
                 developer: spec.developer.clone(),
+                github_url: None,
                 binary_name,
                 bin_path: None,
                 sha256,
@@ -1501,14 +1995,15 @@ fn sync_core_plugins(conn: &Connection, core_plugins: &[CorePluginSpec]) -> Plug
 fn upsert_plugin(conn: &Connection, record: PluginRecord) -> PluginResult<()> {
     conn.execute(
         "INSERT INTO plugins (
-            id, name, description, version, service, developer, binary_name, bin_path, sha256, install_dir, package_path, official, enabled, removable, target_name, installed_at, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            id, name, description, version, service, developer, github_url, binary_name, bin_path, sha256, install_dir, package_path, official, enabled, removable, target_name, installed_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
         ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             description = excluded.description,
             version = excluded.version,
             service = excluded.service,
             developer = excluded.developer,
+            github_url = excluded.github_url,
             binary_name = excluded.binary_name,
             bin_path = excluded.bin_path,
             sha256 = excluded.sha256,
@@ -1527,6 +2022,7 @@ fn upsert_plugin(conn: &Connection, record: PluginRecord) -> PluginResult<()> {
             record.version,
             record.service,
             record.developer,
+            record.github_url,
             record.binary_name,
             record.bin_path,
             record.sha256,
@@ -1576,24 +2072,60 @@ fn update_plugin_enabled(conn: &Connection, plugin_id: &str, enabled: bool) -> P
 }
 
 fn daemon_reload() -> PluginResult<()> {
-    Command::new("systemctl")
+    #[cfg(test)]
+    {
+        return Ok(());
+    }
+
+    #[cfg(not(test))]
+    {
+    let status = Command::new("systemctl")
         .arg("daemon-reload")
         .status()
         .map_err(|err| PluginError::internal(format!("systemctl daemon-reload: {err}")))?;
+    if status.success() {
+        log::debug!("systemctl daemon-reload succeeded");
+    } else {
+        log::warn!("systemctl daemon-reload exited with status {}", status);
+    }
     Ok(())
+    }
 }
 
 fn systemctl(action: &str, service: &str) -> io::Result<()> {
-    Command::new("systemctl").args([action, service]).status()?;
+    #[cfg(test)]
+    {
+        let _ = (action, service);
+        return Ok(());
+    }
+
+    #[cfg(not(test))]
+    {
+    let status = Command::new("systemctl").args([action, service]).status()?;
+    if status.success() {
+        log::debug!("systemctl {} {} succeeded", action, service);
+    } else {
+        log::warn!("systemctl {} {} exited with status {}", action, service, status);
+    }
     Ok(())
+    }
 }
 
 fn is_service_running(service: &str) -> bool {
+    #[cfg(test)]
+    {
+        let _ = service;
+        return false;
+    }
+
+    #[cfg(not(test))]
+    {
     Command::new("systemctl")
         .args(["is-active", "--quiet", service])
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+    }
 }
 
 fn poll_running(service: &str, tries: u32, interval: Duration) -> bool {
@@ -1606,36 +2138,115 @@ fn poll_running(service: &str, tries: u32, interval: Duration) -> bool {
     false
 }
 
-fn read_service_status(service: &str) -> String {
+fn summarize_service_status(status: &PluginSystemdStatus) -> String {
+    if status.active_state == "unknown" && status.sub_state == "unknown" {
+        return "unknown".into();
+    }
+    if status.sub_state.is_empty() || status.sub_state == "unknown" || status.sub_state == status.active_state
+    {
+        status.active_state.clone()
+    } else {
+        format!("{}/{}", status.active_state, status.sub_state)
+    }
+}
+
+fn read_service_systemd_status(service: &str) -> PluginSystemdStatus {
     #[cfg(target_os = "linux")]
     {
+        let mut snapshot = PluginSystemdStatus {
+            active_state: "unknown".into(),
+            sub_state: "unknown".into(),
+            unit_file_state: "unknown".into(),
+            main_pid: None,
+            tasks_current: None,
+            memory_current: None,
+            cpu_usage_nsec: None,
+        };
         match Command::new("systemctl")
-            .args(["show", "--property=ActiveState", "--value", service])
+            .args([
+                "show",
+                service,
+                "--property=ActiveState",
+                "--property=SubState",
+                "--property=UnitFileState",
+                "--property=MainPID",
+                "--property=TasksCurrent",
+                "--property=MemoryCurrent",
+                "--property=CPUUsageNSec",
+            ])
             .output()
         {
             Ok(output) if output.status.success() => {
-                let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if value.is_empty() {
-                    "unknown".into()
-                } else {
-                    value
+                for line in String::from_utf8_lossy(&output.stdout).lines() {
+                    if let Some(value) = line.strip_prefix("ActiveState=") {
+                        if !value.trim().is_empty() {
+                            snapshot.active_state = value.trim().to_string();
+                        }
+                    } else if let Some(value) = line.strip_prefix("SubState=") {
+                        if !value.trim().is_empty() {
+                            snapshot.sub_state = value.trim().to_string();
+                        }
+                    } else if let Some(value) = line.strip_prefix("UnitFileState=") {
+                        if !value.trim().is_empty() {
+                            snapshot.unit_file_state = value.trim().to_string();
+                        }
+                    } else if let Some(value) = line.strip_prefix("MainPID=") {
+                        snapshot.main_pid = parse_systemd_number(value).and_then(|value| {
+                            if value == 0 {
+                                None
+                            } else {
+                                u32::try_from(value).ok()
+                            }
+                        });
+                    } else if let Some(value) = line.strip_prefix("TasksCurrent=") {
+                        snapshot.tasks_current = parse_systemd_number(value);
+                    } else if let Some(value) = line.strip_prefix("MemoryCurrent=") {
+                        snapshot.memory_current = parse_systemd_number(value);
+                    } else if let Some(value) = line.strip_prefix("CPUUsageNSec=") {
+                        snapshot.cpu_usage_nsec = parse_systemd_number(value);
+                    }
                 }
+                snapshot
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                if stderr.is_empty() {
-                    "error".into()
+                let error_text = if stderr.is_empty() {
+                    "error".to_string()
                 } else {
                     stderr
-                }
+                };
+                snapshot.active_state = error_text.clone();
+                snapshot.sub_state = error_text;
+                snapshot
             }
-            Err(err) => format!("systemctl unavailable: {err}"),
+            Err(err) => {
+                snapshot.active_state = format!("systemctl unavailable: {err}");
+                snapshot.sub_state = "unknown".into();
+                snapshot
+            }
         }
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        format!("Unavailable on this host ({service})")
+        PluginSystemdStatus {
+            active_state: format!("Unavailable on this host ({service})"),
+            sub_state: "unknown".into(),
+            unit_file_state: "unknown".into(),
+            main_pid: None,
+            tasks_current: None,
+            memory_current: None,
+            cpu_usage_nsec: None,
+        }
+    }
+}
+
+fn parse_systemd_number(value: &str) -> Option<u64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed == "[not set]" {
+        None
+    } else {
+        trimmed.parse::<u64>().ok()
     }
 }
 
@@ -1774,6 +2385,12 @@ mod tests {
         assert_eq!(package.id, "kaonic-plugin-sample");
         assert_eq!(package.manifest.name, "Sample");
         assert_eq!(package.sha256.len(), 64);
+        assert_eq!(package.custom_files.len(), 2);
+        assert_eq!(
+            package.custom_files[0].relative_path,
+            PathBuf::from("config/settings.toml")
+        );
+        assert_eq!(package.custom_files[1].relative_path, PathBuf::from(".env"));
         assert!(package.signature_bytes.is_none());
     }
 
@@ -1785,6 +2402,57 @@ mod tests {
     }
 
     #[test]
+    fn adds_working_directory_to_service_section() {
+        let normalized = normalize_service_working_directory(
+            b"[Unit]\nDescription=Sample\n\n[Service]\nExecStart=/bin/true\n",
+            Path::new("/etc/kaonic/plugins/sample/current"),
+        )
+        .unwrap();
+        let text = String::from_utf8(normalized).unwrap();
+        assert!(text.contains("[Service]\nExecStart=/bin/true\nWorkingDirectory=/etc/kaonic/plugins/sample/current\n"));
+    }
+
+    #[test]
+    fn replaces_existing_working_directory_in_service_section() {
+        let normalized = normalize_service_working_directory(
+            b"[Service]\nWorkingDirectory=/tmp\nExecStart=/bin/true\n",
+            Path::new("/etc/kaonic/plugins/sample/current"),
+        )
+        .unwrap();
+        let text = String::from_utf8(normalized).unwrap();
+        assert!(!text.contains("WorkingDirectory=/tmp"));
+        assert!(text.contains("WorkingDirectory=/etc/kaonic/plugins/sample/current"));
+    }
+
+    #[test]
+    fn installs_custom_files_into_current_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let current_dir = tmp.path().join("current");
+        fs::create_dir_all(&current_dir).unwrap();
+        let files = vec![
+            PluginPackageFile {
+                relative_path: PathBuf::from("config/settings.toml"),
+                bytes: b"mode = \"demo\"\n".to_vec(),
+            },
+            PluginPackageFile {
+                relative_path: PathBuf::from(".env"),
+                bytes: b"NAME=sample\n".to_vec(),
+            },
+        ];
+
+        install_custom_files(&current_dir, &files).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(current_dir.join("config/settings.toml")).unwrap(),
+            "mode = \"demo\"\n"
+        );
+        assert_eq!(
+            fs::read_to_string(current_dir.join(".env")).unwrap(),
+            "NAME=sample\n"
+        );
+    }
+
+    #[test]
     fn discovers_untracked_plugin_from_disk() {
         let tmp = tempfile::tempdir().unwrap();
         let plugins_root = tmp.path().join("plugins");
@@ -1793,11 +2461,13 @@ mod tests {
         fs::create_dir_all(&current_dir).unwrap();
         fs::write(
             plugin_dir.join(MANIFEST_NAME),
-            r#"name = "Sample"
+            r#"[kaonic-plugin]
+name = "Sample"
 description = "Sample plugin"
 version = "0.1.0"
 service = "kaonic-plugin-sample.service"
 developer = "Beechat"
+github_url = "https://github.com/BeechatNetworkSystemsLtd/kaonic-gateway"
 "#,
         )
         .unwrap();
@@ -1819,13 +2489,64 @@ developer = "Beechat"
         .unwrap();
 
         let db_path = plugins_root.join("kaonic-plugins.db");
-        initialize_store(&plugins_root, &db_path, None, &[]).unwrap();
+        initialize_store(&plugins_root, &db_path, tmp.path(), None, &[]).unwrap();
 
-        let plugins = list_plugins(&plugins_root, &db_path, None, &[]).unwrap();
+        let plugins = list_plugins(&plugins_root, &db_path, tmp.path(), None, &[]).unwrap();
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].id, "kaonic-plugin-sample");
         assert_eq!(plugins[0].service, "kaonic-plugin-sample.service");
         assert_eq!(plugins[0].sha256, binary_hash);
+    }
+
+    #[test]
+    fn lists_plugins_with_live_binary_sha256() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugins_root = tmp.path().join("plugins");
+        let plugin_dir = plugins_root.join("kaonic-plugin-sample");
+        let current_dir = plugin_dir.join("current");
+        fs::create_dir_all(&current_dir).unwrap();
+        fs::write(
+            plugin_dir.join(MANIFEST_NAME),
+            r#"[kaonic-plugin]
+name = "Sample"
+description = "Sample plugin"
+version = "0.1.0"
+service = "kaonic-plugin-sample.service"
+developer = "Beechat"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin_dir.join("kaonic-plugin-sample.service"),
+            "[Service]\nExecStart=/etc/kaonic/plugins/kaonic-plugin-sample/current/kaonic-plugin-sample\n",
+        )
+        .unwrap();
+        fs::write(
+            current_dir.join("kaonic-plugin-sample"),
+            b"#!/bin/sh\nexit 0\n",
+        )
+        .unwrap();
+        let original_hash = hex::encode(Sha256::digest(b"#!/bin/sh\nexit 0\n"));
+        fs::write(
+            plugin_dir.join("kaonic-plugin-sample.sha256"),
+            format!("{original_hash}\n"),
+        )
+        .unwrap();
+
+        let db_path = plugins_root.join("kaonic-plugins.db");
+        initialize_store(&plugins_root, &db_path, tmp.path(), None, &[]).unwrap();
+        fs::write(
+            current_dir.join("kaonic-plugin-sample"),
+            b"#!/bin/sh\necho live\n",
+        )
+        .unwrap();
+
+        let plugins = list_plugins(&plugins_root, &db_path, tmp.path(), None, &[]).unwrap();
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(
+            plugins[0].sha256,
+            hex::encode(Sha256::digest(b"#!/bin/sh\necho live\n"))
+        );
     }
 
     #[test]
@@ -1853,6 +2574,155 @@ developer = "Beechat"
         assert!(fs::symlink_metadata(&link_path).is_err());
     }
 
+    #[test]
+    fn rejects_deleting_built_in_plugin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugins_root = tmp.path().join("plugins");
+        let db_path = plugins_root.join("kaonic-plugins.db");
+        let systemd_dir = tmp.path().join("systemd");
+        let target = Arc::new(Target {
+            name: "gateway",
+            bin_path: tmp.path().join("usr/bin/kaonic-gateway"),
+            service: "kaonic-gateway.service",
+            meta_dir: tmp.path().join("meta"),
+        });
+
+        fs::create_dir_all(target.bin_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(&target.meta_dir).unwrap();
+        fs::write(&target.bin_path, b"gateway").unwrap();
+        fs::write(target.meta_dir.join("kaonic-gateway.version"), "1.0.0\n").unwrap();
+        fs::write(target.meta_dir.join("kaonic-gateway.sha256"), "abcd\n").unwrap();
+
+        initialize_store(
+            &plugins_root,
+            &db_path,
+            &systemd_dir,
+            None,
+            &[CorePluginSpec::new(
+                target,
+                "Kaonic Gateway",
+                "Built-in gateway service.",
+                "Beechat",
+            )],
+        )
+        .unwrap();
+
+        let err = delete_plugin(&plugins_root, &db_path, &systemd_dir, "kaonic-gateway").unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.detail.contains("built-in"));
+    }
+
+    #[test]
+    fn recovers_plugin_from_rollback_after_interrupted_update() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugins_root = tmp.path().join("plugins");
+        let plugin_dir = plugins_root.join("kaonic-plugin-sample");
+        let current_dir = plugin_dir.join("current");
+        let rollback_dir = plugin_dir.join(".rollback");
+        let db_path = plugins_root.join("kaonic-plugins.db");
+        let systemd_dir = tmp.path().join("systemd");
+        fs::create_dir_all(&current_dir).unwrap();
+        fs::create_dir_all(&rollback_dir).unwrap();
+        fs::create_dir_all(&systemd_dir).unwrap();
+
+        let previous_binary = b"#!/bin/sh\nexit 0\n";
+        let previous_hash = hex::encode(Sha256::digest(previous_binary));
+        fs::write(
+            plugin_dir.join(MANIFEST_NAME),
+            r#"[kaonic-plugin]
+name = "Sample"
+description = "Sample plugin"
+version = "0.2.0"
+service = "kaonic-plugin-sample.service"
+developer = "Beechat"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin_dir.join("kaonic-plugin-sample.service"),
+            "[Service]\nExecStart=/etc/kaonic/plugins/kaonic-plugin-sample/current/kaonic-plugin-sample\n",
+        )
+        .unwrap();
+        fs::write(current_dir.join("kaonic-plugin-sample"), b"broken").unwrap();
+        fs::write(
+            plugin_dir.join("kaonic-plugin-sample.sha256"),
+            "0000000000000000000000000000000000000000000000000000000000000000\n",
+        )
+        .unwrap();
+        fs::write(
+            rollback_dir.join(MANIFEST_NAME),
+            r#"[kaonic-plugin]
+name = "Sample"
+description = "Sample plugin"
+version = "0.1.0"
+service = "kaonic-plugin-sample.service"
+developer = "Beechat"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            rollback_dir.join("kaonic-plugin-sample.service"),
+            "[Service]\nExecStart=/etc/kaonic/plugins/kaonic-plugin-sample/current/kaonic-plugin-sample\n",
+        )
+        .unwrap();
+        fs::create_dir_all(rollback_dir.join("current")).unwrap();
+        fs::write(
+            rollback_dir.join("current").join("kaonic-plugin-sample"),
+            previous_binary,
+        )
+        .unwrap();
+        fs::write(
+            rollback_dir.join("kaonic-plugin-sample.sha256"),
+            format!("{previous_hash}\n"),
+        )
+        .unwrap();
+        fs::write(
+            rollback_dir.join("package.zip"),
+            b"rollback-zip",
+        )
+        .unwrap();
+
+        {
+            let conn = open_db(&db_path).unwrap();
+            upsert_plugin(
+                &conn,
+                PluginRecord {
+                    id: "kaonic-plugin-sample".into(),
+                    name: "Sample".into(),
+                    description: "Sample plugin".into(),
+                    version: "0.1.0".into(),
+                    service: "kaonic-plugin-sample.service".into(),
+                    developer: "Beechat".into(),
+                    github_url: None,
+                    binary_name: "kaonic-plugin-sample".into(),
+                    bin_path: None,
+                    sha256: previous_hash.clone(),
+                    install_dir: plugin_dir.to_string_lossy().into_owned(),
+                    package_path: plugin_dir.join("package.zip").to_string_lossy().into_owned(),
+                    official: false,
+                    enabled: false,
+                    removable: true,
+                    target_name: None,
+                    installed_at: 1,
+                    updated_at: 1,
+                },
+            )
+            .unwrap();
+        }
+
+        initialize_store(&plugins_root, &db_path, &systemd_dir, None, &[]).unwrap();
+
+        assert_eq!(
+            fs::read(plugin_dir.join("current").join("kaonic-plugin-sample")).unwrap(),
+            previous_binary
+        );
+        assert_eq!(
+            read_sha256_file(&plugin_dir.join("kaonic-plugin-sample.sha256")).unwrap(),
+            previous_hash
+        );
+        assert!(!rollback_dir.exists());
+    }
+
     fn build_test_plugin_zip() -> Vec<u8> {
         let binary = b"#!/bin/sh\nexit 0\n";
         let sha256 = hex::encode(Sha256::digest(binary));
@@ -1867,11 +2737,13 @@ developer = "Beechat"
             writer.start_file(MANIFEST_NAME, options).unwrap();
             writer
                 .write_all(
-                    br#"name = "Sample"
+                    br#"[kaonic-plugin]
+name = "Sample"
 description = "Sample plugin"
 version = "0.1.0"
 service = "kaonic-plugin-sample.service"
 developer = "Beechat"
+github_url = "https://github.com/BeechatNetworkSystemsLtd/kaonic-gateway"
 "#,
                 )
                 .unwrap();
@@ -1881,6 +2753,12 @@ developer = "Beechat"
             writer
                 .write_all(b"[Service]\nExecStart=/bin/true\n")
                 .unwrap();
+            writer
+                .start_file("files/config/settings.toml", options)
+                .unwrap();
+            writer.write_all(b"mode = \"demo\"\n").unwrap();
+            writer.start_file("files/.env", options).unwrap();
+            writer.write_all(b"NAME=sample\n").unwrap();
             writer
                 .start_file("kaonic-plugin-sample.sha256", options)
                 .unwrap();

@@ -78,14 +78,6 @@ pub async fn serve(state: AppState, addr: SocketAddr) {
         )
         .route("/api/vpn/ping", post(handlers::post_vpn_ping))
         .route("/api/vpn/speed-test", post(handlers::post_vpn_speed_test))
-        .route(
-            "/api/installer/{target}/version",
-            get(installer::get_version),
-        )
-        .route(
-            "/api/installer/{target}/upload",
-            post(installer::upload_update),
-        )
         .route("/api/plugins", get(installer::list_plugins))
         .route("/api/plugins/install", post(installer::install_plugin))
         .route(

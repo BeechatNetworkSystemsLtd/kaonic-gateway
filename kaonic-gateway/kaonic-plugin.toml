@@ -1,0 +1,8 @@
+[kaonic-plugin]
+name = "Kaonic Gateway"
+description = "Web gateway service that provides the Kaonic device UI, system APIs, plugin management, and runtime status views."
+version = "0.1.0"
+service = "kaonic-gateway.service"
+developer = "Beechat Network Systems Ltd"
+github_url = "https://github.com/BeechatNetworkSystemsLtd/kaonic-gateway"
+bin_path = "/usr/bin/kaonic-gateway"

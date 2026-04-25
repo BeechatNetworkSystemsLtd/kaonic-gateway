@@ -17,7 +17,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 mod installer;
 mod plugins;
 
-use installer::{apply_update, get_version, validate_on_boot, Target};
+use installer::{validate_on_boot, Target};
 
 const META_DIR: &str = "/etc/kaonic";
 const BIN_DIR: &str = "/usr/bin";
@@ -37,8 +37,6 @@ struct Cmd {
 
 #[derive(Clone)]
 struct AppState {
-    commd: Arc<Target>,
-    gateway: Arc<Target>,
     core_plugins: Vec<plugins::CorePluginSpec>,
     plugins_root: PathBuf,
     plugins_db: PathBuf,
@@ -95,8 +93,6 @@ async fn main() {
                 "Beechat Network Systems Ltd",
             ),
         ],
-        commd,
-        gateway,
         plugins_root: PathBuf::from(PLUGINS_DIR),
         plugins_db: PathBuf::from(PLUGINS_DB),
         systemd_dir: PathBuf::from(SYSTEMD_DIR),
@@ -106,15 +102,16 @@ async fn main() {
     if let Err(err) = plugins::initialize_store(
         &state.plugins_root,
         &state.plugins_db,
+        &state.systemd_dir,
         Some(&state.cert_path),
         &state.core_plugins,
     ) {
         log::error!("failed to initialize plugin store: {err}");
+    } else if let Err(err) = plugins::log_boot_inventory(&state.plugins_root, &state.plugins_db) {
+        log::error!("failed to log plugin boot inventory: {err}");
     }
 
     let app = Router::new()
-        .route("/api/installer/:target/version", get(handle_version))
-        .route("/api/installer/:target/upload", post(handle_upload))
         .route("/api/plugins", get(handle_plugins_list))
         .route("/api/plugins/install", post(handle_plugin_install))
         .route("/api/plugins/:plugin_id/upload", post(handle_plugin_upload))
@@ -138,69 +135,37 @@ async fn main() {
 
 // ── handlers ─────────────────────────────────────────────────────────────────
 
-async fn handle_version(
-    Path(target): Path<String>,
-    State(state): State<AppState>,
-) -> impl IntoResponse {
-    match resolve_target(&state, &target) {
-        Some(t) => Json(get_version(&t)).into_response(),
-        None => (StatusCode::NOT_FOUND, "unknown target").into_response(),
-    }
-}
-
-async fn handle_upload(
-    Path(target): Path<String>,
-    State(state): State<AppState>,
-    multipart: Multipart,
-) -> impl IntoResponse {
-    let t = match resolve_target(&state, &target) {
-        Some(t) => t,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"detail":"unknown target"})),
-            )
-                .into_response()
-        }
-    };
-
-    let zip_bytes = match read_upload_bytes(multipart).await {
-        Ok(bytes) => bytes,
-        Err(response) => return response,
-    };
-
-    // Run the blocking OTA logic on a threadpool thread so we don't block Tokio
-    let result = tokio::task::spawn_blocking(move || apply_update(&t, &zip_bytes))
-        .await
-        .unwrap_or_else(|e| Err(format!("task panic: {e}")));
-
-    match result {
-        Ok(msg) => Json(serde_json::json!({"detail": msg})).into_response(),
-        Err(msg) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"detail": msg})),
-        )
-            .into_response(),
-    }
-}
-
 async fn handle_plugins_list(State(state): State<AppState>) -> impl IntoResponse {
+    log::debug!("listing plugins");
     let plugins_root = state.plugins_root.clone();
     let plugins_db = state.plugins_db.clone();
     let cert_path = state.cert_path.clone();
     let core_plugins = state.core_plugins.clone();
+    let systemd_dir = state.systemd_dir.clone();
     match tokio::task::spawn_blocking(move || {
-        plugins::list_plugins(&plugins_root, &plugins_db, Some(&cert_path), &core_plugins)
+        plugins::list_plugins(
+            &plugins_root,
+            &plugins_db,
+            &systemd_dir,
+            Some(&cert_path),
+            &core_plugins,
+        )
     })
     .await
     {
-        Ok(Ok(records)) => Json(records).into_response(),
-        Ok(Err(err)) => plugin_error_response(err),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"detail": format!("plugin task panic: {err}")})),
-        )
-            .into_response(),
+        Ok(Ok(records)) => {
+            log::debug!("plugin list returned {} records", records.len());
+            Json(records).into_response()
+        }
+        Ok(Err(err)) => plugin_error_response("list plugins", err),
+        Err(err) => {
+            log::error!("plugin list task panic: {err}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"detail": format!("plugin task panic: {err}")})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -208,10 +173,12 @@ async fn handle_plugin_install(
     State(state): State<AppState>,
     multipart: Multipart,
 ) -> impl IntoResponse {
+    log::info!("received plugin install upload");
     let zip_bytes = match read_upload_bytes(multipart).await {
         Ok(bytes) => bytes,
         Err(response) => return response,
     };
+    log::info!("starting plugin install payload_bytes={}", zip_bytes.len());
     let plugins_root = state.plugins_root.clone();
     let plugins_db = state.plugins_db.clone();
     let systemd_dir = state.systemd_dir.clone();
@@ -230,13 +197,19 @@ async fn handle_plugin_install(
     })
     .await
     {
-        Ok(Ok(response)) => Json(response).into_response(),
-        Ok(Err(err)) => plugin_error_response(err),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"detail": format!("plugin task panic: {err}")})),
-        )
-            .into_response(),
+        Ok(Ok(response)) => {
+            log::info!("plugin install completed detail={}", response.detail);
+            Json(response).into_response()
+        }
+        Ok(Err(err)) => plugin_error_response("install plugin", err),
+        Err(err) => {
+            log::error!("plugin install task panic: {err}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"detail": format!("plugin task panic: {err}")})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -245,15 +218,22 @@ async fn handle_plugin_upload(
     State(state): State<AppState>,
     multipart: Multipart,
 ) -> impl IntoResponse {
+    log::info!("received plugin update upload for plugin_id={plugin_id}");
     let zip_bytes = match read_upload_bytes(multipart).await {
         Ok(bytes) => bytes,
         Err(response) => return response,
     };
+    log::info!(
+        "starting plugin update for plugin_id={} payload_bytes={}",
+        plugin_id,
+        zip_bytes.len()
+    );
     let plugins_root = state.plugins_root.clone();
     let plugins_db = state.plugins_db.clone();
     let systemd_dir = state.systemd_dir.clone();
     let cert_path = state.cert_path.clone();
     let core_plugins = state.core_plugins.clone();
+    let plugin_id_for_task = plugin_id.clone();
 
     match tokio::task::spawn_blocking(move || {
         plugins::upload_plugin_update(
@@ -262,19 +242,29 @@ async fn handle_plugin_upload(
             &systemd_dir,
             &cert_path,
             &core_plugins,
-            &plugin_id,
+            &plugin_id_for_task,
             &zip_bytes,
         )
     })
     .await
     {
-        Ok(Ok(response)) => Json(response).into_response(),
-        Ok(Err(err)) => plugin_error_response(err),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"detail": format!("plugin task panic: {err}")})),
-        )
-            .into_response(),
+        Ok(Ok(response)) => {
+            log::info!(
+                "plugin update completed for plugin_id={} detail={}",
+                plugin_id,
+                response.detail
+            );
+            Json(response).into_response()
+        }
+        Ok(Err(err)) => plugin_error_response(&format!("update plugin {plugin_id}"), err),
+        Err(err) => {
+            log::error!("plugin update task panic for plugin_id={plugin_id}: {err}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"detail": format!("plugin task panic: {err}")})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -303,21 +293,33 @@ async fn handle_plugin_delete(
     Path(plugin_id): Path<String>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
+    log::info!("received delete request for plugin_id={plugin_id}");
     let plugins_root = state.plugins_root.clone();
     let plugins_db = state.plugins_db.clone();
     let systemd_dir = state.systemd_dir.clone();
+    let plugin_id_for_task = plugin_id.clone();
     match tokio::task::spawn_blocking(move || {
-        plugins::delete_plugin(&plugins_root, &plugins_db, &systemd_dir, &plugin_id)
+        plugins::delete_plugin(&plugins_root, &plugins_db, &systemd_dir, &plugin_id_for_task)
     })
     .await
     {
-        Ok(Ok(response)) => Json(response).into_response(),
-        Ok(Err(err)) => plugin_error_response(err),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"detail": format!("plugin task panic: {err}")})),
-        )
-            .into_response(),
+        Ok(Ok(response)) => {
+            log::info!(
+                "delete completed for plugin_id={} detail={}",
+                plugin_id,
+                response.detail
+            );
+            Json(response).into_response()
+        }
+        Ok(Err(err)) => plugin_error_response(&format!("delete plugin {plugin_id}"), err),
+        Err(err) => {
+            log::error!("plugin delete task panic for plugin_id={plugin_id}: {err}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"detail": format!("plugin task panic: {err}")})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -327,53 +329,98 @@ async fn handle_plugin_action(
     action: plugins::PluginAction,
 ) -> axum::response::Response {
     let plugins_db = state.plugins_db.clone();
+    let action_name = action.as_str().to_string();
+    log::info!("received plugin action request action={} plugin_id={}", action_name, plugin_id);
+    let plugin_id_for_task = plugin_id.clone();
     match tokio::task::spawn_blocking(move || {
-        plugins::control_plugin(&plugins_db, &plugin_id, action)
+        plugins::control_plugin(&plugins_db, &plugin_id_for_task, action)
     })
     .await
     {
-        Ok(Ok(response)) => Json(response).into_response(),
-        Ok(Err(err)) => plugin_error_response(err),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"detail": format!("plugin task panic: {err}")})),
-        )
-            .into_response(),
+        Ok(Ok(response)) => {
+            log::info!(
+                "plugin action completed action={} detail={}",
+                action_name,
+                response.detail
+            );
+            Json(response).into_response()
+        }
+        Ok(Err(err)) => plugin_error_response(
+            &format!("{} plugin {}", action_name, plugin_id),
+            err,
+        ),
+        Err(err) => {
+            log::error!(
+                "plugin action task panic action={} plugin_id={}: {err}",
+                action_name,
+                plugin_id
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"detail": format!("plugin task panic: {err}")})),
+            )
+                .into_response()
+        }
     }
 }
 
 async fn read_upload_bytes(mut multipart: Multipart) -> Result<Bytes, axum::response::Response> {
     loop {
         match multipart.next_field().await {
-            Ok(Some(field)) => match field.bytes().await {
-                Ok(bytes) => return Ok(bytes),
-                Err(err) => {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({"detail": format!("read error: {err}")})),
-                    )
-                        .into_response())
+            Ok(Some(field)) => {
+                let field_name = field.name().map(str::to_string);
+                let file_name = field.file_name().map(str::to_string);
+                match field.bytes().await {
+                    Ok(bytes) => {
+                        log::debug!(
+                            "received multipart field name={:?} file_name={:?} bytes={}",
+                            field_name,
+                            file_name,
+                            bytes.len()
+                        );
+                        return Ok(bytes);
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "failed reading multipart field name={:?} file_name={:?}: {}",
+                            field_name,
+                            file_name,
+                            err
+                        );
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({"detail": format!("read error: {err}")})),
+                        )
+                            .into_response());
+                    }
                 }
-            },
+            }
             Ok(None) => {
+                log::warn!("multipart upload missing file field");
                 return Err((
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({"detail": "no file uploaded"})),
                 )
-                    .into_response())
+                    .into_response());
             }
             Err(err) => {
+                log::warn!("multipart parsing error: {}", err);
                 return Err((
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({"detail": format!("multipart error: {err}")})),
                 )
-                    .into_response())
+                    .into_response());
             }
         }
     }
 }
 
-fn plugin_error_response(err: plugins::PluginError) -> axum::response::Response {
+fn plugin_error_response(context: &str, err: plugins::PluginError) -> axum::response::Response {
+    if err.status.is_server_error() {
+        log::error!("{} failed status={} detail={}", context, err.status, err.detail);
+    } else {
+        log::warn!("{} failed status={} detail={}", context, err.status, err.detail);
+    }
     (
         err.status,
         Json(serde_json::json!({
@@ -381,12 +428,4 @@ fn plugin_error_response(err: plugins::PluginError) -> axum::response::Response 
         })),
     )
         .into_response()
-}
-
-fn resolve_target(state: &AppState, name: &str) -> Option<Arc<Target>> {
-    match name {
-        "commd" => Some(state.commd.clone()),
-        "gateway" => Some(state.gateway.clone()),
-        _ => None,
-    }
 }
