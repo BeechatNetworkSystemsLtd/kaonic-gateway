@@ -12,6 +12,10 @@ pub async fn list_plugins() -> impl IntoResponse {
     proxy_get(format!("{UPDATE_BASE}/api/plugins")).await
 }
 
+pub async fn installer_version() -> impl IntoResponse {
+    proxy_get(format!("{UPDATE_BASE}/api/plugins/installer-version")).await
+}
+
 pub async fn install_plugin(req: Request<Body>) -> impl IntoResponse {
     proxy_request(
         Method::POST,

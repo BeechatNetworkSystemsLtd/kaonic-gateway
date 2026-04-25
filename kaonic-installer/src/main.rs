@@ -113,6 +113,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/api/plugins", get(handle_plugins_list))
+        .route("/api/plugins/installer-version", get(handle_installer_version))
         .route("/api/plugins/install", post(handle_plugin_install))
         .route("/api/plugins/:plugin_id/upload", post(handle_plugin_upload))
         .route("/api/plugins/:plugin_id/start", post(handle_plugin_start))
@@ -167,6 +168,10 @@ async fn handle_plugins_list(State(state): State<AppState>) -> impl IntoResponse
                 .into_response()
         }
     }
+}
+
+async fn handle_installer_version() -> impl IntoResponse {
+    Json(serde_json::json!({ "version": env!("CARGO_PKG_VERSION") })).into_response()
 }
 
 async fn handle_plugin_install(

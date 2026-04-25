@@ -80,6 +80,7 @@ pub struct CorePluginSpec {
     pub name: String,
     pub description: String,
     pub developer: String,
+    pub channel: Option<String>,
 }
 
 impl CorePluginSpec {
@@ -101,6 +102,7 @@ impl CorePluginSpec {
             name: name.into(),
             description: description.into(),
             developer: developer.into(),
+            channel: Some("stable".into()),
         }
     }
 }
@@ -112,6 +114,8 @@ struct PluginManifest {
     version: String,
     service: String,
     developer: String,
+    #[serde(default)]
+    channel: Option<String>,
     #[serde(default)]
     github_url: Option<String>,
     #[serde(default)]
@@ -153,6 +157,7 @@ struct PluginRecord {
     version: String,
     service: String,
     developer: String,
+    channel: Option<String>,
     github_url: Option<String>,
     binary_name: String,
     bin_path: Option<String>,
@@ -175,6 +180,7 @@ pub struct PluginSummary {
     pub version: String,
     pub service: String,
     pub developer: String,
+    pub channel: Option<String>,
     pub github_url: Option<String>,
     pub binary_name: String,
     pub bin_path: Option<String>,
@@ -227,6 +233,7 @@ pub fn initialize_store(
     recover_plugins_after_interruption(plugins_root, &conn, systemd_dir, cert_path)?;
     discover_plugins(plugins_root, &conn, cert_path)?;
     sync_core_plugins(&conn, core_plugins)?;
+    reconcile_plugin_bin_paths(&conn)?;
     Ok(())
 }
 
@@ -242,7 +249,7 @@ pub fn list_plugins(
     let conn = open_db(db_path)?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, name, description, version, service, developer, github_url, binary_name, bin_path, sha256, install_dir, package_path, official, enabled, removable, target_name, installed_at, updated_at
+            "SELECT id, name, description, version, service, developer, channel, github_url, binary_name, bin_path, sha256, install_dir, package_path, official, enabled, removable, target_name, installed_at, updated_at
              FROM plugins
              ORDER BY name COLLATE NOCASE, id",
         )
@@ -257,18 +264,19 @@ pub fn list_plugins(
                 version: row.get(3)?,
                 service: row.get(4)?,
                 developer: row.get(5)?,
-                github_url: row.get(6)?,
-                binary_name: row.get(7)?,
-                bin_path: row.get(8)?,
-                sha256: row.get(9)?,
-                install_dir: row.get(10)?,
-                package_path: row.get(11)?,
-                official: row.get::<_, i64>(12)? != 0,
-                enabled: row.get::<_, i64>(13)? != 0,
-                removable: row.get::<_, i64>(14)? != 0,
-                target_name: row.get(15)?,
-                installed_at: row.get(16)?,
-                updated_at: row.get(17)?,
+                channel: row.get(6)?,
+                github_url: row.get(7)?,
+                binary_name: row.get(8)?,
+                bin_path: row.get(9)?,
+                sha256: row.get(10)?,
+                install_dir: row.get(11)?,
+                package_path: row.get(12)?,
+                official: row.get::<_, i64>(13)? != 0,
+                enabled: row.get::<_, i64>(14)? != 0,
+                removable: row.get::<_, i64>(15)? != 0,
+                target_name: row.get(16)?,
+                installed_at: row.get(17)?,
+                updated_at: row.get(18)?,
             })
         })
         .map_err(|err| PluginError::internal(format!("query plugins: {err}")))?;
@@ -287,6 +295,7 @@ pub fn list_plugins(
             version: record.version,
             service: record.service,
             developer: record.developer,
+            channel: record.channel,
             github_url: record.github_url,
             binary_name: record.binary_name,
             bin_path: record.bin_path,
@@ -528,6 +537,7 @@ pub fn install_plugin(
                 version: package.manifest.version.clone(),
                 service: package.service_name.clone(),
                 developer: package.manifest.developer.clone(),
+                channel: normalize_channel(package.manifest.channel.as_deref())?,
                 github_url: normalize_github_url(package.manifest.github_url.as_deref()),
                 binary_name: package.binary_name.clone(),
                 bin_path: package.bin_path.clone(),
@@ -1023,6 +1033,7 @@ fn discover_plugin_record(
         version: manifest.version,
         service: service_name.clone(),
         developer: manifest.developer,
+        channel: normalize_channel(manifest.channel.as_deref())?,
         github_url: normalize_github_url(manifest.github_url.as_deref()),
         binary_name,
         bin_path: normalize_bin_path(manifest.bin_path.as_deref())?,
@@ -1055,6 +1066,7 @@ fn validate_manifest(manifest: &PluginManifest) -> PluginResult<()> {
             "plugin developer must not be empty",
         ));
     }
+    let _ = normalize_channel(manifest.channel.as_deref())?;
     let _ = normalize_github_url(manifest.github_url.as_deref());
     normalize_bin_path(manifest.bin_path.as_deref())?;
     derive_binary_name(manifest.service.trim()).map(|_| ())
@@ -1275,6 +1287,23 @@ fn normalize_github_url(github_url: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn normalize_channel(channel: Option<&str>) -> PluginResult<Option<String>> {
+    let Some(channel) = channel.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let normalized = channel.to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "dev" | "experimental" | "unstable" | "stable"
+    ) {
+        Ok(Some(normalized))
+    } else {
+        Err(PluginError::bad_request(
+            "plugin channel must be one of: dev, experimental, unstable, stable",
+        ))
+    }
 }
 
 fn collect_plugin_paths(root: &Path, current: &Path, out: &mut Vec<String>) -> PluginResult<()> {
@@ -1780,6 +1809,7 @@ fn init_db(conn: &Connection) -> PluginResult<()> {
             version TEXT NOT NULL,
             service TEXT NOT NULL UNIQUE,
             developer TEXT NOT NULL,
+            channel TEXT,
             github_url TEXT,
             binary_name TEXT NOT NULL,
             bin_path TEXT,
@@ -1816,6 +1846,12 @@ fn init_db(conn: &Connection) -> PluginResult<()> {
     ensure_column_exists(
         conn,
         "plugins",
+        "channel",
+        "ALTER TABLE plugins ADD COLUMN channel TEXT",
+    )?;
+    ensure_column_exists(
+        conn,
+        "plugins",
         "target_name",
         "ALTER TABLE plugins ADD COLUMN target_name TEXT",
     )?;
@@ -1840,7 +1876,7 @@ fn init_db(conn: &Connection) -> PluginResult<()> {
 
 fn load_plugin(conn: &Connection, plugin_id: &str) -> PluginResult<Option<PluginRecord>> {
     conn.query_row(
-        "SELECT id, name, description, version, service, developer, github_url, binary_name, bin_path, sha256, install_dir, package_path, official, enabled, removable, target_name, installed_at, updated_at
+        "SELECT id, name, description, version, service, developer, channel, github_url, binary_name, bin_path, sha256, install_dir, package_path, official, enabled, removable, target_name, installed_at, updated_at
          FROM plugins
          WHERE id = ?1",
         params![plugin_id],
@@ -1852,23 +1888,80 @@ fn load_plugin(conn: &Connection, plugin_id: &str) -> PluginResult<Option<Plugin
                 version: row.get(3)?,
                 service: row.get(4)?,
                 developer: row.get(5)?,
-                github_url: row.get(6)?,
-                binary_name: row.get(7)?,
-                bin_path: row.get(8)?,
-                sha256: row.get(9)?,
-                install_dir: row.get(10)?,
-                package_path: row.get(11)?,
-                official: row.get::<_, i64>(12)? != 0,
-                enabled: row.get::<_, i64>(13)? != 0,
-                removable: row.get::<_, i64>(14)? != 0,
-                target_name: row.get(15)?,
-                installed_at: row.get(16)?,
-                updated_at: row.get(17)?,
+                channel: row.get(6)?,
+                github_url: row.get(7)?,
+                binary_name: row.get(8)?,
+                bin_path: row.get(9)?,
+                sha256: row.get(10)?,
+                install_dir: row.get(11)?,
+                package_path: row.get(12)?,
+                official: row.get::<_, i64>(13)? != 0,
+                enabled: row.get::<_, i64>(14)? != 0,
+                removable: row.get::<_, i64>(15)? != 0,
+                target_name: row.get(16)?,
+                installed_at: row.get(17)?,
+                updated_at: row.get(18)?,
             })
         },
     )
     .optional()
     .map_err(|err| PluginError::internal(format!("load plugin {plugin_id}: {err}")))
+}
+
+fn load_all_plugins(conn: &Connection) -> PluginResult<Vec<PluginRecord>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, name, description, version, service, developer, channel, github_url, binary_name, bin_path, sha256, install_dir, package_path, official, enabled, removable, target_name, installed_at, updated_at
+             FROM plugins
+             ORDER BY name COLLATE NOCASE, id",
+        )
+        .map_err(|err| PluginError::internal(format!("prepare plugin query: {err}")))?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(PluginRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                version: row.get(3)?,
+                service: row.get(4)?,
+                developer: row.get(5)?,
+                channel: row.get(6)?,
+                github_url: row.get(7)?,
+                binary_name: row.get(8)?,
+                bin_path: row.get(9)?,
+                sha256: row.get(10)?,
+                install_dir: row.get(11)?,
+                package_path: row.get(12)?,
+                official: row.get::<_, i64>(13)? != 0,
+                enabled: row.get::<_, i64>(14)? != 0,
+                removable: row.get::<_, i64>(15)? != 0,
+                target_name: row.get(16)?,
+                installed_at: row.get(17)?,
+                updated_at: row.get(18)?,
+            })
+        })
+        .map_err(|err| PluginError::internal(format!("query plugins: {err}")))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|err| PluginError::internal(format!("read plugins: {err}")))
+}
+
+fn reconcile_plugin_bin_paths(conn: &Connection) -> PluginResult<()> {
+    for record in load_all_plugins(conn)? {
+        if record.target_name.is_some() || !record.removable {
+            continue;
+        }
+        let Some(_) = record.bin_path.as_deref() else {
+            continue;
+        };
+        let target = current_binary_path(&record);
+        if !target.is_file() {
+            continue;
+        }
+        install_bin_path(record.bin_path.as_deref(), None, &target, Path::new(""))?;
+    }
+    Ok(())
 }
 
 fn ensure_service_available(
@@ -1968,6 +2061,7 @@ fn sync_core_plugins(conn: &Connection, core_plugins: &[CorePluginSpec]) -> Plug
                 version,
                 service: spec.target.service.to_string(),
                 developer: spec.developer.clone(),
+                channel: spec.channel.clone(),
                 github_url: None,
                 binary_name,
                 bin_path: None,
@@ -1995,14 +2089,15 @@ fn sync_core_plugins(conn: &Connection, core_plugins: &[CorePluginSpec]) -> Plug
 fn upsert_plugin(conn: &Connection, record: PluginRecord) -> PluginResult<()> {
     conn.execute(
         "INSERT INTO plugins (
-            id, name, description, version, service, developer, github_url, binary_name, bin_path, sha256, install_dir, package_path, official, enabled, removable, target_name, installed_at, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+            id, name, description, version, service, developer, channel, github_url, binary_name, bin_path, sha256, install_dir, package_path, official, enabled, removable, target_name, installed_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
         ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             description = excluded.description,
             version = excluded.version,
             service = excluded.service,
             developer = excluded.developer,
+            channel = excluded.channel,
             github_url = excluded.github_url,
             binary_name = excluded.binary_name,
             bin_path = excluded.bin_path,
@@ -2022,6 +2117,7 @@ fn upsert_plugin(conn: &Connection, record: PluginRecord) -> PluginResult<()> {
             record.version,
             record.service,
             record.developer,
+            record.channel,
             record.github_url,
             record.binary_name,
             record.bin_path,
@@ -2384,6 +2480,7 @@ mod tests {
         let package = parse_plugin_package(&zip_bytes).unwrap();
         assert_eq!(package.id, "kaonic-plugin-sample");
         assert_eq!(package.manifest.name, "Sample");
+        assert_eq!(package.manifest.channel.as_deref(), Some("experimental"));
         assert_eq!(package.sha256.len(), 64);
         assert_eq!(package.custom_files.len(), 2);
         assert_eq!(
@@ -2399,6 +2496,14 @@ mod tests {
         let zip_bytes = build_test_plugin_zip_with_hash("deadbeef");
         let err = parse_plugin_package(&zip_bytes).unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn rejects_invalid_plugin_channel() {
+        let zip_bytes = build_test_plugin_zip_with_channel("beta");
+        let err = parse_plugin_package(&zip_bytes).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.detail.contains("plugin channel"));
     }
 
     #[test]
@@ -2467,6 +2572,7 @@ description = "Sample plugin"
 version = "0.1.0"
 service = "kaonic-plugin-sample.service"
 developer = "Beechat"
+channel = "stable"
 github_url = "https://github.com/BeechatNetworkSystemsLtd/kaonic-gateway"
 "#,
         )
@@ -2495,7 +2601,64 @@ github_url = "https://github.com/BeechatNetworkSystemsLtd/kaonic-gateway"
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].id, "kaonic-plugin-sample");
         assert_eq!(plugins[0].service, "kaonic-plugin-sample.service");
+        assert_eq!(plugins[0].channel.as_deref(), Some("stable"));
         assert_eq!(plugins[0].sha256, binary_hash);
+    }
+
+    #[test]
+    fn initialize_store_recreates_bin_path_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugins_root = tmp.path().join("plugins");
+        let plugin_dir = plugins_root.join("kaonic-plugin-sample");
+        let current_dir = plugin_dir.join("current");
+        let bin_link = tmp.path().join("usr/bin/kaonic-plugin-sample");
+        fs::create_dir_all(&current_dir).unwrap();
+        fs::write(
+            plugin_dir.join(MANIFEST_NAME),
+            format!(
+                r#"[kaonic-plugin]
+name = "Sample"
+description = "Sample plugin"
+version = "0.1.0"
+service = "kaonic-plugin-sample.service"
+developer = "Beechat"
+channel = "stable"
+bin_path = "{}"
+"#,
+                bin_link.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            plugin_dir.join("kaonic-plugin-sample.service"),
+            "[Service]\nExecStart=/etc/kaonic/plugins/kaonic-plugin-sample/current/kaonic-plugin-sample\n",
+        )
+        .unwrap();
+        fs::write(
+            current_dir.join("kaonic-plugin-sample"),
+            b"#!/bin/sh\nexit 0\n",
+        )
+        .unwrap();
+        let binary_hash = hex::encode(Sha256::digest(b"#!/bin/sh\nexit 0\n"));
+        fs::write(
+            plugin_dir.join("kaonic-plugin-sample.sha256"),
+            format!("{binary_hash}\n"),
+        )
+        .unwrap();
+
+        let db_path = plugins_root.join("kaonic-plugins.db");
+        initialize_store(&plugins_root, &db_path, tmp.path(), None, &[]).unwrap();
+        assert_eq!(
+            fs::read_link(&bin_link).unwrap(),
+            current_dir.join("kaonic-plugin-sample")
+        );
+
+        fs::remove_file(&bin_link).unwrap();
+        initialize_store(&plugins_root, &db_path, tmp.path(), None, &[]).unwrap();
+        assert_eq!(
+            fs::read_link(&bin_link).unwrap(),
+            current_dir.join("kaonic-plugin-sample")
+        );
     }
 
     #[test]
@@ -2513,6 +2676,7 @@ description = "Sample plugin"
 version = "0.1.0"
 service = "kaonic-plugin-sample.service"
 developer = "Beechat"
+channel = "experimental"
 "#,
         )
         .unwrap();
@@ -2693,6 +2857,7 @@ developer = "Beechat"
                     version: "0.1.0".into(),
                     service: "kaonic-plugin-sample.service".into(),
                     developer: "Beechat".into(),
+                    channel: Some("stable".into()),
                     github_url: None,
                     binary_name: "kaonic-plugin-sample".into(),
                     bin_path: None,
@@ -2726,27 +2891,29 @@ developer = "Beechat"
     fn build_test_plugin_zip() -> Vec<u8> {
         let binary = b"#!/bin/sh\nexit 0\n";
         let sha256 = hex::encode(Sha256::digest(binary));
-        build_test_plugin_zip_with_hash(&sha256)
+        build_test_plugin_zip_with_hash_and_channel(&sha256, "experimental")
+    }
+
+    fn build_test_plugin_zip_with_channel(channel: &str) -> Vec<u8> {
+        let binary = b"#!/bin/sh\nexit 0\n";
+        let sha256 = hex::encode(Sha256::digest(binary));
+        build_test_plugin_zip_with_hash_and_channel(&sha256, channel)
     }
 
     fn build_test_plugin_zip_with_hash(sha256: &str) -> Vec<u8> {
+        build_test_plugin_zip_with_hash_and_channel(sha256, "experimental")
+    }
+
+    fn build_test_plugin_zip_with_hash_and_channel(sha256: &str, channel: &str) -> Vec<u8> {
         let mut cursor = Cursor::new(Vec::<u8>::new());
         {
             let mut writer = ZipWriter::new(&mut cursor);
             let options = SimpleFileOptions::default();
             writer.start_file(MANIFEST_NAME, options).unwrap();
-            writer
-                .write_all(
-                    br#"[kaonic-plugin]
-name = "Sample"
-description = "Sample plugin"
-version = "0.1.0"
-service = "kaonic-plugin-sample.service"
-developer = "Beechat"
-github_url = "https://github.com/BeechatNetworkSystemsLtd/kaonic-gateway"
-"#,
-                )
-                .unwrap();
+            let manifest = format!(
+                "[kaonic-plugin]\nname = \"Sample\"\ndescription = \"Sample plugin\"\nversion = \"0.1.0\"\nservice = \"kaonic-plugin-sample.service\"\ndeveloper = \"Beechat\"\nchannel = \"{channel}\"\ngithub_url = \"https://github.com/BeechatNetworkSystemsLtd/kaonic-gateway\"\n"
+            );
+            writer.write_all(manifest.as_bytes()).unwrap();
             writer
                 .start_file("kaonic-plugin-sample.service", options)
                 .unwrap();

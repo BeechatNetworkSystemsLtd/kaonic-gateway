@@ -982,19 +982,18 @@ select.field-input {
   word-break: break-all;
 }
 
-.plugins-action-status {
-  min-height: 20px;
+.plugins-shell-footer {
   margin-top: 18px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.plugins-shell-footer-label {
   font-size: 13px;
   font-weight: 600;
-}
-
-.plugins-action-status.ok {
-  color: var(--ok);
-}
-
-.plugins-action-status.warn {
-  color: var(--warn);
+  color: var(--text-muted);
 }
 
 .plugins-file-input {

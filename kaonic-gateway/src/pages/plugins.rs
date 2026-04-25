@@ -8,6 +8,8 @@ const PLUGINS_JS: &str = r#"
         selectedId: '',
         plugins: [],
         systemdSamples: {},
+        installerVersion: '',
+        loadError: '',
         loading: false,
         busyAction: {
             pluginId: '',
@@ -42,11 +44,17 @@ const PLUGINS_JS: &str = r#"
         return 'badge';
     }
 
-    function setStatus(text, kind) {
-        var el = document.getElementById('plugins-action-status');
+    function setInstallerVersion(version) {
+        state.installerVersion = version || '';
+        var el = document.getElementById('plugins-installer-version');
         if (!el) { return; }
-        el.textContent = text || '';
-        el.className = 'plugins-action-status' + (kind ? ' ' + kind : '');
+        el.textContent = state.installerVersion
+            ? 'v' + state.installerVersion
+            : 'Unavailable';
+    }
+
+    function showActionError(err) {
+        window.alert('Plugin action failed: ' + (err && err.message ? err.message : err));
     }
 
     function setLoading(loading) {
@@ -287,6 +295,24 @@ const PLUGINS_JS: &str = r#"
             : escaped(modalActionLabel());
     }
 
+    function loadInstallerVersion() {
+        return fetch('/api/plugins/installer-version')
+            .then(function(resp) {
+                if (!resp.ok) {
+                    return resp.json().catch(function() { return {}; }).then(function(data) {
+                        throw new Error(data.detail || ('HTTP ' + resp.status));
+                    });
+                }
+                return resp.json();
+            })
+            .then(function(data) {
+                setInstallerVersion((data && data.version) || '');
+            })
+            .catch(function() {
+                setInstallerVersion('');
+            });
+    }
+
     function loadPlugins(message, kind, options) {
         options = options || {};
         if (!options.background) { setLoading(true); }
@@ -301,16 +327,17 @@ const PLUGINS_JS: &str = r#"
             })
             .then(function(plugins) {
                 state.plugins = Array.isArray(plugins) ? plugins : [];
+                state.loadError = '';
                 enrichRealtimeMetrics(state.plugins);
                 ensureSelection();
-                if (message) { setStatus(message, kind || 'ok'); }
-                else if (!state.plugins.length && !options.background) { setStatus('No plugins installed yet.', ''); }
                 render();
             })
             .catch(function(err) {
-                if (!options.background) {
-                    setStatus('Error: ' + (err.message || err), 'warn');
+                if (!options.background && !state.plugins.length) {
+                    state.loadError = 'Unable to load plugins: ' + (err.message || err);
+                    render();
                 }
+                if (options.propagateError) { throw err; }
             })
             .finally(function() {
                 if (!options.background) { setLoading(false); }
@@ -322,6 +349,10 @@ const PLUGINS_JS: &str = r#"
         var count = document.getElementById('plugins-count');
         if (count) { count.textContent = String(state.plugins.length); }
         if (!list) { return; }
+        if (state.loadError && !state.plugins.length) {
+            list.innerHTML = '<div class=\"plugins-empty\">' + escaped(state.loadError) + '</div>';
+            return;
+        }
         if (!state.plugins.length) {
             list.innerHTML = '<div class=\"plugins-empty\">No plugins installed.</div>';
             return;
@@ -342,7 +373,9 @@ const PLUGINS_JS: &str = r#"
         if (!panel) { return; }
         var plugin = currentPlugin();
         if (!plugin) {
-            panel.innerHTML = '<div class=\"plugins-empty plugins-empty--detail\">Select a plugin from the left list.</div>';
+            panel.innerHTML = state.loadError && !state.plugins.length
+                ? '<div class=\"plugins-empty plugins-empty--detail\">' + escaped(state.loadError) + '</div>'
+                : '<div class=\"plugins-empty plugins-empty--detail\">Select a plugin from the left list.</div>';
             return;
         }
         var running = String(plugin.status || '').toLowerCase().includes('running') || String(plugin.status || '').toLowerCase() === 'active';
@@ -377,11 +410,12 @@ const PLUGINS_JS: &str = r#"
                 + deleteAction
             + '</div>'
             + '<div class=\"plugins-detail-grid\">'
-                + '<div class=\"info-row\"><span class=\"info-label\">Version</span><span class=\"info-value\">' + escaped(detailValue(plugin.version)) + '</span></div>'
-                + '<div class=\"info-row\"><span class=\"info-label\">Service name</span><code class=\"info-value\">' + escaped(detailValue(plugin.service)) + '</code></div>'
-                + '<div class=\"info-row\"><span class=\"info-label\">SHA-256</span><code class=\"info-value\">' + escaped(detailValue(plugin.sha256)) + '</code></div>'
-                + '<div class=\"info-row\"><span class=\"info-label\">GitHub URL</span><span class=\"info-value\">' + githubLink(plugin.github_url) + '</span></div>'
-            + '</div>';
+                 + '<div class=\"info-row\"><span class=\"info-label\">Version</span><span class=\"info-value\">' + escaped(detailValue(plugin.version)) + '</span></div>'
+                 + '<div class=\"info-row\"><span class=\"info-label\">Channel</span><span class=\"info-value\">' + escaped(detailValue(plugin.channel)) + '</span></div>'
+                 + '<div class=\"info-row\"><span class=\"info-label\">Service name</span><code class=\"info-value\">' + escaped(detailValue(plugin.service)) + '</code></div>'
+                 + '<div class=\"info-row\"><span class=\"info-label\">SHA-256</span><code class=\"info-value\">' + escaped(detailValue(plugin.sha256)) + '</code></div>'
+                 + '<div class=\"info-row\"><span class=\"info-label\">GitHub URL</span><span class=\"info-value\">' + githubLink(plugin.github_url) + '</span></div>'
+             + '</div>';
         if (plugin.systemd_status) {
             panel.innerHTML += ''
                 + '<div class=\"plugins-runtime-card\">'
@@ -420,10 +454,12 @@ const PLUGINS_JS: &str = r#"
                 });
             })
             .then(function(data) {
-                loadPlugins((data && data.detail) || successMessage, successKind || 'ok');
+                return loadPlugins((data && data.detail) || successMessage, successKind || 'ok', {
+                    propagateError: true
+                });
             })
             .catch(function(err) {
-                setStatus('Error: ' + (err.message || err), 'warn');
+                showActionError(err);
             });
     }
 
@@ -453,10 +489,12 @@ const PLUGINS_JS: &str = r#"
                 });
             })
             .then(function(data) {
-                return loadPlugins((data && data.detail) || fallbackMessage, successKind);
+                return loadPlugins((data && data.detail) || fallbackMessage, successKind, {
+                    propagateError: true
+                });
             })
             .catch(function(err) {
-                setStatus('Error: ' + (err.message || err), 'warn');
+                showActionError(err);
             })
             .finally(function() {
                 state.busyAction.pluginId = '';
@@ -500,7 +538,6 @@ const PLUGINS_JS: &str = r#"
                 state.modal.uploading = false;
                 setLoading(false);
                 setModalFeedback('Error: ' + (err.message || err), 'warn');
-                setStatus('Error: ' + (err.message || err), 'warn');
                 renderModal();
             });
     }
@@ -512,7 +549,6 @@ const PLUGINS_JS: &str = r#"
         var selectBtn = target.closest('[data-plugin-select]');
         if (selectBtn) {
             state.selectedId = selectBtn.getAttribute('data-plugin-select') || '';
-            setStatus('', '');
             render();
             return;
         }
@@ -651,6 +687,7 @@ const PLUGINS_JS: &str = r#"
         loadPlugins('', '', { background: true });
     }, 5000);
 
+    loadInstallerVersion();
     loadPlugins();
 })();
 "#;
@@ -681,7 +718,10 @@ pub fn PluginsPage() -> impl IntoView {
                     <PluginsList />
                     <PluginsDetail />
                 </div>
-                <div id="plugins-action-status" class="plugins-action-status"></div>
+                <div class="plugins-shell-footer">
+                    <span class="plugins-shell-footer-label">"Installer version"</span>
+                    <span id="plugins-installer-version" class="badge">"Loading…"</span>
+                </div>
             </div>
 
             <input id="plugin-package-input" class="plugins-file-input" type="file" accept=".zip,application/zip" />
