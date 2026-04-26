@@ -89,6 +89,8 @@ jobs:
           cargo build --release -p "${{ matrix.crate }}" --target "${TARGET_TRIPLE}"
 
       - name: Package plugin ZIP
+        env:
+          OTA_SIGN_KEY: ${{ secrets.BEECHAT_KAONIC_COMM_OTA_KEY }}
         run: |
           STAGING_DIR="deploy/${{ matrix.plugin_id }}/staging"
           mkdir -p "$STAGING_DIR"
@@ -97,6 +99,21 @@ jobs:
           cp "${{ matrix.service_path }}" "$STAGING_DIR/${{ matrix.service }}"
           cp "target/${TARGET_TRIPLE}/release/${{ matrix.binary }}" "$STAGING_DIR/${{ matrix.binary }}"
           sha256sum "$STAGING_DIR/${{ matrix.binary }}" | awk '{print $1}' > "$STAGING_DIR/${{ matrix.binary }}.sha256"
+
+          if [ -n "$OTA_SIGN_KEY" ]; then
+            trap 'rm -f ota_sign_key.pem ota_sign_key.pub.pem' EXIT
+            printf '%s' "$OTA_SIGN_KEY" > ota_sign_key.pem
+            chmod 600 ota_sign_key.pem
+            openssl dgst -sha256 -sign ota_sign_key.pem \
+              -out "$STAGING_DIR/${{ matrix.binary }}.sig" \
+              "$STAGING_DIR/${{ matrix.binary }}"
+            openssl pkey -in ota_sign_key.pem -pubout -out ota_sign_key.pub.pem >/dev/null 2>&1
+            openssl dgst -sha256 -verify ota_sign_key.pub.pem \
+              -signature "$STAGING_DIR/${{ matrix.binary }}.sig" \
+              "$STAGING_DIR/${{ matrix.binary }}" >/dev/null
+          else
+            echo "OTA signing key not configured; creating unsigned plugin package."
+          fi
 
           if [ -d "${{ matrix.files_dir }}" ]; then
             cp -R "${{ matrix.files_dir }}" "$STAGING_DIR/files"
@@ -112,4 +129,3 @@ jobs:
         with:
           name: plugin-${{ matrix.plugin_id }}
           path: deploy/${{ matrix.plugin_id }}/${{ matrix.plugin_id }}.zip
-
