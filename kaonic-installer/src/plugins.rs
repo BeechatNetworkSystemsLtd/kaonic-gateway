@@ -342,13 +342,15 @@ pub fn install_plugin(
         Some(cert_path),
         core_plugins,
     )?;
-    let package = parse_plugin_package(zip_bytes)?;
+    let normalized_zip =
+        crate::installer::normalize_uploaded_zip(zip_bytes).map_err(PluginError::bad_request)?;
+    let package = parse_plugin_package(normalized_zip.as_ref())?;
     log::info!(
         "installing plugin id={} version={} service={} payload_bytes={}",
         package.id,
         package.manifest.version,
         package.service_name,
-        zip_bytes.len()
+        normalized_zip.len()
     );
     let conn = open_db(db_path)?;
     let existing = load_plugin(&conn, &package.id)?;
@@ -370,7 +372,8 @@ pub fn install_plugin(
     let manifest_path = plugin_dir.join(MANIFEST_NAME);
     let stored_service_path = plugin_dir.join(&package.service_name);
     let stored_hash_path = plugin_dir.join(format!("{}.sha256", package.binary_name));
-    let stored_signature_path = plugin_dir.join(format!("{}.sign", package.binary_name));
+    let stored_signature_path = plugin_dir.join(format!("{}.sig", package.binary_name));
+    let legacy_signature_path = plugin_dir.join(format!("{}.sign", package.binary_name));
     let service_path = systemd_dir.join(&package.service_name);
     let binary_path = current_dir.join(&package.binary_name);
     let binary_target = binary_path.clone();
@@ -434,7 +437,7 @@ pub fn install_plugin(
         make_executable(&binary_path)
             .map_err(|err| PluginError::internal(format!("chmod plugin binary: {err}")))?;
         install_custom_files(&current_dir, &package.custom_files)?;
-        fs::write(&package_path, zip_bytes)
+        fs::write(&package_path, normalized_zip.as_ref())
             .map_err(|err| PluginError::internal(format!("persist plugin package: {err}")))?;
         fs::write(&manifest_path, package.manifest_raw.as_bytes())
             .map_err(|err| PluginError::internal(format!("persist plugin manifest: {err}")))?;
@@ -445,9 +448,18 @@ pub fn install_plugin(
         if let Some(signature) = &package.signature_bytes {
             fs::write(&stored_signature_path, signature)
                 .map_err(|err| PluginError::internal(format!("persist plugin signature: {err}")))?;
+            if legacy_signature_path.exists() {
+                fs::remove_file(&legacy_signature_path).map_err(|err| {
+                    PluginError::internal(format!("remove legacy plugin signature: {err}"))
+                })?;
+            }
         } else if stored_signature_path.exists() {
             fs::remove_file(&stored_signature_path).map_err(|err| {
                 PluginError::internal(format!("remove stale plugin signature: {err}"))
+            })?;
+        } else if legacy_signature_path.exists() {
+            fs::remove_file(&legacy_signature_path).map_err(|err| {
+                PluginError::internal(format!("remove stale legacy plugin signature: {err}"))
             })?;
         }
 
@@ -672,11 +684,13 @@ pub fn upload_plugin_update(
     let conn = open_db(db_path)?;
     let plugin = load_plugin(&conn, plugin_id)?
         .ok_or_else(|| PluginError::not_found(format!("unknown plugin: {plugin_id}")))?;
+    let normalized_zip =
+        crate::installer::normalize_uploaded_zip(zip_bytes).map_err(PluginError::bad_request)?;
     log::info!(
         "uploading plugin update id={} built_in={} payload_bytes={}",
         plugin_id,
         plugin.target_name.is_some(),
-        zip_bytes.len()
+        normalized_zip.len()
     );
 
     if let Some(target_name) = plugin.target_name.as_deref() {
@@ -693,12 +707,13 @@ pub fn upload_plugin_update(
             plugin_id,
             target_name
         );
-        let detail = apply_update(&spec.target, zip_bytes).map_err(PluginError::internal)?;
+        let detail =
+            apply_update(&spec.target, normalized_zip.as_ref()).map_err(PluginError::internal)?;
         sync_core_plugins(&conn, core_plugins)?;
         return Ok(PluginMessage { detail });
     }
 
-    let package = parse_plugin_package(zip_bytes)?;
+    let package = parse_plugin_package(normalized_zip.as_ref())?;
     log::debug!(
         "parsed plugin update package id={} version={}",
         package.id,
@@ -716,7 +731,7 @@ pub fn upload_plugin_update(
         systemd_dir,
         cert_path,
         core_plugins,
-        zip_bytes,
+        normalized_zip.as_ref(),
     )
 }
 
@@ -747,8 +762,7 @@ fn parse_plugin_package(zip_bytes: &[u8]) -> PluginResult<PluginPackage> {
     validate_sha256_text(&sha256)?;
     verify_sha256(&binary_bytes, &sha256, "plugin package binary")?;
     let custom_files = read_custom_files(&mut archive, &binary_name)?;
-    let signature_name = format!("{binary_name}.sign");
-    let signature_bytes = read_optional_zip_entry_bytes(&mut archive, &signature_name)?;
+    let signature_bytes = read_optional_signature_bytes(&mut archive, &binary_name)?;
     log::debug!(
         "parsed plugin manifest id={} version={} service={} has_signature={} has_symlink={} custom_files={}",
         id,
@@ -944,7 +958,7 @@ fn discover_plugin_record(
     let service_path = plugin_dir.join(&service_name);
     let hash_path = plugin_dir.join(format!("{}.sha256", binary_name));
     let package_path = plugin_dir.join("package.zip");
-    let signature_path = plugin_dir.join(format!("{}.sign", binary_name));
+    let signature_path = resolve_signature_file_path(plugin_dir, &binary_name);
 
     if !binary_path.is_file() {
         return Err(PluginError::bad_request(format!(
@@ -969,7 +983,7 @@ fn discover_plugin_record(
         .map_err(|err| PluginError::internal(format!("read plugin binary: {err}")))?;
     let sha256 = read_sha256_file(&hash_path)?;
     verify_sha256(&binary_bytes, &sha256, "installed plugin binary")?;
-    let signature_bytes = if signature_path.is_file() {
+    let signature_bytes = if let Some(signature_path) = signature_path {
         Some(
             fs::read(&signature_path)
                 .map_err(|err| PluginError::internal(format!("read plugin signature: {err}")))?,
@@ -1136,6 +1150,28 @@ fn read_optional_zip_entry_bytes<R: io::Read + io::Seek>(
             "read optional plugin file {name}: {err}"
         ))),
     }
+}
+
+fn read_optional_signature_bytes<R: io::Read + io::Seek>(
+    archive: &mut ZipArchive<R>,
+    binary_name: &str,
+) -> PluginResult<Option<Vec<u8>>> {
+    if let Some(bytes) = read_optional_zip_entry_bytes(archive, &format!("{binary_name}.sig"))? {
+        return Ok(Some(bytes));
+    }
+    read_optional_zip_entry_bytes(archive, &format!("{binary_name}.sign"))
+}
+
+fn resolve_signature_file_path(plugin_dir: &Path, binary_name: &str) -> Option<PathBuf> {
+    let sig_path = plugin_dir.join(format!("{binary_name}.sig"));
+    if sig_path.is_file() {
+        return Some(sig_path);
+    }
+    let legacy_path = plugin_dir.join(format!("{binary_name}.sign"));
+    if legacy_path.is_file() {
+        return Some(legacy_path);
+    }
+    None
 }
 
 fn read_custom_files<R: io::Read + io::Seek>(
@@ -1582,7 +1618,7 @@ fn evaluate_official(
     let tmp = tempfile::tempdir()
         .map_err(|err| PluginError::internal(format!("create signature tempdir: {err}")))?;
     let bin_path = tmp.path().join("plugin.bin");
-    let sig_path = tmp.path().join("plugin.sign");
+    let sig_path = tmp.path().join("plugin.sig");
     fs::write(&bin_path, binary_bytes)
         .map_err(|err| PluginError::internal(format!("write temp plugin binary: {err}")))?;
     fs::write(&sig_path, signature)
@@ -1635,17 +1671,17 @@ fn prepare_rollback(
         )),
     )?;
 
-    let signature_path = plugin_dir.join(format!(
-        "{}.sign",
-        Path::new(service_name)
-            .file_stem()
-            .and_then(OsStr::to_str)
-            .unwrap_or(service_name)
-    ));
-    move_if_exists(
-        &signature_path,
-        &rollback_dir.join(signature_path.file_name().unwrap()),
-    )?;
+    let binary_name = Path::new(service_name)
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .unwrap_or(service_name);
+    for signature_name in [format!("{binary_name}.sig"), format!("{binary_name}.sign")] {
+        let signature_path = plugin_dir.join(&signature_name);
+        move_if_exists(
+            &signature_path,
+            &rollback_dir.join(signature_path.file_name().unwrap()),
+        )?;
+    }
 
     if service_path.exists() {
         fs::copy(service_path, rollback_dir.join(service_name))
@@ -1681,13 +1717,12 @@ fn rollback_install(
             .and_then(OsStr::to_str)
             .unwrap_or(service_name)
     )));
-    let _ = fs::remove_file(plugin_dir.join(format!(
-        "{}.sign",
-        Path::new(service_name)
-            .file_stem()
-            .and_then(OsStr::to_str)
-            .unwrap_or(service_name)
-    )));
+    let binary_name = Path::new(service_name)
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .unwrap_or(service_name);
+    let _ = fs::remove_file(plugin_dir.join(format!("{binary_name}.sig")));
+    let _ = fs::remove_file(plugin_dir.join(format!("{binary_name}.sign")));
 
     restore_if_exists(&rollback_dir.join("current"), &current_dir)?;
     restore_if_exists(
@@ -1697,6 +1732,14 @@ fn rollback_install(
     restore_if_exists(
         &rollback_dir.join(MANIFEST_NAME),
         &plugin_dir.join(MANIFEST_NAME),
+    )?;
+    restore_if_exists(
+        &rollback_dir.join(format!("{binary_name}.sig")),
+        &plugin_dir.join(format!("{binary_name}.sig")),
+    )?;
+    restore_if_exists(
+        &rollback_dir.join(format!("{binary_name}.sign")),
+        &plugin_dir.join(format!("{binary_name}.sign")),
     )?;
     restore_if_exists(
         &rollback_dir.join(service_name),
@@ -2528,7 +2571,7 @@ fn file_timestamp(path: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{self, Write};
     use zip::{write::SimpleFileOptions, ZipWriter};
 
     #[test]
@@ -2566,6 +2609,39 @@ mod tests {
         );
         assert_eq!(package.custom_files[1].relative_path, PathBuf::from(".env"));
         assert!(package.signature_bytes.is_none());
+    }
+
+    #[test]
+    fn parses_plugin_package_sig_signature() {
+        let zip_bytes = build_test_plugin_zip_with_signature("kaonic-plugin-sample.sig");
+        let package = parse_plugin_package(&zip_bytes).unwrap();
+        assert_eq!(package.signature_bytes.as_deref(), Some(b"signature-bytes".as_slice()));
+    }
+
+    #[test]
+    fn parses_plugin_package_legacy_sign_signature() {
+        let zip_bytes = build_test_plugin_zip_with_signature("kaonic-plugin-sample.sign");
+        let package = parse_plugin_package(&zip_bytes).unwrap();
+        assert_eq!(package.signature_bytes.as_deref(), Some(b"signature-bytes".as_slice()));
+    }
+
+    #[test]
+    fn install_path_accepts_github_artifact_wrapper_zip() {
+        let inner_zip = build_test_plugin_zip();
+        let cursor = io::Cursor::new(Vec::new());
+        let mut wrapper = ZipWriter::new(cursor);
+        let options = SimpleFileOptions::default();
+        wrapper
+            .start_file("kaonic-plugin-sample.zip", options)
+            .unwrap();
+        wrapper.write_all(&inner_zip).unwrap();
+        let wrapped_zip = wrapper.finish().unwrap().into_inner();
+
+        let normalized = crate::installer::normalize_uploaded_zip(&wrapped_zip).unwrap();
+        let package = parse_plugin_package(normalized.as_ref()).unwrap();
+
+        assert_eq!(package.id, "kaonic-plugin-sample");
+        assert_eq!(package.binary_name, "kaonic-plugin-sample");
     }
 
     #[test]
@@ -3061,6 +3137,25 @@ developer = "Beechat"
 
     fn build_test_plugin_zip_with_hash(sha256: &str) -> Vec<u8> {
         build_test_plugin_zip_with_hash_and_channel(sha256, "experimental")
+    }
+
+    fn build_test_plugin_zip_with_signature(signature_name: &str) -> Vec<u8> {
+        let mut cursor = Cursor::new(build_test_plugin_zip());
+        let mut archive = ZipArchive::new(&mut cursor).unwrap();
+        let mut out = Cursor::new(Vec::<u8>::new());
+        {
+            let mut writer = ZipWriter::new(&mut out);
+            let options = SimpleFileOptions::default();
+            for index in 0..archive.len() {
+                let mut file = archive.by_index(index).unwrap();
+                writer.start_file(file.name(), options).unwrap();
+                io::copy(&mut file, &mut writer).unwrap();
+            }
+            writer.start_file(signature_name, options).unwrap();
+            writer.write_all(b"signature-bytes").unwrap();
+            writer.finish().unwrap();
+        }
+        out.into_inner()
     }
 
     fn build_test_plugin_zip_with_hash_and_channel(sha256: &str, channel: &str) -> Vec<u8> {

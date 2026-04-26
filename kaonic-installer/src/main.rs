@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::{Multipart, Path, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
@@ -141,6 +141,7 @@ async fn main() {
         )
         .route("/api/plugins/:plugin_id", delete(handle_plugin_delete))
         .layer(CorsLayer::permissive())
+        .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .layer(RequestBodyLimitLayer::new(MAX_UPLOAD_BYTES))
         .with_state(state);
 
@@ -154,6 +155,9 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::{header, Request};
+    use tower::util::ServiceExt;
 
     #[test]
     fn core_targets_include_factory() {
@@ -171,6 +175,57 @@ mod tests {
         assert_eq!(
             factory.binary_path,
             PathBuf::from("/etc/kaonic/plugins/kaonic-factory/current/kaonic-factory")
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_uploads_above_default_limit_are_accepted() {
+        async fn upload_echo(multipart: Multipart) -> impl IntoResponse {
+            match read_upload_bytes(multipart).await {
+                Ok(bytes) => (StatusCode::OK, bytes.len().to_string()).into_response(),
+                Err(response) => response,
+            }
+        }
+
+        let app = Router::new()
+            .route("/upload", post(upload_echo))
+            .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
+            .layer(RequestBodyLimitLayer::new(MAX_UPLOAD_BYTES));
+
+        let boundary = "X-BOUNDARY";
+        let payload = vec![b'a'; (2 * 1024 * 1024) + 4096];
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"file\"; filename=\"plugin.zip\"\r\n",
+        );
+        body.extend_from_slice(b"Content-Type: application/zip\r\n\r\n");
+        body.extend_from_slice(&payload);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .expect("multipart request"),
+            )
+            .await
+            .expect("upload response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        assert_eq!(
+            String::from_utf8(body.to_vec()).expect("utf8 body"),
+            payload.len().to_string()
         );
     }
 }

@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -89,6 +91,7 @@ pub fn validate_on_boot(target: &Target) {
 
 /// Full OTA update flow. Returns a human-readable result message or an error string.
 pub fn apply_update(target: &Target, zip_bytes: &[u8]) -> Result<String, String> {
+    let zip_bytes = normalize_uploaded_zip(zip_bytes)?;
     log::info!(
         "[{}] starting OTA apply payload_bytes={} target_bin={} service={}",
         target.name,
@@ -100,7 +103,7 @@ pub fn apply_update(target: &Target, zip_bytes: &[u8]) -> Result<String, String>
     let tmp_path = tmp.path();
 
     // Extract ZIP
-    let cursor = io::Cursor::new(zip_bytes);
+    let cursor = io::Cursor::new(zip_bytes.as_ref());
     let mut archive = zip::ZipArchive::new(cursor).map_err(|e| format!("bad ZIP: {e}"))?;
     log::debug!("[{}] OTA archive entries={}", target.name, archive.len());
     archive
@@ -117,9 +120,14 @@ pub fn apply_update(target: &Target, zip_bytes: &[u8]) -> Result<String, String>
     let hash_file = tmp_path.join(format!("{bin_name}.sha256"));
     let ver_file = tmp_path.join(format!("{bin_name}.version"));
     let sig_file = tmp_path.join(format!("{bin_name}.sig"));
+    let cert = target.cert_path();
+    let cert_exists = cert.exists();
+
+    hydrate_version_from_plugin_manifest(tmp_path, &ver_file)?;
+    let signature_file = resolve_signature_path(tmp_path, &bin_name, &sig_file)?;
 
     // Required files
-    for f in [&new_bin, &hash_file, &ver_file, &sig_file] {
+    for f in [&new_bin, &hash_file, &ver_file] {
         if !f.exists() {
             return Err(format!(
                 "missing {} in OTA package",
@@ -127,7 +135,6 @@ pub fn apply_update(target: &Target, zip_bytes: &[u8]) -> Result<String, String>
             ));
         }
     }
-
     // SHA-256 check
     let expected_hash = fs::read_to_string(&hash_file)
         .map_err(|e| format!("read hash file: {e}"))?
@@ -146,14 +153,27 @@ pub fn apply_update(target: &Target, zip_bytes: &[u8]) -> Result<String, String>
     }
 
     // Signature verification (skipped if cert absent — dev/test mode)
-    let cert = target.cert_path();
-    if cert.exists() {
-        log::debug!(
-            "[{}] verifying OTA signature using cert={}",
+    if let Some(signature_file) = signature_file.as_ref() {
+        if cert_exists {
+            log::debug!(
+                "[{}] verifying OTA signature using cert={}",
+                target.name,
+                cert.display()
+            );
+            verify_signature(&new_bin, signature_file, &cert)?;
+        } else {
+            log::warn!(
+                "[{}] OTA signature present but cert not found at {:?} — skipping signature check",
+                target.name,
+                cert
+            );
+        }
+    } else if cert_exists {
+        log::warn!(
+            "[{}] OTA signature missing from package — skipping signature check despite cert at {:?}",
             target.name,
-            cert.display()
+            cert
         );
-        verify_signature(&new_bin, &sig_file, &cert)?;
     } else {
         log::warn!(
             "[{}] OTA cert not found at {:?} — skipping signature check",
@@ -222,6 +242,94 @@ pub fn apply_update(target: &Target, zip_bytes: &[u8]) -> Result<String, String>
         let _ = systemctl("start", target.service);
         Err("new binary failed health check — rollback complete".to_string())
     }
+}
+
+pub(crate) fn normalize_uploaded_zip<'a>(zip_bytes: &'a [u8]) -> Result<Cow<'a, [u8]>, String> {
+    let cursor = io::Cursor::new(zip_bytes);
+    let mut archive = zip::ZipArchive::new(cursor).map_err(|e| format!("bad ZIP: {e}"))?;
+    let mut nested_index = None;
+    let mut nested_name = None;
+    let mut non_dir_entries = 0usize;
+
+    for index in 0..archive.len() {
+        let file = archive
+            .by_index(index)
+            .map_err(|e| format!("read ZIP entry {index}: {e}"))?;
+        if file.is_dir() {
+            continue;
+        }
+        non_dir_entries += 1;
+        if non_dir_entries > 1 {
+            return Ok(Cow::Borrowed(zip_bytes));
+        }
+
+        if file.name().ends_with(".zip") {
+            nested_index = Some(index);
+            nested_name = Some(file.name().to_string());
+        }
+    }
+
+    if non_dir_entries == 1 {
+        if let Some(index) = nested_index {
+            let mut nested = archive
+                .by_index(index)
+                .map_err(|e| format!("read nested ZIP entry {index}: {e}"))?;
+            let mut inner = Vec::new();
+            nested
+                .read_to_end(&mut inner)
+                .map_err(|e| format!("read nested ZIP bytes: {e}"))?;
+            log::info!(
+                "unwrapped uploaded artifact bundle entry={} inner_bytes={}",
+                nested_name.as_deref().unwrap_or("<unknown>"),
+                inner.len()
+            );
+            return Ok(Cow::Owned(inner));
+        }
+    }
+
+    Ok(Cow::Borrowed(zip_bytes))
+}
+
+fn hydrate_version_from_plugin_manifest(tmp_path: &Path, version_path: &Path) -> Result<(), String> {
+    if version_path.exists() {
+        return Ok(());
+    }
+
+    let manifest_path = tmp_path.join("kaonic-plugin.toml");
+    if !manifest_path.exists() {
+        return Ok(());
+    }
+
+    let manifest_raw =
+        fs::read_to_string(&manifest_path).map_err(|e| format!("read plugin manifest: {e}"))?;
+    let manifest: toml::Value =
+        toml::from_str(&manifest_raw).map_err(|e| format!("parse plugin manifest: {e}"))?;
+    let version = manifest
+        .get("kaonic-plugin")
+        .and_then(|section| section.get("version"))
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "missing version in plugin manifest".to_string())?;
+
+    fs::write(version_path, format!("{version}\n"))
+        .map_err(|e| format!("write OTA version file: {e}"))?;
+    Ok(())
+}
+
+fn resolve_signature_path(
+    tmp_path: &Path,
+    bin_name: &str,
+    sig_path: &Path,
+) -> Result<Option<PathBuf>, String> {
+    if sig_path.exists() {
+        return Ok(Some(sig_path.to_path_buf()));
+    }
+
+    let plugin_sig = tmp_path.join(format!("{bin_name}.sign"));
+    if plugin_sig.exists() {
+        return Ok(Some(plugin_sig));
+    }
+
+    Ok(None)
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -352,6 +460,15 @@ mod tests {
         zip.finish().unwrap().into_inner()
     }
 
+    fn wrap_uploaded_artifact(entry_name: &str, inner_bytes: &[u8]) -> Vec<u8> {
+        let cursor = io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(cursor);
+        let options = SimpleFileOptions::default();
+        zip.start_file(entry_name, options).unwrap();
+        zip.write_all(inner_bytes).unwrap();
+        zip.finish().unwrap().into_inner()
+    }
+
     #[test]
     fn apply_update_replaces_real_binary_not_public_symlink() {
         let tmp = tempfile::tempdir().unwrap();
@@ -387,5 +504,152 @@ mod tests {
             fs::read_to_string(meta_dir.join("kaonic-gateway.version")).unwrap(),
             "2.0.0"
         );
+    }
+
+    #[test]
+    fn apply_update_accepts_github_artifact_wrapper_zip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let public_dir = tmp.path().join("usr/bin");
+        let plugin_dir = tmp.path().join("plugins/kaonic-gateway/current");
+        let meta_dir = tmp.path().join("meta");
+        fs::create_dir_all(&public_dir).unwrap();
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::create_dir_all(&meta_dir).unwrap();
+
+        let binary_path = plugin_dir.join("kaonic-gateway");
+        let public_path = public_dir.join("kaonic-gateway");
+        fs::write(&binary_path, b"old-binary").unwrap();
+        std::os::unix::fs::symlink(&binary_path, &public_path).unwrap();
+
+        let target = Target {
+            name: "gateway",
+            symlink_path: public_path,
+            binary_path: binary_path.clone(),
+            service: "kaonic-gateway.service",
+            meta_dir,
+        };
+
+        let inner_zip = ota_zip_bytes("kaonic-gateway", b"new-binary", "2.0.1");
+        let wrapped_zip = wrap_uploaded_artifact("kaonic-gateway.zip", &inner_zip);
+
+        let result = apply_update(&target, &wrapped_zip);
+
+        assert!(result.is_ok());
+        assert_eq!(fs::read(&binary_path).unwrap(), b"new-binary");
+    }
+
+    #[test]
+    fn apply_update_accepts_plugin_package_layout_without_ota_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let public_dir = tmp.path().join("usr/bin");
+        let plugin_dir = tmp.path().join("plugins/kaonic-gateway/current");
+        let meta_dir = tmp.path().join("meta");
+        fs::create_dir_all(&public_dir).unwrap();
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::create_dir_all(&meta_dir).unwrap();
+
+        let binary_path = plugin_dir.join("kaonic-gateway");
+        let public_path = public_dir.join("kaonic-gateway");
+        fs::write(&binary_path, b"old-binary").unwrap();
+        std::os::unix::fs::symlink(&binary_path, &public_path).unwrap();
+
+        let target = Target {
+            name: "gateway",
+            symlink_path: public_path,
+            binary_path: binary_path.clone(),
+            service: "kaonic-gateway.service",
+            meta_dir: meta_dir.clone(),
+        };
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"new-binary");
+        let hash = hex::encode(hasher.finalize());
+
+        let cursor = io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(cursor);
+        let options = SimpleFileOptions::default();
+        zip.start_file("kaonic-plugin.toml", options).unwrap();
+        zip.write_all(
+            br#"[kaonic-plugin]
+name = "Kaonic Gateway"
+description = "Gateway"
+version = "9.9.9"
+service = "kaonic-gateway.service"
+developer = "Beechat"
+"#,
+        )
+        .unwrap();
+        zip.start_file("kaonic-gateway.service", options).unwrap();
+        zip.write_all(b"[Service]\nExecStart=/bin/true\n").unwrap();
+        zip.start_file("kaonic-gateway", options).unwrap();
+        zip.write_all(b"new-binary").unwrap();
+        zip.start_file("kaonic-gateway.sha256", options).unwrap();
+        zip.write_all(format!("{hash}\n").as_bytes()).unwrap();
+        let plugin_zip = zip.finish().unwrap().into_inner();
+
+        let result = apply_update(&target, &plugin_zip);
+
+        assert!(result.is_ok());
+        assert_eq!(fs::read(&binary_path).unwrap(), b"new-binary");
+        assert_eq!(
+            fs::read_to_string(meta_dir.join("kaonic-gateway.version")).unwrap(),
+            "9.9.9"
+        );
+    }
+
+    #[test]
+    fn apply_update_accepts_missing_signature_even_when_cert_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let public_dir = tmp.path().join("usr/bin");
+        let plugin_dir = tmp.path().join("plugins/kaonic-gateway/current");
+        let meta_dir = tmp.path().join("meta");
+        fs::create_dir_all(&public_dir).unwrap();
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::create_dir_all(&meta_dir).unwrap();
+        fs::write(meta_dir.join("beechat-ota.pub.pem"), b"fake-cert").unwrap();
+
+        let binary_path = plugin_dir.join("kaonic-gateway");
+        let public_path = public_dir.join("kaonic-gateway");
+        fs::write(&binary_path, b"old-binary").unwrap();
+        std::os::unix::fs::symlink(&binary_path, &public_path).unwrap();
+
+        let target = Target {
+            name: "gateway",
+            symlink_path: public_path,
+            binary_path: binary_path.clone(),
+            service: "kaonic-gateway.service",
+            meta_dir,
+        };
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"new-binary");
+        let hash = hex::encode(hasher.finalize());
+
+        let cursor = io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(cursor);
+        let options = SimpleFileOptions::default();
+        zip.start_file("kaonic-plugin.toml", options).unwrap();
+        zip.write_all(
+            br#"[kaonic-plugin]
+name = "Kaonic Gateway"
+description = "Gateway"
+version = "9.9.10"
+service = "kaonic-gateway.service"
+developer = "Beechat"
+"#,
+        )
+        .unwrap();
+        zip.start_file("kaonic-gateway.service", options).unwrap();
+        zip.write_all(b"[Service]\nExecStart=/bin/true\n").unwrap();
+        zip.start_file("kaonic-gateway", options).unwrap();
+        zip.write_all(b"new-binary").unwrap();
+        zip.start_file("kaonic-gateway.sha256", options).unwrap();
+        zip.write_all(format!("{hash}\n").as_bytes()).unwrap();
+        let plugin_zip = zip.finish().unwrap().into_inner();
+
+        let result = apply_update(&target, &plugin_zip);
+
+        assert!(result.is_ok());
+        assert_eq!(fs::read(&binary_path).unwrap(), b"new-binary");
     }
 }
