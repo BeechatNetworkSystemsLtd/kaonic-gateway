@@ -1,0 +1,115 @@
+name: Build Plugins
+
+on:
+  push:
+    branches: [ main ]
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TARGET_TRIPLE: armv7-unknown-linux-gnueabihf
+
+jobs:
+  build-plugin-packages:
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - plugin_id: kaonic-plugin-sample
+            crate: kaonic-plugin-sample
+            binary: kaonic-plugin-sample
+            service: kaonic-plugin-sample.service
+            manifest_path: kaonic-plugin-sample/kaonic-plugin.toml
+            service_path: kaonic-plugin-sample/kaonic-plugin-sample.service
+            files_dir: kaonic-plugin-sample/files
+          - plugin_id: kaonic-atak-bridge
+            crate: kaonic-atak-bridge
+            binary: kaonic-atak-bridge
+            service: kaonic-atak-bridge.service
+            manifest_path: kaonic-atak-bridge/kaonic-plugin.toml
+            service_path: kaonic-atak-bridge/kaonic-atak-bridge.service
+            files_dir: kaonic-atak-bridge/files
+          - plugin_id: kaonic-gateway
+            crate: kaonic-gateway
+            binary: kaonic-gateway
+            service: kaonic-gateway.service
+            manifest_path: kaonic-gateway/kaonic-plugin.toml
+            service_path: kaonic-gateway/kaonic-gateway.service
+            files_dir: kaonic-gateway/files
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-tags: true
+          fetch-depth: 0
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ matrix.crate }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-${{ matrix.crate }}-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build build-essential openssl zip wget file
+          rustup target add "${TARGET_TRIPLE}"
+
+      - name: Install Kaonic Yocto SDK
+        run: |
+          ASSET_NAME="stm32mp1-kaonic-proto-sdk-aarch64.sh"
+          DOWNLOAD_URL=$(curl -s https://api.github.com/repos/BeechatNetworkSystemsLtd/kaonic-yocto/releases/latest \
+            | grep "browser_download_url" \
+            | grep "$ASSET_NAME" \
+            | cut -d '"' -f 4)
+          if [ -z "$DOWNLOAD_URL" ]; then
+            echo "SDK asset not found in latest release."
+            exit 1
+          fi
+          wget -q "$DOWNLOAD_URL" -O yocto-sdk.sh
+          chmod +x yocto-sdk.sh
+          ./yocto-sdk.sh -y -d /opt/yocto-sdk
+
+      - name: Build plugin binary
+        run: |
+          unset LD_LIBRARY_PATH
+          source /opt/yocto-sdk/environment-setup
+          cargo build --release -p "${{ matrix.crate }}" --target "${TARGET_TRIPLE}"
+
+      - name: Package plugin ZIP
+        run: |
+          STAGING_DIR="deploy/${{ matrix.plugin_id }}/staging"
+          mkdir -p "$STAGING_DIR"
+
+          cp "${{ matrix.manifest_path }}" "$STAGING_DIR/kaonic-plugin.toml"
+          cp "${{ matrix.service_path }}" "$STAGING_DIR/${{ matrix.service }}"
+          cp "target/${TARGET_TRIPLE}/release/${{ matrix.binary }}" "$STAGING_DIR/${{ matrix.binary }}"
+          sha256sum "$STAGING_DIR/${{ matrix.binary }}" | awk '{print $1}' > "$STAGING_DIR/${{ matrix.binary }}.sha256"
+
+          if [ -d "${{ matrix.files_dir }}" ]; then
+            cp -R "${{ matrix.files_dir }}" "$STAGING_DIR/files"
+          fi
+
+          (
+            cd "$STAGING_DIR"
+            zip -r "../${{ matrix.plugin_id }}.zip" .
+          )
+
+      - name: Upload plugin artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-${{ matrix.plugin_id }}
+          path: deploy/${{ matrix.plugin_id }}/${{ matrix.plugin_id }}.zip
+
