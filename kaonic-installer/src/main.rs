@@ -49,11 +49,11 @@ struct AppState {
     systemd_cache: Arc<RwLock<HashMap<String, plugins::PluginSystemdStatus>>>,
 }
 
-fn make_targets(meta_dir: &str, bin_dir: &str, plugins_dir: &str) -> (Arc<Target>, Arc<Target>) {
+fn make_core_targets(meta_dir: &str, bin_dir: &str, plugins_dir: &str) -> Vec<Arc<Target>> {
     let meta = PathBuf::from(meta_dir);
     let bin = PathBuf::from(bin_dir);
     let plugins = PathBuf::from(plugins_dir);
-    (
+    vec![
         Arc::new(Target {
             name: "commd",
             symlink_path: bin.join("kaonic-commd"),
@@ -66,9 +66,16 @@ fn make_targets(meta_dir: &str, bin_dir: &str, plugins_dir: &str) -> (Arc<Target
             symlink_path: bin.join("kaonic-gateway"),
             binary_path: plugins.join("kaonic-gateway/current/kaonic-gateway"),
             service: "kaonic-gateway.service",
+            meta_dir: meta.clone(),
+        }),
+        Arc::new(Target {
+            name: "factory",
+            symlink_path: bin.join("kaonic-factory"),
+            binary_path: plugins.join("kaonic-factory/current/kaonic-factory"),
+            service: "kaonic-factory.service",
             meta_dir: meta,
         }),
-    )
+    ]
 }
 
 #[tokio::main]
@@ -80,19 +87,21 @@ async fn main() {
 
     let cmd = Cmd::parse();
 
-    let (commd, gateway) = make_targets(META_DIR, BIN_DIR, PLUGINS_DIR);
+    let core_targets = make_core_targets(META_DIR, BIN_DIR, PLUGINS_DIR);
 
     // Validate installed binaries against stored hashes on boot
-    validate_on_boot(&commd);
-    validate_on_boot(&gateway);
+    for target in &core_targets {
+        validate_on_boot(target);
+    }
 
     let systemd_cache = Arc::new(RwLock::new(HashMap::new()));
     let plugins_root = PathBuf::from(PLUGINS_DIR);
     let state = AppState {
-        core_plugins: vec![
-            plugins::CorePluginSpec::new(commd.clone(), &plugins_root),
-            plugins::CorePluginSpec::new(gateway.clone(), &plugins_root),
-        ],
+        core_plugins: core_targets
+            .iter()
+            .cloned()
+            .map(|target| plugins::CorePluginSpec::new(target, &plugins_root))
+            .collect(),
         plugins_root,
         plugins_db: PathBuf::from(PLUGINS_DB),
         systemd_dir: PathBuf::from(SYSTEMD_DIR),
@@ -140,6 +149,30 @@ async fn main() {
         .expect("failed to bind");
     log::info!("kaonic-installer listening on http://{}", cmd.listen);
     axum::serve(listener, app).await.expect("server error");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn core_targets_include_factory() {
+        let targets = make_core_targets("/etc/kaonic", "/usr/bin", "/etc/kaonic/plugins");
+        let factory = targets
+            .iter()
+            .find(|target| target.name == "factory")
+            .expect("factory target registered");
+
+        assert_eq!(factory.service, "kaonic-factory.service");
+        assert_eq!(
+            factory.symlink_path,
+            PathBuf::from("/usr/bin/kaonic-factory")
+        );
+        assert_eq!(
+            factory.binary_path,
+            PathBuf::from("/etc/kaonic/plugins/kaonic-factory/current/kaonic-factory")
+        );
+    }
 }
 
 // ── handlers ─────────────────────────────────────────────────────────────────

@@ -2,9 +2,8 @@ use axum::extract::{Form, Path, State};
 use axum::http::{header, StatusCode};
 use axum::{response::IntoResponse, Json};
 use kaonic_gateway::app_types::{
-    AtakBridgeStatusDto, FrameStatsDto, NetworkPortStatusDto, NetworkSnapshotDto,
-    ReticulumSnapshotDto, RxFrameDto, ServiceStatusDto, SystemStatusDto, WsInterfacesDto,
-    WsReticulumSnapshotDto,
+    FrameStatsDto, NetworkPortStatusDto, NetworkSnapshotDto, ReticulumSnapshotDto, RxFrameDto,
+    ServiceStatusDto, SystemStatusDto, WsInterfacesDto, WsReticulumSnapshotDto,
 };
 use kaonic_gateway::audio::{
     AudioCardSnapshot, AudioControlSnapshot, AudioControlState, AudioError, AudioOutput,
@@ -899,7 +898,6 @@ pub struct StatusResponse {
     vpn_hash: String,
     wlan0_ip: Option<String>,
     usb0_ip: Option<String>,
-    atak_bridges: Vec<AtakBridgeStatusDto>,
     network_ports: Vec<NetworkPortStatusDto>,
     system: SystemStatusDto,
     services: Vec<ServiceStatusDto>,
@@ -910,7 +908,7 @@ pub struct StatusResponse {
     frame_stats: [FrameStatsDto; 2],
 }
 
-/// `GET /api/status` — live gateway status: ATAK counters, system resources, VPN hash, radio config.
+/// `GET /api/status` — live gateway status: system resources, VPN hash, radio config.
 pub async fn get_status(State(state): State<AppState>) -> Json<StatusResponse> {
     Json(build_status(&state).await)
 }
@@ -928,7 +926,6 @@ pub async fn build_status(state: &AppState) -> StatusResponse {
     let services = build_services();
     let network_ports = build_network_ports(state, &services);
     let interfaces = build_ws_interfaces();
-    let atak_bridges = build_atak_bridges(state);
     let system = build_system_status().await;
     let rx_frames = build_all_radio_frames(state).await;
     let frame_stats = build_all_frame_stats(state);
@@ -939,7 +936,6 @@ pub async fn build_status(state: &AppState) -> StatusResponse {
         vpn_hash: state.vpn_hash.clone(),
         wlan0_ip: interfaces.wlan0_ip,
         usb0_ip: interfaces.usb0_ip,
-        atak_bridges,
         network_ports,
         system,
         services,
@@ -956,21 +952,6 @@ pub fn build_ws_interfaces() -> WsInterfacesDto {
         wlan0_ip: read_interface_ipv4("wlan0"),
         usb0_ip: read_interface_ipv4("usb0"),
     }
-}
-
-pub fn build_atak_bridges(state: &AppState) -> Vec<AtakBridgeStatusDto> {
-    use std::sync::atomic::Ordering;
-
-    state
-        .atak_metrics
-        .iter()
-        .map(|m| AtakBridgeStatusDto {
-            port: m.port,
-            dest_hash: m.dest_hash.get().cloned().unwrap_or_default(),
-            rx_packets: m.rx_packets.load(Ordering::Relaxed),
-            tx_packets: m.tx_packets.load(Ordering::Relaxed),
-        })
-        .collect()
 }
 
 pub fn build_services() -> Vec<ServiceStatusDto> {
@@ -1047,6 +1028,7 @@ pub async fn build_reticulum_snapshot(state: &AppState) -> ReticulumSnapshotDto 
 pub async fn build_ws_reticulum_snapshot(state: &AppState) -> WsReticulumSnapshotDto {
     let snapshot = state.reticulum.snapshot().await;
     WsReticulumSnapshotDto {
+        interface_stats: snapshot.interface_stats,
         incoming_links: snapshot.incoming_links,
         outgoing_links: snapshot.outgoing_links,
     }

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::radio::HardwareRadioConfig;
 
 fn default_announce_freq_secs() -> u32 {
-    3
+    5
 }
 
 fn default_allow_all_peers() -> bool {

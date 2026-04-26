@@ -8,7 +8,7 @@ use crate::config::GatewayConfig;
 use crate::radio::{HardwareRadioConfig, RadioModuleConfig};
 
 const DEFAULT_NETWORK: &str = "10.20.0.0/16";
-const DEFAULT_ANNOUNCE_FREQ_SECS: u32 = 1;
+const DEFAULT_ANNOUNCE_FREQ_SECS: u32 = 5;
 const DEFAULT_ADVERTISED_ROUTES: &str = "[\"192.168.10.0/24\"]";
 const DEFAULT_ALLOW_ALL_PEERS: bool = true;
 

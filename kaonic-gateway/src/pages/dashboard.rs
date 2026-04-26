@@ -4,8 +4,7 @@ use kaonic_vpn::VpnSnapshot;
 
 use super::PageTitle;
 use crate::app_types::{
-    AtakBridgeStatusDto, GatewayStatusDto, NetworkPortStatusDto, RadioModuleConfigDto,
-    ServiceStatusDto, SystemStatusDto,
+    GatewayStatusDto, NetworkPortStatusDto, RadioModuleConfigDto, ServiceStatusDto, SystemStatusDto,
 };
 use crate::system_metrics::{
     read_cpu_percent_async, read_fs_mb, read_gateway_services, read_mem_mb, read_os_details,
@@ -23,23 +22,11 @@ fn radio_label(index: usize) -> &'static str {
 
 #[server]
 pub async fn get_gateway_status() -> Result<GatewayStatusDto, ServerFnError> {
-    use crate::app_types::{AtakBridgeStatusDto, RadioModuleConfigDto};
+    use crate::app_types::RadioModuleConfigDto;
     use crate::state::AppState;
-    use std::sync::atomic::Ordering;
 
     let state = leptos::context::use_context::<AppState>()
         .ok_or_else(|| ServerFnError::new("missing AppState context"))?;
-
-    let atak_bridges = state
-        .atak_metrics
-        .iter()
-        .map(|m| AtakBridgeStatusDto {
-            port: m.port,
-            dest_hash: m.dest_hash.get().cloned().unwrap_or_default(),
-            rx_packets: m.rx_packets.load(Ordering::Relaxed),
-            tx_packets: m.tx_packets.load(Ordering::Relaxed),
-        })
-        .collect();
 
     let radio_modules = state
         .settings
@@ -59,7 +46,6 @@ pub async fn get_gateway_status() -> Result<GatewayStatusDto, ServerFnError> {
     Ok(GatewayStatusDto {
         serial: state.serial.clone(),
         vpn_hash: state.vpn_hash.clone(),
-        atak_bridges,
         network_ports,
         system,
         services,
@@ -190,17 +176,6 @@ const WS_SCRIPT: &str = r#"
           set('dash-vpn-tx', formatBytes(vpn.tx_bytes || 0));
           set('dash-vpn-rx', formatBytes(vpn.rx_bytes || 0));
           return;
-        }
-        if (msg.type === 'atak_bridges') {
-          data.forEach(function(b, i) {
-            set('bridge-rx-' + i, '\u2193 ' + b.rx_packets);
-            set('bridge-tx-' + i, '\u2191 ' + b.tx_packets);
-            var badge = document.getElementById('bridge-badge-' + i);
-            if (badge) {
-              badge.textContent = b.dest_hash ? 'linked' : 'waiting';
-              badge.className = b.dest_hash ? 'badge badge-ok' : 'badge badge-warn';
-            }
-          });
         }
       } catch(err) { console.warn('ws parse error', err); }
     };
@@ -345,7 +320,6 @@ fn StatusView(status: GatewayStatusDto) -> impl IntoView {
             <ServicesCard services=status.services/>
             <NetworkPortsCard ports=status.network_ports/>
             <VpnCard vpn_hash=status.vpn_hash serial=status.serial vpn=status.vpn/>
-            <AtakCard bridges=status.atak_bridges/>
         </div>
         <div class="modal-backdrop" id="service-restart-modal" hidden>
             <div class="modal-card">
@@ -629,37 +603,6 @@ fn NetworkPortsCard(ports: Vec<NetworkPortStatusDto>) -> impl IntoView {
                     </tbody>
                 </table>
             </div>
-        </div>
-    }
-}
-
-#[component]
-fn AtakCard(bridges: Vec<AtakBridgeStatusDto>) -> impl IntoView {
-    view! {
-        <div class="card">
-            <div class="card-header">
-                <span class="card-title">"ATAK Bridges"</span>
-                <span class="badge">{bridges.len()}" active"</span>
-            </div>
-            {bridges.into_iter().enumerate().map(|(i, b)| {
-                let active = !b.dest_hash.is_empty();
-                view! {
-                    <div class="bridge-row">
-                        <div class="bridge-info">
-                            <span class="bridge-port">"Port "{b.port}</span>
-                            <code class="bridge-hash">{b.dest_hash}</code>
-                        </div>
-                        <div class="bridge-stats">
-                            <span class="stat-rx" id=format!("bridge-rx-{i}")>"↓ "{b.rx_packets}</span>
-                            <span class="stat-tx" id=format!("bridge-tx-{i}")>"↑ "{b.tx_packets}</span>
-                            <span id=format!("bridge-badge-{i}")
-                                class=if active { "badge badge-ok" } else { "badge badge-warn" }>
-                                {if active { "linked" } else { "waiting" }}
-                            </span>
-                        </div>
-                    </div>
-                }
-            }).collect_view()}
         </div>
     }
 }

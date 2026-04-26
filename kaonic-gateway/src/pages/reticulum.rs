@@ -52,7 +52,7 @@ const RETICULUM_WS_JS: &str = r#"
 (function() {
     var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     var ws = new WebSocket(proto + '//' + location.host + '/api/ws/status');
-    var liveState = { vpn: {}, atak_bridges: [], reticulum: {} };
+    var liveState = { vpn: {}, reticulum: {} };
 
     function shouldPauseLiveUpdates() {
         if (document.body.classList.contains('modal-open')) { return true; }
@@ -121,7 +121,6 @@ const RETICULUM_WS_JS: &str = r#"
     function destinationKindBadgeClass(value) {
         var text = String(value == null ? '' : value).toLowerCase();
         if (text === 'vpn') { return 'reticulum-badge-kind-vpn'; }
-        if (text === 'atak') { return 'reticulum-badge-kind-atak'; }
         return 'reticulum-badge-soft';
     }
 
@@ -204,6 +203,12 @@ const RETICULUM_WS_JS: &str = r#"
         }).join('');
     }
 
+    function renderInterfaceStats(stats) {
+        stats = stats || {};
+        setText('reticulum-rx-errors', String(stats.rx_errors || 0));
+        setText('reticulum-tx-errors', String(stats.tx_errors || 0));
+    }
+
     function collectLocalDestinations(payload) {
         var rows = [];
         var vpn = payload.vpn || {};
@@ -215,14 +220,6 @@ const RETICULUM_WS_JS: &str = r#"
                 status: vpn.status || 'ready'
             });
         }
-        (payload.atak_bridges || []).forEach(function(bridge) {
-            rows.push({
-                name: 'kaonic.atak.' + String(bridge.port || ''),
-                destination: bridge.dest_hash || '',
-                kind: 'ATAK',
-                status: bridge.dest_hash ? 'ready' : 'starting'
-            });
-        });
         return rows.sort(function(a, b) { return a.name.localeCompare(b.name); });
     }
 
@@ -254,12 +251,6 @@ const RETICULUM_WS_JS: &str = r#"
                 renderLocalDestinations(liveState);
                 return;
             }
-            if (msg.type === 'atak_bridges') {
-                liveState.atak_bridges = msg.data || [];
-                setText('reticulum-local-destinations-count', String(collectLocalDestinations(liveState).length));
-                renderLocalDestinations(liveState);
-                return;
-            }
             if (msg.type !== 'reticulum') { return; }
             var snapshot = msg.data || {};
             liveState.reticulum = snapshot;
@@ -267,6 +258,7 @@ const RETICULUM_WS_JS: &str = r#"
             var outgoing = snapshot.outgoing_links || [];
             setText('reticulum-incoming-count', String(incoming.length));
             setText('reticulum-outgoing-count', String(outgoing.length));
+            renderInterfaceStats(snapshot.interface_stats || {});
             renderLinks('reticulum-incoming-links', incoming, 'No incoming links seen');
             renderLinks('reticulum-outgoing-links', outgoing, 'No outgoing links seen');
             renderOpenDestinations(snapshot);
@@ -301,6 +293,8 @@ fn ReticulumContent(snapshot: ReticulumPageSnapshot) -> impl IntoView {
     let local_destinations_count = snapshot.local_destinations.len();
     let incoming_count = snapshot.reticulum.incoming_links.len();
     let outgoing_count = snapshot.reticulum.outgoing_links.len();
+    let rx_errors = snapshot.reticulum.interface_stats.rx_errors;
+    let tx_errors = snapshot.reticulum.interface_stats.tx_errors;
 
     view! {
         <div class="reticulum-summary">
@@ -319,6 +313,14 @@ fn ReticulumContent(snapshot: ReticulumPageSnapshot) -> impl IntoView {
             <div class="card stat-card">
                 <span class="stat-label">"My destinations"</span>
                 <span class="stat-value" id="reticulum-local-destinations-count">{local_destinations_count}</span>
+            </div>
+            <div class="card stat-card">
+                <span class="stat-label">"RX errors"</span>
+                <span class="stat-value" id="reticulum-rx-errors">{rx_errors}</span>
+            </div>
+            <div class="card stat-card">
+                <span class="stat-label">"TX errors"</span>
+                <span class="stat-value" id="reticulum-tx-errors">{tx_errors}</span>
             </div>
         </div>
 
@@ -520,7 +522,6 @@ fn source_badge_class(value: &str) -> &'static str {
 fn destination_kind_badge_class(value: &str) -> &'static str {
     match value.trim().to_ascii_lowercase().as_str() {
         "vpn" => "reticulum-badge-kind-vpn",
-        "atak" => "reticulum-badge-kind-atak",
         _ => "reticulum-badge-soft",
     }
 }
@@ -545,7 +546,7 @@ fn render_badge_list(values: &[String], class_fn: fn(&str) -> &'static str) -> i
 }
 
 fn collect_local_destinations(
-    state: &crate::state::AppState,
+    _state: &crate::state::AppState,
     vpn: &kaonic_vpn::VpnSnapshot,
 ) -> Vec<LocalDestinationRow> {
     let mut rows = Vec::new();
@@ -556,19 +557,6 @@ fn collect_local_destinations(
             destination: vpn.destination_hash.clone(),
             kind: "VPN".into(),
             status: vpn.status.clone(),
-        });
-    }
-
-    for bridge in &state.atak_metrics {
-        rows.push(LocalDestinationRow {
-            name: format!("kaonic.atak.{}", bridge.port),
-            destination: bridge.dest_hash.get().cloned().unwrap_or_default(),
-            kind: "ATAK".into(),
-            status: if bridge.dest_hash.get().is_some() {
-                "ready".into()
-            } else {
-                "starting".into()
-            },
         });
     }
 

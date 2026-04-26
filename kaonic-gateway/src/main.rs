@@ -14,7 +14,8 @@ use env_logger;
 use http::{AppState, SharedSettings};
 use kaonic_gateway::gateway_reticulum::GatewayReticulum;
 use kaonic_gateway::radio::{
-    attach_radio_interface, connect_radio_client, SharedRadioClient, SharedTxObserver,
+    attach_radio_interface, connect_radio_client, SharedErrorObserver, SharedRadioClient,
+    SharedTxObserver,
 };
 use kaonic_gateway::settings::Settings;
 use kaonic_vpn::{VpnConfig, VpnRuntime};
@@ -117,7 +118,6 @@ async fn async_main() -> Result<(), process::ExitCode> {
         let reticulum = Arc::new(GatewayReticulum::new());
         let app_state = AppState::new(
             settings.clone(),
-            Vec::new(),
             "webapp-only".into(),
             None,
             cmd.kaonic_ctrl_server
@@ -182,6 +182,15 @@ async fn async_main() -> Result<(), process::ExitCode> {
     let transport = Arc::new(tokio::sync::Mutex::new(Transport::new(transport_cfg)));
     let reticulum = Arc::new(GatewayReticulum::new());
     reticulum.attach(transport.clone()).await;
+    let reticulum_error_observer: SharedErrorObserver = Arc::new({
+        let reticulum = reticulum.clone();
+        move |module, kind| {
+            let reticulum = reticulum.clone();
+            tokio::spawn(async move {
+                reticulum.record_interface_error(module, kind).await;
+            });
+        }
+    });
 
     attach_radio_interface(
         &transport,
@@ -189,6 +198,7 @@ async fn async_main() -> Result<(), process::ExitCode> {
         &config.radio,
         0,
         Some(radio_tx_observer.clone()),
+        Some(reticulum_error_observer),
     )
     .await
     .map_err(|err| {
@@ -219,12 +229,8 @@ async fn async_main() -> Result<(), process::ExitCode> {
         }
     };
 
-    log::info!("ATAK bridge disabled");
-    let atak_metrics = Vec::new();
-
     let app_state = AppState::new(
         settings.clone(),
-        atak_metrics,
         vpn_hash,
         vpn,
         server_addr,

@@ -2,7 +2,7 @@ use cidr::Ipv4Cidr;
 use serde::{Deserialize, Serialize};
 
 fn default_announce_freq_secs() -> u32 {
-    3
+    5
 }
 
 fn default_allow_all_peers() -> bool {

@@ -223,6 +223,10 @@ fn VpnContent(snapshot: VpnPageSnapshot) -> impl IntoView {
                 <span class="vpn-banner-label">"Network"</span>
                 <span class="vpn-banner-ip vpn-banner-net" id="vpn-network">{network}</span>
             </div>
+            <div class="vpn-banner-field vpn-banner-field--hash">
+                <span class="vpn-banner-label">"My hash"</span>
+                <code class="vpn-banner-ip vpn-banner-hash" id="vpn-my-hash">{snapshot.local_hash.clone()}</code>
+            </div>
             <div class="vpn-banner-field">
                 <span class="vpn-banner-label">"TX bytes"</span>
                 <span class="vpn-banner-ip" id="vpn-tx-bytes">{tx_bytes}</span>
@@ -395,8 +399,6 @@ fn VpnThisDeviceCard(
             "reticulum-badge-soft"
         }
     );
-    let hash_short = truncate_hash(&local_hash);
-
     view! {
         <div class="card">
             <div class="card-header">
@@ -415,11 +417,11 @@ fn VpnThisDeviceCard(
                 <span class="info-value" id="vpn-interface">{iface}</span>
             </div>
 
-            // Identity — short hash + tooltip with full value
+            // Identity
             <div class="info-row">
                 <span class="info-label">"Identity"</span>
-                <code class="info-value vpn-hash-display" title=local_hash id="vpn-identity-short">
-                    {hash_short}
+                <code class="info-value vpn-hash-display" id="vpn-identity-short">
+                    {local_hash}
                 </code>
             </div>
 
@@ -537,7 +539,6 @@ fn VpnPeersCard(peers: Vec<VpnPeerSnapshot>) -> impl IntoView {
                             "vpn-peer-ip vpn-peer-ip--none"
                         };
                         let hash_full = peer.destination.clone();
-                        let hash_short = truncate_hash(&peer.destination);
                         let dot_class = peer_dot_class(&peer.link_state);
                         let state_badge = format!("badge {}", vpn_badge_class(&peer.link_state));
                         let last_seen = format_relative_time(peer.last_seen_ts);
@@ -563,10 +564,7 @@ fn VpnPeersCard(peers: Vec<VpnPeerSnapshot>) -> impl IntoView {
                                         </div>
                                         <div class="vpn-peer-field">
                                             <span class="vpn-peer-field-label">"Peer"</span>
-                                            <span
-                                                class="vpn-peer-hash"
-                                                title=hash_full.clone()
-                                            >{hash_short}</span>
+                                            <code class="vpn-peer-hash">{hash_full.clone()}</code>
                                         </div>
                                     </div>
                                 </div>
@@ -1076,7 +1074,7 @@ const VPN_WS_JS: &str = r#"
 
     // ── Peers card ──────────────────────────────────────────────────────────
 
-    function renderPeers(peers) {
+        function renderPeers(peers) {
         var el = document.getElementById('vpn-peers');
         if (!el) { return; }
 
@@ -1094,7 +1092,6 @@ const VPN_WS_JS: &str = r#"
             var hasIp = !!peer.tunnel_ip;
             var ipCls = hasIp ? 'vpn-peer-ip' : 'vpn-peer-ip vpn-peer-ip--none';
             var hash = String(peer.destination || '');
-            var sh   = shortHash(hash);
             var routes = peer.announced_routes || [];
             var routeHtml = routes.length > 0
                 ? routes.map(function(r) { return '<span class="vpn-route-tag">' + esc(r) + '</span>'; }).join('')
@@ -1127,7 +1124,7 @@ const VPN_WS_JS: &str = r#"
                         + '</div>'
                         + '<div class="vpn-peer-field">'
                             + '<span class="vpn-peer-field-label">Peer</span>'
-                            + '<span class="vpn-peer-hash" title="' + esc(hash) + '">' + esc(sh) + '</span>'
+                            + '<code class="vpn-peer-hash">' + esc(hash || '\u2014') + '</code>'
                         + '</div>'
                     + '</div>'
                 + '</div>'

@@ -48,14 +48,6 @@ pub struct FrameStatsDto {
     pub last_rssi: Option<i8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AtakBridgeStatusDto {
-    pub port: u16,
-    pub dest_hash: String,
-    pub rx_packets: u64,
-    pub tx_packets: u64,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SystemStatusDto {
     pub cpu_percent: f32,
@@ -127,6 +119,18 @@ pub struct ReticulumLinkDto {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReticulumInterfaceStatsDto {
+    pub rx_errors: u64,
+    pub tx_errors: u64,
+    pub rx_ldpc_errors: u64,
+    pub rx_reassembly_errors: u64,
+    pub rx_deserialize_errors: u64,
+    pub tx_ldpc_errors: u64,
+    pub tx_transmit_errors: u64,
+    pub tx_serialize_errors: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReticulumEventDto {
     pub ts: u64,
     pub direction: String,
@@ -138,6 +142,7 @@ pub struct ReticulumEventDto {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReticulumSnapshotDto {
+    pub interface_stats: ReticulumInterfaceStatsDto,
     pub incoming_links: Vec<ReticulumLinkDto>,
     pub outgoing_links: Vec<ReticulumLinkDto>,
     pub events: Vec<ReticulumEventDto>,
@@ -145,6 +150,7 @@ pub struct ReticulumSnapshotDto {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WsReticulumSnapshotDto {
+    pub interface_stats: ReticulumInterfaceStatsDto,
     pub incoming_links: Vec<ReticulumLinkDto>,
     pub outgoing_links: Vec<ReticulumLinkDto>,
 }
@@ -166,7 +172,6 @@ pub struct WsRadioFramesDto {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum WsStatusEvent {
     Interfaces(WsInterfacesDto),
-    AtakBridges(Vec<AtakBridgeStatusDto>),
     NetworkPorts(Vec<NetworkPortStatusDto>),
     System(SystemStatusDto),
     Services(Vec<ServiceStatusDto>),
@@ -179,7 +184,6 @@ pub enum WsStatusEvent {
 pub struct GatewayStatusDto {
     pub serial: String,
     pub vpn_hash: String,
-    pub atak_bridges: Vec<AtakBridgeStatusDto>,
     pub network_ports: Vec<NetworkPortStatusDto>,
     pub system: SystemStatusDto,
     pub services: Vec<ServiceStatusDto>,
@@ -193,7 +197,6 @@ impl Default for GatewayStatusDto {
         Self {
             serial: String::new(),
             vpn_hash: String::new(),
-            atak_bridges: vec![],
             network_ports: vec![],
             system: SystemStatusDto::default(),
             services: vec![],
@@ -275,7 +278,7 @@ impl Default for GatewaySettingsDto {
             allow_all_peers: true,
             peers: vec![],
             advertised_routes: vec!["192.168.10.0/24".into()],
-            announce_freq_secs: 1,
+            announce_freq_secs: 5,
             radio_modules: [
                 RadioModuleConfigDto::default(),
                 RadioModuleConfigDto::default(),

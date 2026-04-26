@@ -1626,6 +1626,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "kaonic-atak-bridge"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "env_logger 0.11.10",
+ "if-addrs",
+ "kaonic-gateway",
+ "log",
+ "rand 0.8.5",
+ "reticulum",
+ "socket2 0.5.10",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "kaonic-ctrl"
 version = "0.1.1"
 source = "git+https://github.com/BeechatNetworkSystemsLtd/kaonic-radio#60d5345479b7b2e17c7f2caa941080e96fcf2324"
@@ -1656,7 +1672,7 @@ dependencies = [
 
 [[package]]
 name = "kaonic-gateway"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "axum 0.8.9",
  "cidr 0.2.3",
@@ -1732,8 +1748,10 @@ version = "0.1.0"
 dependencies = [
  "kaonic-ctrl",
  "kaonic-frame",
+ "kaonic-net",
  "log",
  "radio-common",
+ "rand 0.8.5",
  "reticulum",
  "tokio",
  "tokio-util",

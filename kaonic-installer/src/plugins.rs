@@ -2045,6 +2045,15 @@ fn ensure_bin_path_available(
 fn sync_core_plugins(conn: &Connection, core_plugins: &[CorePluginSpec]) -> PluginResult<()> {
     for spec in core_plugins {
         let manifest_path = spec.plugin_dir.join(MANIFEST_NAME);
+        if !manifest_path.is_file() {
+            log::info!(
+                "skipping built-in plugin id={} target={} missing manifest at {}",
+                spec.plugin_id,
+                spec.target.name,
+                manifest_path.display()
+            );
+            continue;
+        }
         let manifest_raw = fs::read_to_string(&manifest_path).map_err(|err| {
             PluginError::internal(format!("read built-in plugin manifest: {err}"))
         })?;

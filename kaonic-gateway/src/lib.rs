@@ -1,5 +1,4 @@
 #![recursion_limit = "512"]
-pub mod atak;
 pub mod audio;
 pub mod config;
 pub mod gateway_reticulum;

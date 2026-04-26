@@ -7,7 +7,7 @@ use tokio::time::{interval, Duration};
 use kaonic_gateway::app_types::{FrameStatsDto, RxFrameDto, WsRadioFramesDto, WsStatusEvent};
 
 use super::handlers::{
-    build_atak_bridges, build_frame_stats, build_network_ports, build_radio_frames, build_services,
+    build_frame_stats, build_network_ports, build_radio_frames, build_services,
     build_system_status, build_vpn_snapshot, build_ws_interfaces, build_ws_reticulum_snapshot,
 };
 use super::AppState;
@@ -72,9 +72,6 @@ async fn publish_periodic_events(state: &AppState) {
         .send(WsStatusEvent::Interfaces(build_ws_interfaces()));
     let _ = state
         .ws_events
-        .send(WsStatusEvent::AtakBridges(build_atak_bridges(state)));
-    let _ = state
-        .ws_events
         .send(WsStatusEvent::System(build_system_status().await));
     let _ = state.ws_events.send(WsStatusEvent::Services(services));
     let _ = state
@@ -93,7 +90,6 @@ async fn initial_events(state: &AppState) -> Vec<WsStatusEvent> {
     let network_ports = build_network_ports(state, &services);
     vec![
         WsStatusEvent::Interfaces(build_ws_interfaces()),
-        WsStatusEvent::AtakBridges(build_atak_bridges(state)),
         WsStatusEvent::System(build_system_status().await),
         WsStatusEvent::Services(services),
         WsStatusEvent::NetworkPorts(network_ports),

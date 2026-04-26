@@ -2051,6 +2051,7 @@ select.field-input {
   display: flex;
   flex-direction: column;
   gap: 1px;
+  min-width: 0;
 }
 
 .vpn-banner-label {
@@ -2072,6 +2073,18 @@ select.field-input {
 .vpn-banner-net {
   font-size: 13px;
   font-weight: 600;
+}
+
+.vpn-banner-field--hash {
+  flex: 1 1 260px;
+}
+
+.vpn-banner-hash {
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.45;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .vpn-banner-spacer { flex: 1; min-width: 8px; }
@@ -2143,7 +2156,6 @@ select.field-input {
   font-family: var(--font-mono);
   font-size: 12px;
   color: var(--text-muted);
-  cursor: help;
   word-break: break-all;
 }
 
@@ -2345,7 +2357,9 @@ select.field-input {
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--text-muted);
-  cursor: help;
+  line-height: 1.45;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .vpn-peer-routes {

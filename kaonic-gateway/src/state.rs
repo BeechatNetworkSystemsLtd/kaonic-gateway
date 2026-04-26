@@ -9,7 +9,6 @@ use tokio::sync::{broadcast, Mutex as TokioMutex};
 use kaonic_vpn::VpnRuntime;
 
 use crate::app_types::{NetworkPortStatusDto, RxFrameDto, ServiceStatusDto, WsStatusEvent};
-use crate::atak::BridgeMetrics;
 use crate::audio::AudioService;
 use crate::gateway_reticulum::SharedGatewayReticulum;
 use crate::network::NetworkService;
@@ -100,7 +99,6 @@ pub struct AppState {
     pub audio: SharedAudioService,
     pub network: SharedNetworkService,
     pub settings: SharedSettings,
-    pub atak_metrics: Vec<Arc<BridgeMetrics>>,
     pub vpn_hash: String,
     pub vpn: Option<Arc<VpnRuntime>>,
     pub kaonic_ctrl_server_addr: SocketAddr,
@@ -118,7 +116,6 @@ pub struct AppState {
 impl AppState {
     pub fn new(
         settings: SharedSettings,
-        atak_metrics: Vec<Arc<BridgeMetrics>>,
         vpn_hash: String,
         vpn: Option<Arc<VpnRuntime>>,
         kaonic_ctrl_server_addr: SocketAddr,
@@ -132,7 +129,6 @@ impl AppState {
             audio: Arc::new(AudioService::new()),
             network: Arc::new(NetworkService::new()),
             settings,
-            atak_metrics,
             vpn_hash,
             vpn,
             kaonic_ctrl_server_addr,
@@ -191,23 +187,6 @@ impl AppState {
                 details: "Dashboard, API, WebSocket".into(),
             },
         ];
-
-        for bridge in &self.atak_metrics {
-            ports.push(NetworkPortStatusDto {
-                name: format!("ATAK Bridge {}", bridge.port),
-                protocol: "UDP".into(),
-                port: bridge.port,
-                service: "kaonic-gateway.service".into(),
-                status: if gateway_active && bridge.dest_hash.get().is_some() {
-                    "linked".into()
-                } else if gateway_active {
-                    "listening".into()
-                } else {
-                    gateway_status.clone()
-                },
-                details: format!("Multicast bridge :{}", bridge.port),
-            });
-        }
 
         ports.sort_by(|a, b| {
             a.port

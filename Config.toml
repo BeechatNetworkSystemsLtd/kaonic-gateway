@@ -14,7 +14,7 @@ advertised_routes = [
 ]
 
 # How often to re-announce our VPN destination on the network (seconds).
-announce_freq_secs = 1
+announce_freq_secs = 5
 
 # kaonic-ctrl connection settings (used when running without --udp-port)
 [kaonic_ctrl_config]

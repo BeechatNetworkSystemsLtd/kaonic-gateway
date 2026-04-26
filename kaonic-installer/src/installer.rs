@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 /// Describes one updatable target on the system.
 #[derive(Debug)]
 pub struct Target {
-    /// Stable built-in target name ("commd" or "gateway").
+    /// Stable built-in target name ("commd", "gateway", or "factory").
     pub name: &'static str,
     /// Public executable path exposed in plugin metadata (usually a symlink).
     pub symlink_path: PathBuf,

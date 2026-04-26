@@ -1,12 +1,15 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+use kaonic_reticulum::InterfaceErrorKind;
 use reticulum::destination::link::{Link, LinkEvent, LinkEventData, LinkStatus};
 use reticulum::transport::{AnnounceEvent, ReceivedData, Transport};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::Mutex;
 
-use crate::app_types::{ReticulumEventDto, ReticulumLinkDto, ReticulumSnapshotDto};
+use crate::app_types::{
+    ReticulumEventDto, ReticulumInterfaceStatsDto, ReticulumLinkDto, ReticulumSnapshotDto,
+};
 
 const RETICULUM_EVENT_BUF_SIZE: usize = 256;
 
@@ -14,6 +17,7 @@ pub type SharedGatewayReticulum = Arc<GatewayReticulum>;
 
 #[derive(Default)]
 struct GatewayReticulumState {
+    interface_stats: ReticulumInterfaceStatsDto,
     incoming_links: HashMap<String, ReticulumLinkDto>,
     outgoing_links: HashMap<String, ReticulumLinkDto>,
     events: VecDeque<ReticulumEventDto>,
@@ -47,10 +51,55 @@ impl GatewayReticulum {
         });
 
         ReticulumSnapshotDto {
+            interface_stats: state.interface_stats.clone(),
             incoming_links,
             outgoing_links,
             events: state.events.iter().cloned().collect(),
         }
+    }
+
+    pub async fn record_interface_error(&self, module: usize, kind: InterfaceErrorKind) {
+        let ts = unix_timestamp_secs();
+        let mut state = self.state.lock().await;
+        let stats = &mut state.interface_stats;
+        match kind {
+            InterfaceErrorKind::RxLdpcDecode => {
+                stats.rx_errors += 1;
+                stats.rx_ldpc_errors += 1;
+            }
+            InterfaceErrorKind::RxReassembly => {
+                stats.rx_errors += 1;
+                stats.rx_reassembly_errors += 1;
+            }
+            InterfaceErrorKind::RxDeserialize => {
+                stats.rx_errors += 1;
+                stats.rx_deserialize_errors += 1;
+            }
+            InterfaceErrorKind::TxLdpcEncode => {
+                stats.tx_errors += 1;
+                stats.tx_ldpc_errors += 1;
+            }
+            InterfaceErrorKind::TxTransmit => {
+                stats.tx_errors += 1;
+                stats.tx_transmit_errors += 1;
+            }
+            InterfaceErrorKind::TxSerialize => {
+                stats.tx_errors += 1;
+                stats.tx_serialize_errors += 1;
+            }
+        }
+
+        push_event(
+            &mut state.events,
+            ReticulumEventDto {
+                ts,
+                direction: "interface".into(),
+                kind: "error".into(),
+                link_id: String::new(),
+                destination: String::new(),
+                details: format!("module {module}: {}", interface_error_label(kind)),
+            },
+        );
     }
 
     pub async fn attach(self: &Arc<Self>, transport: Arc<Mutex<Transport>>) {
@@ -297,6 +346,17 @@ fn link_event_status(event: &LinkEvent) -> &'static str {
 fn push_event(events: &mut VecDeque<ReticulumEventDto>, event: ReticulumEventDto) {
     events.push_front(event);
     events.truncate(RETICULUM_EVENT_BUF_SIZE);
+}
+
+fn interface_error_label(kind: InterfaceErrorKind) -> &'static str {
+    match kind {
+        InterfaceErrorKind::RxLdpcDecode => "rx ldpc decode",
+        InterfaceErrorKind::RxReassembly => "rx reassembly",
+        InterfaceErrorKind::RxDeserialize => "rx deserialize",
+        InterfaceErrorKind::TxLdpcEncode => "tx ldpc encode",
+        InterfaceErrorKind::TxTransmit => "tx transmit",
+        InterfaceErrorKind::TxSerialize => "tx serialize",
+    }
 }
 
 fn unix_timestamp_secs() -> u64 {

@@ -4,21 +4,34 @@ use std::sync::Arc;
 use kaonic_ctrl::client::Client;
 use kaonic_ctrl::error::ControllerError;
 use kaonic_ctrl::protocol::{Message, MessageCoder, RADIO_FRAME_SIZE};
-use kaonic_frame::frame::Frame;
+use kaonic_frame::frame::{Frame, FrameSegment};
+use kaonic_net::{
+    coder::LdpcPacketCoder, error::NetworkError as KaonicNetError,
+    network::Network as KaonicNetNetwork,
+};
+use rand::rngs::OsRng;
 use reticulum::buffer::{InputBuffer, OutputBuffer};
 use reticulum::iface::{Interface, InterfaceContext, RxMessage, TxMessage};
-use reticulum::packet::{Packet, PacketContext, PacketType};
+use reticulum::packet::Packet;
 use reticulum::serde::Serialize;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 pub use kaonic_ctrl::radio::RadioClient;
 
 pub type TxObserver = Arc<dyn Fn(usize, &[u8]) + Send + Sync>;
+pub type ErrorObserver = Arc<dyn Fn(usize, InterfaceErrorKind) + Send + Sync>;
+const LDPC_SEGMENTS_PER_PACKET: usize = 3;
+const LDPC_REASSEMBLY_QUEUE: usize = 32;
 
-const HIGH_PRIORITY_TX_CAPACITY: usize = 64;
-const NORMAL_PRIORITY_TX_CAPACITY: usize = 256;
-const HIGH_PRIORITY_BURST: usize = 8;
+type RadioPacketCoder = LdpcPacketCoder<RADIO_FRAME_SIZE>;
+type RadioNetwork = KaonicNetNetwork<
+    RADIO_FRAME_SIZE,
+    LDPC_SEGMENTS_PER_PACKET,
+    LDPC_REASSEMBLY_QUEUE,
+    RadioPacketCoder,
+>;
+type RadioSegmentBuffer = FrameSegment<RADIO_FRAME_SIZE, LDPC_SEGMENTS_PER_PACKET>;
 
 /// Reticulum interface that forwards packets through the kaonic radio hardware
 /// via the kaonic-ctrl UDP control protocol.
@@ -30,6 +43,17 @@ pub struct KaonicCtrlInterface {
     radio_client: Arc<Mutex<RadioClient>>,
     module: usize,
     tx_observer: Option<TxObserver>,
+    error_observer: Option<ErrorObserver>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum InterfaceErrorKind {
+    RxLdpcDecode,
+    RxReassembly,
+    RxDeserialize,
+    TxLdpcEncode,
+    TxTransmit,
+    TxSerialize,
 }
 
 impl KaonicCtrlInterface {
@@ -57,100 +81,105 @@ impl KaonicCtrlInterface {
         radio_client: Arc<Mutex<RadioClient>>,
         module: usize,
         tx_observer: Option<TxObserver>,
+        error_observer: Option<ErrorObserver>,
     ) -> Self {
         Self {
             radio_client,
             module,
             tx_observer,
+            error_observer,
         }
     }
 
     /// Spawn the interface tasks. Matches the pattern used by other Reticulum interfaces.
     pub async fn spawn(context: InterfaceContext<Self>) {
-        let (radio_client, module, tx_observer) = {
+        let (radio_client, module, tx_observer, error_observer) = {
             let inner = context.inner.lock().unwrap();
             (
                 inner.radio_client.clone(),
                 inner.module,
                 inner.tx_observer.clone(),
+                inner.error_observer.clone(),
             )
         };
 
         let iface_address = context.channel.address;
         let (rx_channel, mut tx_channel) = context.channel.split();
         let cancel = context.cancel;
-        let (high_tx, mut high_rx) = mpsc::channel(HIGH_PRIORITY_TX_CAPACITY);
-        let (normal_tx, mut normal_rx) = mpsc::channel(NORMAL_PRIORITY_TX_CAPACITY);
 
         let mut rx_recv = radio_client.lock().await.module_receive();
 
         let rx_task = {
             let cancel = cancel.clone();
             let rx_channel = rx_channel.clone();
+            let error_observer = error_observer.clone();
 
             tokio::spawn(async move {
+                let mut rx_network = build_radio_network();
+                let mut rx_frame = RadioSegmentBuffer::new();
                 loop {
                     tokio::select! {
                         _ = cancel.cancelled() => break,
                         Ok(recv_module) = rx_recv.recv() => {
                             if recv_module.module == module {
-                                let bytes = recv_module.frame.as_slice();
-                                let mut input = InputBuffer::new(bytes);
-                                match Packet::deserialize(&mut input) {
-                                    Ok(packet) => {
-                                        log::trace!(
-                                            "kaonic_ctrl: rx module={} rssi={} {}",
-                                            module,
-                                            recv_module.rssi,
-                                            packet_log_summary(&packet)
-                                        );
-                                        let _ = rx_channel
-                                            .send(RxMessage { address: iface_address, packet })
-                                            .await;
-                                    }
-                                    Err(err) => {
-                                        log::warn!(
-                                            "kaonic_ctrl: rx deserialize failed module={} len={} preview={} err={err:?}",
-                                            module,
-                                            bytes.len(),
-                                            frame_preview(bytes)
-                                        );
+                                let current_time = network_time_now();
+                                let frame_bytes = recv_module.frame.as_slice();
+                                let mut frame = Frame::<RADIO_FRAME_SIZE>::new();
+                                frame.copy_from_slice(frame_bytes);
+                                if let Err(err) = rx_network.receive(current_time, &frame) {
+                                    notify_error(&error_observer, module, InterfaceErrorKind::RxLdpcDecode);
+                                    log::warn!(
+                                        "kaonic_ctrl: rx ldpc decode failed module={} len={} preview={} err={err:?}",
+                                        module,
+                                        frame_bytes.len(),
+                                        frame_preview(frame_bytes)
+                                    );
+                                    continue;
+                                }
+
+                                loop {
+                                    match rx_network.process(current_time, &mut rx_frame) {
+                                        Ok(assembled) => {
+                                            let bytes = assembled.as_slice();
+                                            let mut input = InputBuffer::new(bytes);
+                                            match Packet::deserialize(&mut input) {
+                                                Ok(packet) => {
+                                                    log::trace!(
+                                                        "kaonic_ctrl: rx module={} rssi={} packet_id={} {}",
+                                                        module,
+                                                        recv_module.rssi,
+                                                        assembled.id(),
+                                                        packet_log_summary(&packet)
+                                                    );
+                                                    let _ = rx_channel
+                                                        .send(RxMessage { address: iface_address, packet })
+                                                        .await;
+                                                }
+                                                Err(err) => {
+                                                    notify_error(&error_observer, module, InterfaceErrorKind::RxDeserialize);
+                                                    log::warn!(
+                                                        "kaonic_ctrl: rx deserialize failed module={} len={} preview={} err={err:?}",
+                                                        module,
+                                                        bytes.len(),
+                                                        frame_preview(bytes)
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(KaonicNetError::TryAgain) => break,
+                                        Err(err) => {
+                                            notify_error(&error_observer, module, InterfaceErrorKind::RxReassembly);
+                                            log::warn!(
+                                                "kaonic_ctrl: rx ldpc reassembly failed module={} len={} preview={} err={err:?}",
+                                                module,
+                                                frame_bytes.len(),
+                                                frame_preview(frame_bytes)
+                                            );
+                                            break;
+                                        }
                                     }
                                 }
                             }
-                        }
-                    }
-                }
-            })
-        };
-
-        let tx_classifier_task = {
-            let cancel = cancel.clone();
-
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = cancel.cancelled() => break,
-                        maybe_message = tx_channel.recv() => match maybe_message {
-                            Some(message) => {
-                                let high_priority = is_high_priority(&message.packet);
-                                log::trace!(
-                                    "kaonic_ctrl: tx classify module={} priority={} {}",
-                                    module,
-                                    if high_priority { "high" } else { "normal" },
-                                    packet_log_summary(&message.packet)
-                                );
-                                let target = if high_priority {
-                                    &high_tx
-                                } else {
-                                    &normal_tx
-                                };
-                                if target.send(message).await.is_err() {
-                                    log::warn!("kaonic_ctrl: priority tx queue closed");
-                                    break;
-                                }
-                            }
-                            None => break,
                         }
                     }
                 }
@@ -161,26 +190,28 @@ impl KaonicCtrlInterface {
             let cancel = cancel.clone();
             let radio_client = radio_client.clone();
             let tx_observer = tx_observer.clone();
+            let error_observer = error_observer.clone();
 
             tokio::spawn(async move {
                 const BUF_SIZE: usize = reticulum::packet::PACKET_MDU * 2;
                 let mut tx_buffer = [0u8; BUF_SIZE];
+                let mut tx_network = build_radio_network();
+                let mut tx_frames = [Frame::<RADIO_FRAME_SIZE>::new(); LDPC_SEGMENTS_PER_PACKET];
 
                 loop {
                     tokio::select! {
                         _ = cancel.cancelled() => break,
-                        Some(message) = high_rx.recv() => {
-                            transmit_message(&radio_client, module, &tx_observer, &mut tx_buffer, message).await;
-                            for _ in 1..HIGH_PRIORITY_BURST {
-                                let Ok(message) = high_rx.try_recv() else { break; };
-                                transmit_message(&radio_client, module, &tx_observer, &mut tx_buffer, message).await;
-                            }
-                            if let Ok(message) = normal_rx.try_recv() {
-                                transmit_message(&radio_client, module, &tx_observer, &mut tx_buffer, message).await;
-                            }
-                        }
-                        Some(message) = normal_rx.recv() => {
-                            transmit_message(&radio_client, module, &tx_observer, &mut tx_buffer, message).await;
+                        Some(message) = tx_channel.recv() => {
+                            transmit_message(
+                                &radio_client,
+                                module,
+                                &tx_observer,
+                                &error_observer,
+                                &mut tx_network,
+                                &mut tx_frames,
+                                &mut tx_buffer,
+                                message,
+                            ).await;
                         }
                         else => break,
                     }
@@ -188,19 +219,8 @@ impl KaonicCtrlInterface {
             })
         };
 
-        let _ = tokio::join!(rx_task, tx_classifier_task, tx_task);
+        let _ = tokio::join!(rx_task, tx_task);
     }
-}
-
-fn is_high_priority(packet: &Packet) -> bool {
-    matches!(
-        (packet.header.packet_type, packet.context),
-        (PacketType::LinkRequest, _)
-            | (PacketType::Proof, PacketContext::LinkRequestProof)
-            | (PacketType::Data, PacketContext::KeepAlive)
-            | (PacketType::Data, PacketContext::LinkRTT)
-            | (PacketType::Data, PacketContext::LinkClose)
-    )
 }
 
 fn packet_log_summary(packet: &Packet) -> String {
@@ -226,32 +246,56 @@ async fn transmit_message(
     radio_client: &Arc<Mutex<RadioClient>>,
     module: usize,
     tx_observer: &Option<TxObserver>,
+    error_observer: &Option<ErrorObserver>,
+    tx_network: &mut RadioNetwork,
+    tx_frames: &mut [Frame<RADIO_FRAME_SIZE>; LDPC_SEGMENTS_PER_PACKET],
     tx_buffer: &mut [u8],
     message: TxMessage,
 ) {
     let mut output = OutputBuffer::new(tx_buffer);
     if let Ok(_) = message.packet.serialize(&mut output) {
         let bytes = output.as_slice();
-        log::trace!(
-            "kaonic_ctrl: tx module={} {} frame_len={}",
-            module,
-            packet_log_summary(&message.packet),
-            bytes.len()
-        );
-        let mut frame = Frame::<RADIO_FRAME_SIZE>::new();
-        frame.copy_from_slice(bytes);
+        match tx_network.transmit(bytes, OsRng, tx_frames) {
+            Ok(frames) => {
+                log::trace!(
+                    "kaonic_ctrl: tx module={} {} payload_len={} encoded_frames={}",
+                    module,
+                    packet_log_summary(&message.packet),
+                    bytes.len(),
+                    frames.len()
+                );
 
-        if let Err(err) = radio_client.lock().await.transmit(module, &frame).await {
-            log::warn!(
-                "kaonic_ctrl: tx failed module={} {} frame_len={} err={err:?}",
-                module,
-                packet_log_summary(&message.packet),
-                bytes.len()
-            );
-        } else if let Some(observer) = tx_observer {
-            observer(module, bytes);
+                let mut radio_client = radio_client.lock().await;
+                for frame in frames {
+                    let frame_bytes = frame.as_slice();
+                    if let Err(err) = radio_client.transmit(module, frame).await {
+                        notify_error(error_observer, module, InterfaceErrorKind::TxTransmit);
+                        log::warn!(
+                            "kaonic_ctrl: tx failed module={} {} payload_len={} frame_len={} err={err:?}",
+                            module,
+                            packet_log_summary(&message.packet),
+                            bytes.len(),
+                            frame_bytes.len()
+                        );
+                        return;
+                    }
+                    if let Some(observer) = tx_observer {
+                        observer(module, frame_bytes);
+                    }
+                }
+            }
+            Err(err) => {
+                notify_error(error_observer, module, InterfaceErrorKind::TxLdpcEncode);
+                log::warn!(
+                    "kaonic_ctrl: tx ldpc encode failed module={} {} payload_len={} err={err:?}",
+                    module,
+                    packet_log_summary(&message.packet),
+                    bytes.len()
+                );
+            }
         }
     } else {
+        notify_error(error_observer, module, InterfaceErrorKind::TxSerialize);
         log::warn!(
             "kaonic_ctrl: packet serialize failed module={} {}",
             module,
@@ -263,8 +307,54 @@ async fn transmit_message(
     tokio::task::yield_now().await;
 }
 
+fn notify_error(observer: &Option<ErrorObserver>, module: usize, kind: InterfaceErrorKind) {
+    if let Some(observer) = observer {
+        observer(module, kind);
+    }
+}
+
+fn build_radio_network() -> RadioNetwork {
+    KaonicNetNetwork::new(LdpcPacketCoder::new())
+}
+
+fn network_time_now() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
 impl Interface for KaonicCtrlInterface {
     fn mtu() -> usize {
         RADIO_FRAME_SIZE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ldpc_radio_network_round_trips_full_reticulum_payload() {
+        let original = [0x5a; reticulum::packet::PACKET_MDU];
+        let mut tx_network = build_radio_network();
+        let mut rx_network = build_radio_network();
+        let mut tx_frames = [Frame::<RADIO_FRAME_SIZE>::new(); LDPC_SEGMENTS_PER_PACKET];
+        let mut rx_frame = RadioSegmentBuffer::new();
+
+        let frames = tx_network
+            .transmit(&original, OsRng, &mut tx_frames)
+            .expect("encoded ldpc frames");
+
+        let mut recovered = None;
+        for (idx, frame) in frames.iter().enumerate() {
+            let ts = idx as u128;
+            rx_network.receive(ts, frame).expect("accepted ldpc frame");
+            if let Ok(packet) = rx_network.process(ts, &mut rx_frame) {
+                recovered = Some(packet.as_slice().to_vec());
+            }
+        }
+
+        assert_eq!(recovered.as_deref(), Some(original.as_slice()));
     }
 }
