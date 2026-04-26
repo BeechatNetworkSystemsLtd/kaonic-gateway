@@ -49,19 +49,22 @@ struct AppState {
     systemd_cache: Arc<RwLock<HashMap<String, plugins::PluginSystemdStatus>>>,
 }
 
-fn make_targets(meta_dir: &str, bin_dir: &str) -> (Arc<Target>, Arc<Target>) {
+fn make_targets(meta_dir: &str, bin_dir: &str, plugins_dir: &str) -> (Arc<Target>, Arc<Target>) {
     let meta = PathBuf::from(meta_dir);
     let bin = PathBuf::from(bin_dir);
+    let plugins = PathBuf::from(plugins_dir);
     (
         Arc::new(Target {
             name: "commd",
-            bin_path: bin.join("kaonic-commd"),
+            symlink_path: bin.join("kaonic-commd"),
+            binary_path: plugins.join("kaonic-commd/current/kaonic-commd"),
             service: "kaonic-commd.service",
             meta_dir: meta.clone(),
         }),
         Arc::new(Target {
             name: "gateway",
-            bin_path: bin.join("kaonic-gateway"),
+            symlink_path: bin.join("kaonic-gateway"),
+            binary_path: plugins.join("kaonic-gateway/current/kaonic-gateway"),
             service: "kaonic-gateway.service",
             meta_dir: meta,
         }),
@@ -77,7 +80,7 @@ async fn main() {
 
     let cmd = Cmd::parse();
 
-    let (commd, gateway) = make_targets(META_DIR, BIN_DIR);
+    let (commd, gateway) = make_targets(META_DIR, BIN_DIR, PLUGINS_DIR);
 
     // Validate installed binaries against stored hashes on boot
     validate_on_boot(&commd);
@@ -115,7 +118,10 @@ async fn main() {
 
     let app = Router::new()
         .route("/api/plugins", get(handle_plugins_list))
-        .route("/api/plugins/installer-version", get(handle_installer_version))
+        .route(
+            "/api/plugins/installer-version",
+            get(handle_installer_version),
+        )
         .route("/api/plugins/install", post(handle_plugin_install))
         .route("/api/plugins/:plugin_id/upload", post(handle_plugin_upload))
         .route("/api/plugins/:plugin_id/start", post(handle_plugin_start))
@@ -303,7 +309,12 @@ async fn handle_plugin_delete(
     let systemd_dir = state.systemd_dir.clone();
     let plugin_id_for_task = plugin_id.clone();
     match tokio::task::spawn_blocking(move || {
-        plugins::delete_plugin(&plugins_root, &plugins_db, &systemd_dir, &plugin_id_for_task)
+        plugins::delete_plugin(
+            &plugins_root,
+            &plugins_db,
+            &systemd_dir,
+            &plugin_id_for_task,
+        )
     })
     .await
     {
@@ -337,7 +348,11 @@ async fn handle_plugin_action(
 ) -> axum::response::Response {
     let plugins_db = state.plugins_db.clone();
     let action_name = action.as_str().to_string();
-    log::info!("received plugin action request action={} plugin_id={}", action_name, plugin_id);
+    log::info!(
+        "received plugin action request action={} plugin_id={}",
+        action_name,
+        plugin_id
+    );
     let plugin_id_for_task = plugin_id.clone();
     match tokio::task::spawn_blocking(move || {
         plugins::control_plugin(&plugins_db, &plugin_id_for_task, action)
@@ -359,10 +374,9 @@ async fn handle_plugin_action(
             }
             Json(response).into_response()
         }
-        Ok(Err(err)) => plugin_error_response(
-            &format!("{} plugin {}", action_name, plugin_id),
-            err,
-        ),
+        Ok(Err(err)) => {
+            plugin_error_response(&format!("{} plugin {}", action_name, plugin_id), err)
+        }
         Err(err) => {
             log::error!(
                 "plugin action task panic action={} plugin_id={}: {err}",
@@ -393,12 +407,13 @@ async fn run_systemd_refresh_loop(state: AppState) {
 async fn refresh_systemd_cache(state: &AppState) -> Result<(), plugins::PluginError> {
     let plugins_db = state.plugins_db.clone();
 
-    let cache = tokio::task::spawn_blocking(move || plugins::refresh_systemd_status_cache(&plugins_db))
-        .await
-    .map_err(|err| plugins::PluginError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        detail: format!("plugin cache task panic: {err}"),
-    })??;
+    let cache =
+        tokio::task::spawn_blocking(move || plugins::refresh_systemd_status_cache(&plugins_db))
+            .await
+            .map_err(|err| plugins::PluginError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                detail: format!("plugin cache task panic: {err}"),
+            })??;
 
     *state.systemd_cache.write().await = cache;
     Ok(())
@@ -457,9 +472,19 @@ async fn read_upload_bytes(mut multipart: Multipart) -> Result<Bytes, axum::resp
 
 fn plugin_error_response(context: &str, err: plugins::PluginError) -> axum::response::Response {
     if err.status.is_server_error() {
-        log::error!("{} failed status={} detail={}", context, err.status, err.detail);
+        log::error!(
+            "{} failed status={} detail={}",
+            context,
+            err.status,
+            err.detail
+        );
     } else {
-        log::warn!("{} failed status={} detail={}", context, err.status, err.detail);
+        log::warn!(
+            "{} failed status={} detail={}",
+            context,
+            err.status,
+            err.detail
+        );
     }
     (
         err.status,

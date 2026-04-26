@@ -10,6 +10,7 @@ use crate::radio::{HardwareRadioConfig, RadioModuleConfig};
 const DEFAULT_NETWORK: &str = "10.20.0.0/16";
 const DEFAULT_ANNOUNCE_FREQ_SECS: u32 = 1;
 const DEFAULT_ADVERTISED_ROUTES: &str = "[\"192.168.10.0/24\"]";
+const DEFAULT_ALLOW_ALL_PEERS: bool = true;
 
 pub struct Database {
     conn: Connection,
@@ -83,6 +84,10 @@ impl Database {
             .get("announce_freq_secs")?
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(DEFAULT_ANNOUNCE_FREQ_SECS);
+        let allow_all_peers = self
+            .get("allow_all_peers")?
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(DEFAULT_ALLOW_ALL_PEERS);
 
         let peers = {
             let mut stmt = self
@@ -134,6 +139,7 @@ impl Database {
 
         Ok(GatewayConfig {
             network,
+            allow_all_peers,
             peers,
             advertised_routes,
             announce_freq_secs,
@@ -147,6 +153,7 @@ impl Database {
             "advertised_routes",
             &serde_json::to_string(&config.advertised_routes).unwrap(),
         )?;
+        self.set("allow_all_peers", &config.allow_all_peers.to_string())?;
         self.set("announce_freq_secs", &config.announce_freq_secs.to_string())?;
 
         self.conn.execute("DELETE FROM peers", [])?;

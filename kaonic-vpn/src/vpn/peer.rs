@@ -195,6 +195,10 @@ impl PeerRegistry {
     pub fn all(&self) -> Vec<Arc<Peer>> {
         self.peers.read().values().cloned().collect()
     }
+
+    pub fn remove(&self, hash: &AddressHash) {
+        self.peers.write().remove(hash);
+    }
 }
 
 impl Default for PeerRegistry {

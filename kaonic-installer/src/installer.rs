@@ -10,8 +10,10 @@ use sha2::{Digest, Sha256};
 pub struct Target {
     /// Stable built-in target name ("commd" or "gateway").
     pub name: &'static str,
-    /// Installed binary path.
-    pub bin_path: PathBuf,
+    /// Public executable path exposed in plugin metadata (usually a symlink).
+    pub symlink_path: PathBuf,
+    /// Actual managed binary path updated by OTA.
+    pub binary_path: PathBuf,
     /// systemd service unit name.
     pub service: &'static str,
     /// Directory that holds version/hash/backup metadata.
@@ -33,7 +35,7 @@ impl Target {
     }
 
     fn bin_name(&self) -> &str {
-        self.bin_path.file_name().unwrap().to_str().unwrap()
+        self.binary_path.file_name().unwrap().to_str().unwrap()
     }
 }
 
@@ -49,7 +51,7 @@ pub fn validate_on_boot(target: &Target) {
         let _ = fs::create_dir_all(&target.meta_dir);
         return;
     }
-    if !target.bin_path.exists() && !target.backup_path().exists() {
+    if !target.binary_path.exists() && !target.backup_path().exists() {
         log::debug!(
             "[{}] no installed binary or backup found, skipping boot validation",
             target.name
@@ -59,11 +61,14 @@ pub fn validate_on_boot(target: &Target) {
     let expected = match read_trimmed(&target.hash_path()) {
         Some(h) => h,
         None => {
-            log::debug!("[{}] no stored hash found, skipping boot validation", target.name);
+            log::debug!(
+                "[{}] no stored hash found, skipping boot validation",
+                target.name
+            );
             return;
         }
     };
-    let actual = match sha256_file(&target.bin_path) {
+    let actual = match sha256_file(&target.binary_path) {
         Ok(h) => h,
         Err(_) => String::new(),
     };
@@ -88,7 +93,7 @@ pub fn apply_update(target: &Target, zip_bytes: &[u8]) -> Result<String, String>
         "[{}] starting OTA apply payload_bytes={} target_bin={} service={}",
         target.name,
         zip_bytes.len(),
-        target.bin_path.display(),
+        target.binary_path.display(),
         target.service
     );
     let tmp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
@@ -101,7 +106,11 @@ pub fn apply_update(target: &Target, zip_bytes: &[u8]) -> Result<String, String>
     archive
         .extract(tmp_path)
         .map_err(|e| format!("ZIP extract: {e}"))?;
-    log::debug!("[{}] extracted OTA package into {}", target.name, tmp_path.display());
+    log::debug!(
+        "[{}] extracted OTA package into {}",
+        target.name,
+        tmp_path.display()
+    );
 
     let bin_name = target.bin_name().to_string();
     let new_bin = tmp_path.join(&bin_name);
@@ -163,10 +172,13 @@ pub fn apply_update(target: &Target, zip_bytes: &[u8]) -> Result<String, String>
     log::debug!(
         "[{}] replacing binary {}",
         target.name,
-        target.bin_path.display()
+        target.binary_path.display()
     );
-    fs::copy(&new_bin, &target.bin_path).map_err(|e| format!("copy binary: {e}"))?;
-    make_executable(&target.bin_path).map_err(|e| format!("chmod: {e}"))?;
+    if let Some(parent) = target.binary_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create binary dir: {e}"))?;
+    }
+    fs::copy(&new_bin, &target.binary_path).map_err(|e| format!("copy binary: {e}"))?;
+    make_executable(&target.binary_path).map_err(|e| format!("chmod: {e}"))?;
 
     log::debug!("[{}] starting service {}", target.name, target.service);
     let _ = systemctl("start", target.service);
@@ -174,10 +186,17 @@ pub fn apply_update(target: &Target, zip_bytes: &[u8]) -> Result<String, String>
     // Poll for up to 10 s (skip for gateway — it restarts itself, breaking the poll)
     let is_gateway = target.name == "gateway";
     let running = if is_gateway {
-        log::debug!("[{}] skipping health poll for self-restarting gateway", target.name);
+        log::debug!(
+            "[{}] skipping health poll for self-restarting gateway",
+            target.name
+        );
         true // assume success; gateway service restart will proceed independently
     } else {
-        log::debug!("[{}] polling service health for {}", target.name, target.service);
+        log::debug!(
+            "[{}] polling service health for {}",
+            target.name,
+            target.service
+        );
         poll_running(target.service, 10, Duration::from_secs(1))
     };
 
@@ -223,7 +242,12 @@ fn systemctl(action: &str, service: &str) -> io::Result<()> {
     if status.success() {
         log::debug!("systemctl {} {} succeeded", action, service);
     } else {
-        log::warn!("systemctl {} {} exited with status {}", action, service, status);
+        log::warn!(
+            "systemctl {} {} exited with status {}",
+            action,
+            service,
+            status
+        );
     }
     Ok(())
 }
@@ -247,26 +271,25 @@ fn poll_running(service: &str, tries: u32, interval: Duration) -> bool {
 }
 
 fn backup_current(target: &Target) {
-    if target.bin_path.exists() {
+    if target.binary_path.exists() {
         log::debug!(
             "[{}] writing backup to {}",
             target.name,
             target.backup_path().display()
         );
-        let _ = fs::copy(&target.bin_path, target.backup_path());
+        let _ = fs::copy(&target.binary_path, target.backup_path());
     }
 }
 
 fn restore_backup(target: &Target) {
     let bak = target.backup_path();
     if bak.exists() {
-        log::debug!(
-            "[{}] restoring backup from {}",
-            target.name,
-            bak.display()
-        );
-        let _ = fs::copy(&bak, &target.bin_path);
-        let _ = make_executable(&target.bin_path);
+        log::debug!("[{}] restoring backup from {}", target.name, bak.display());
+        if let Some(parent) = target.binary_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::copy(&bak, &target.binary_path);
+        let _ = make_executable(&target.binary_path);
     }
 }
 
@@ -299,5 +322,70 @@ fn verify_signature(bin: &Path, sig: &Path, cert: &Path) -> Result<(), String> {
         Ok(())
     } else {
         Err("signature verification failed".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    fn ota_zip_bytes(bin_name: &str, binary_bytes: &[u8], version: &str) -> Vec<u8> {
+        let mut hasher = Sha256::new();
+        hasher.update(binary_bytes);
+        let hash = hex::encode(hasher.finalize());
+
+        let cursor = io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(cursor);
+        let options = SimpleFileOptions::default();
+        zip.start_file(bin_name, options).unwrap();
+        zip.write_all(binary_bytes).unwrap();
+        zip.start_file(format!("{bin_name}.sha256"), options)
+            .unwrap();
+        zip.write_all(format!("{hash}\n").as_bytes()).unwrap();
+        zip.start_file(format!("{bin_name}.version"), options)
+            .unwrap();
+        zip.write_all(format!("{version}\n").as_bytes()).unwrap();
+        zip.start_file(format!("{bin_name}.sig"), options).unwrap();
+        zip.write_all(b"dev-signature").unwrap();
+        zip.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn apply_update_replaces_real_binary_not_public_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let public_dir = tmp.path().join("usr/bin");
+        let plugin_dir = tmp.path().join("plugins/kaonic-gateway/current");
+        let meta_dir = tmp.path().join("meta");
+        fs::create_dir_all(&public_dir).unwrap();
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::create_dir_all(&meta_dir).unwrap();
+
+        let binary_path = plugin_dir.join("kaonic-gateway");
+        let public_path = public_dir.join("kaonic-gateway");
+        fs::write(&binary_path, b"old-binary").unwrap();
+        std::os::unix::fs::symlink(&binary_path, &public_path).unwrap();
+
+        let target = Target {
+            name: "gateway",
+            symlink_path: public_path.clone(),
+            binary_path: binary_path.clone(),
+            service: "kaonic-gateway.service",
+            meta_dir: meta_dir.clone(),
+        };
+
+        let result = apply_update(
+            &target,
+            &ota_zip_bytes("kaonic-gateway", b"new-binary", "2.0.0"),
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(fs::read_link(&target.symlink_path).unwrap(), binary_path);
+        assert_eq!(fs::read(&binary_path).unwrap(), b"new-binary");
+        assert_eq!(
+            fs::read_to_string(meta_dir.join("kaonic-gateway.version")).unwrap(),
+            "2.0.0"
+        );
     }
 }

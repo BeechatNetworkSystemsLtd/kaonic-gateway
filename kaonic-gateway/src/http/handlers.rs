@@ -17,6 +17,7 @@ use kaonic_gateway::system_metrics::{
     read_mem_mb, read_os_details,
 };
 use kaonic_vpn::VpnSnapshot;
+use reticulum::hash::AddressHash;
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 #[cfg(target_os = "linux")]
@@ -67,14 +68,27 @@ pub async fn put_settings(
     State(state): State<AppState>,
     Json(config): Json<GatewayConfig>,
 ) -> StatusCode {
-    let s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
-    match s.save_config(&config) {
-        Ok(_) => StatusCode::NO_CONTENT,
-        Err(err) => {
+    {
+        let s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(err) = s.save_config(&config) {
             log::error!("failed to save settings: {err}");
-            StatusCode::INTERNAL_SERVER_ERROR
+            return StatusCode::INTERNAL_SERVER_ERROR;
         }
     }
+
+    if let Some(vpn) = &state.vpn {
+        if let Err(err) = vpn
+            .replace_peer_policy(config.allow_all_peers, config.peers.clone())
+            .await
+        {
+            log::error!("failed to apply VPN peer policy from settings: {err}");
+            return StatusCode::BAD_REQUEST;
+        }
+        vpn.replace_advertised_routes(config.advertised_routes.clone())
+            .await;
+    }
+
+    StatusCode::NO_CONTENT
 }
 
 /// `GET /api/settings/radio/:module` — return config for one RF module (0 or 1).
@@ -248,6 +262,57 @@ pub async fn put_vpn_routes(
     }))
 }
 
+pub async fn put_vpn_access(
+    State(state): State<AppState>,
+    Json(request): Json<PutVpnAccessRequest>,
+) -> Result<Json<VpnAccessResponse>, (StatusCode, String)> {
+    let peers = normalize_vpn_peer_hashes(&request.peers)?;
+
+    {
+        let settings = state.settings.lock().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "settings lock poisoned".into(),
+            )
+        })?;
+        let mut config = settings.load_config().map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load config: {err}"),
+            )
+        })?;
+        config.allow_all_peers = request.allow_all_peers;
+        config.peers = peers.clone();
+        settings.save_config(&config).map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to save config: {err}"),
+            )
+        })?;
+    }
+
+    if let Some(vpn) = &state.vpn {
+        vpn.replace_peer_policy(request.allow_all_peers, peers.clone())
+            .await
+            .map_err(|err| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("failed to apply VPN peer policy: {err}"),
+                )
+            })?;
+    }
+
+    Ok(Json(VpnAccessResponse {
+        status: if request.allow_all_peers {
+            "VPN access updated (allow all peers)".into()
+        } else {
+            "VPN access updated (allowlist only)".into()
+        },
+        allow_all_peers: request.allow_all_peers,
+        peers,
+    }))
+}
+
 pub async fn post_vpn_ping(
     Json(request): Json<VpnPingRequest>,
 ) -> Result<Json<VpnPingResponse>, (StatusCode, String)> {
@@ -399,6 +464,12 @@ pub struct PutVpnRoutesRequest {
 }
 
 #[derive(Deserialize)]
+pub struct PutVpnAccessRequest {
+    pub allow_all_peers: bool,
+    pub peers: Vec<String>,
+}
+
+#[derive(Deserialize)]
 pub struct VpnPingRequest {
     pub address: String,
 }
@@ -429,6 +500,13 @@ pub struct SystemActionResponse {
 }
 
 #[derive(Serialize)]
+pub struct VpnAccessResponse {
+    pub status: String,
+    pub allow_all_peers: bool,
+    pub peers: Vec<String>,
+}
+
+#[derive(Serialize)]
 pub struct VpnPingResponse {
     pub ok: bool,
     pub latency: Option<String>,
@@ -445,6 +523,29 @@ pub struct VpnSpeedTestResponse {
 struct PingAttempt {
     ok: bool,
     latency: Option<String>,
+}
+
+fn normalize_vpn_peer_hashes(peers: &[String]) -> Result<Vec<String>, (StatusCode, String)> {
+    let mut peers = peers
+        .iter()
+        .map(|peer| {
+            let raw = peer.trim();
+            if raw.is_empty() {
+                return Err((StatusCode::BAD_REQUEST, "peer hash is required".into()));
+            }
+            AddressHash::new_from_hex_string(raw)
+                .map(|hash| hash.to_hex_string())
+                .map_err(|err| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("invalid peer hash '{raw}': {err:?}"),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    peers.sort();
+    peers.dedup();
+    Ok(peers)
 }
 
 pub async fn get_audio(

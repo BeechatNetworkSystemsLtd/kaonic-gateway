@@ -79,8 +79,11 @@ const NETWORK_JS: &str = r#"
         var wifi = snapshot.wifi || {};
         var isStation = wifi.mode === 'sta';
         var stationConnected = !!wifi.connected_ssid;
+        var antennaSupported = !!wifi.antenna_supported;
+        var isExternalAntenna = wifi.antenna === 'external';
 
         setNodeText('wifi-mode-badge', isStation ? 'Station' : 'Access Point');
+        setNodeText('wifi-antenna-value', wifi.antenna || '—');
         setNodeText('network-backend', snapshot.backend || '—');
         setNodeText('wifi-configured-ssid', wifi.configured_ssid || '—');
         setNodeText('wifi-status-value', isStation ? (stationConnected ? 'Connected' : 'Disconnected') : 'Active');
@@ -93,10 +96,15 @@ const NETWORK_JS: &str = r#"
 
         var apBtn = document.getElementById('wifi-mode-btn-ap');
         var staBtn = document.getElementById('wifi-mode-btn-sta');
+        var antennaInternalBtn = document.getElementById('wifi-antenna-btn-internal');
+        var antennaExternalBtn = document.getElementById('wifi-antenna-btn-external');
         if (apBtn) { apBtn.classList.toggle('active', !isStation); }
         if (staBtn) { staBtn.classList.toggle('active', isStation); }
+        if (antennaInternalBtn) { antennaInternalBtn.classList.toggle('active', antennaSupported && !isExternalAntenna); }
+        if (antennaExternalBtn) { antennaExternalBtn.classList.toggle('active', antennaSupported && isExternalAntenna); }
 
         setHidden('open-wifi-connect', !isStation);
+        setHidden('wifi-antenna-section', !antennaSupported);
         setHidden('wifi-station-fields', !isStation);
         setHidden('wifi-station-link', !isStation);
         setHidden('wifi-ap-fields', isStation);
@@ -152,6 +160,29 @@ const NETWORK_JS: &str = r#"
             setText('wifi-action-status', 'Applying WiFi mode...', 'pending');
             toggleBusy(true);
             postForm('/network/wifi/mode', { mode: modeBtn.dataset.wifiMode || '' })
+                .then(function() { return loadSnapshot(); })
+                .then(function() {
+                    setText('wifi-action-status', '', '');
+                })
+                .catch(function(err) {
+                    setText('wifi-action-status', String(err.message || err), 'err');
+                })
+                .finally(function() {
+                    toggleBusy(false);
+                });
+            return;
+        }
+
+        var antennaBtn = target.closest('[data-wifi-antenna]');
+        if (antennaBtn) {
+            if (antennaBtn.classList.contains('active')) {
+                return;
+            }
+            setText('wifi-action-status', 'Applying antenna...', 'pending');
+            toggleBusy(true);
+            postForm('/network/wifi/antenna', {
+                antenna: antennaBtn.dataset.wifiAntenna || ''
+            })
                 .then(function() { return loadSnapshot(); })
                 .then(function() {
                     setText('wifi-action-status', '', '');
@@ -290,6 +321,34 @@ fn NetworkContent(snapshot: NetworkSnapshotDto) -> impl IntoView {
                     >
                         "Station"
                     </button>
+                </div>
+
+                <div class="network-detail-block" id="wifi-antenna-section" hidden=!wifi.antenna_supported>
+                    <div class="network-subtitle">"Antenna"</div>
+                    <div class="network-mode-toggle">
+                        <button
+                            type="button"
+                            class=if wifi.antenna == "internal" { "wifi-mode-btn active" } else { "wifi-mode-btn" }
+                            id="wifi-antenna-btn-internal"
+                            data-network-action
+                            data-wifi-antenna="internal"
+                        >
+                            "Internal"
+                        </button>
+                        <button
+                            type="button"
+                            class=if wifi.antenna == "external" { "wifi-mode-btn active" } else { "wifi-mode-btn" }
+                            id="wifi-antenna-btn-external"
+                            data-network-action
+                            data-wifi-antenna="external"
+                        >
+                            "External"
+                        </button>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">"Selected"</span>
+                        <span class="info-value" id="wifi-antenna-value">{wifi.antenna.clone()}</span>
+                    </div>
                 </div>
 
                 <div class="network-actions">

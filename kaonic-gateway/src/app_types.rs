@@ -209,6 +209,8 @@ impl Default for GatewayStatusDto {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WifiStatusDto {
     pub mode: String,
+    pub antenna: String,
+    pub antenna_supported: bool,
     pub configured_ssid: Option<String>,
     pub connected_ssid: Option<String>,
     pub wlan0_ip: Option<String>,
@@ -221,6 +223,8 @@ impl Default for WifiStatusDto {
     fn default() -> Self {
         Self {
             mode: "ap".into(),
+            antenna: "internal".into(),
+            antenna_supported: false,
             configured_ssid: None,
             connected_ssid: None,
             wlan0_ip: None,
@@ -256,6 +260,7 @@ impl Default for NetworkSnapshotDto {
 pub struct GatewaySettingsDto {
     /// CIDR network string, e.g. `"10.0.0.0/24"`.
     pub network: String,
+    pub allow_all_peers: bool,
     pub peers: Vec<String>,
     pub advertised_routes: Vec<String>,
     pub announce_freq_secs: u32,
@@ -267,6 +272,7 @@ impl Default for GatewaySettingsDto {
     fn default() -> Self {
         Self {
             network: "10.0.0.0/24".into(),
+            allow_all_peers: true,
             peers: vec![],
             advertised_routes: vec!["192.168.10.0/24".into()],
             announce_freq_secs: 1,
@@ -302,6 +308,7 @@ impl From<crate::config::GatewayConfig> for GatewaySettingsDto {
     fn from(c: crate::config::GatewayConfig) -> Self {
         Self {
             network: c.network.to_string(),
+            allow_all_peers: c.allow_all_peers,
             peers: c.peers,
             advertised_routes: c
                 .advertised_routes
@@ -336,6 +343,7 @@ impl TryFrom<GatewaySettingsDto> for crate::config::GatewayConfig {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(crate::config::GatewayConfig {
             network,
+            allow_all_peers: d.allow_all_peers,
             peers: d.peers,
             advertised_routes,
             announce_freq_secs: d.announce_freq_secs,

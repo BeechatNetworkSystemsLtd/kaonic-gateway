@@ -17,6 +17,10 @@ const DEFAULT_WIFI_SCRIPT: &str = "/usr/bin/kaonic-wifi-mode";
 #[cfg(target_os = "linux")]
 const DEFAULT_WIFI_MODE_FILE: &str = "/etc/kaonic/wifi-mode";
 #[cfg(target_os = "linux")]
+const DEFAULT_WIFI_ANTENNA_FILE: &str = "/etc/kaonic/wifi-antenna";
+#[cfg(target_os = "linux")]
+const DEFAULT_MACHINE_FILE: &str = "/etc/kaonic/kaonic_machine";
+#[cfg(target_os = "linux")]
 const DEFAULT_WPA_CONF: &str = "/etc/wpa_supplicant-wlan0.conf";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,10 +46,35 @@ impl WifiMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WifiAntenna {
+    Internal,
+    External,
+}
+
+impl WifiAntenna {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "internal" | "INTERNAL" => Some(Self::Internal),
+            "external" | "EXTERNAL" => Some(Self::External),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Internal => "internal",
+            Self::External => "external",
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum NetworkError {
     #[error("invalid WiFi mode '{0}'")]
     InvalidMode(String),
+    #[error("invalid WiFi antenna '{0}'")]
+    InvalidAntenna(String),
     #[error("SSID is required")]
     InvalidSsid,
     #[error("PSK must be between 8 and 63 characters")]
@@ -78,6 +107,7 @@ pub struct NetworkService {
 #[derive(Debug, Clone)]
 struct MockNetworkState {
     mode: WifiMode,
+    antenna: WifiAntenna,
     configured_ssid: Option<String>,
     connected_ssid: Option<String>,
 }
@@ -87,6 +117,7 @@ impl Default for MockNetworkState {
     fn default() -> Self {
         Self {
             mode: WifiMode::Ap,
+            antenna: WifiAntenna::Internal,
             configured_ssid: None,
             connected_ssid: None,
         }
@@ -153,6 +184,20 @@ impl NetworkService {
         }
     }
 
+    pub async fn set_wifi_antenna(&self, antenna: WifiAntenna) -> Result<(), NetworkError> {
+        #[cfg(target_os = "linux")]
+        {
+            tokio::task::spawn_blocking(move || set_wifi_antenna_linux(antenna))
+                .await
+                .map_err(|err| NetworkError::TaskJoin(err.to_string()))?
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.set_wifi_antenna_mock(antenna)
+        }
+    }
+
     #[cfg(not(target_os = "linux"))]
     fn snapshot_mock(&self) -> Result<NetworkSnapshotDto, NetworkError> {
         let state = self.mock.lock().map_err(|_| NetworkError::StatePoisoned)?;
@@ -162,6 +207,8 @@ impl NetworkService {
             interface_details: mock_interface_details(),
             wifi: WifiStatusDto {
                 mode: state.mode.as_str().into(),
+                antenna: state.antenna.as_str().into(),
+                antenna_supported: true,
                 configured_ssid: state.configured_ssid.clone(),
                 connected_ssid: state.connected_ssid.clone(),
                 wlan0_ip: match state.mode {
@@ -203,6 +250,13 @@ impl NetworkService {
                 state.connected_ssid = state.configured_ssid.clone();
             }
         }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn set_wifi_antenna_mock(&self, antenna: WifiAntenna) -> Result<(), NetworkError> {
+        let mut state = self.mock.lock().map_err(|_| NetworkError::StatePoisoned)?;
+        state.antenna = antenna;
         Ok(())
     }
 
@@ -267,6 +321,8 @@ fn read_interface_details_linux() -> Result<(String, String), NetworkError> {
 #[cfg(target_os = "linux")]
 fn read_wifi_status_linux() -> Result<WifiStatusDto, NetworkError> {
     let mode = read_current_mode_linux();
+    let antenna = read_current_antenna_linux();
+    let antenna_supported = machine_supports_antenna_linux();
     let configured_ssid = read_configured_ssid(&wpa_conf_path());
     let wlan0_ip = match mode {
         WifiMode::Ap => Some("192.168.10.1".into()),
@@ -286,6 +342,8 @@ fn read_wifi_status_linux() -> Result<WifiStatusDto, NetworkError> {
 
     Ok(WifiStatusDto {
         mode: mode.as_str().into(),
+        antenna: antenna.as_str().into(),
+        antenna_supported,
         configured_ssid,
         connected_ssid,
         wlan0_ip,
@@ -322,6 +380,17 @@ fn connect_wifi_linux(ssid: &str, psk: &str) -> Result<(), NetworkError> {
         format!("{} sta <ssid> <redacted>", script.display()),
         &script,
         &["sta", ssid, psk],
+    )
+    .map(|_| ())
+}
+
+#[cfg(target_os = "linux")]
+fn set_wifi_antenna_linux(antenna: WifiAntenna) -> Result<(), NetworkError> {
+    let script = wifi_script_path();
+    run_program(
+        format!("{} antenna {}", script.display(), antenna.as_str()),
+        &script,
+        &["antenna", antenna.as_str()],
     )
     .map(|_| ())
 }
@@ -375,6 +444,25 @@ fn read_current_mode_linux() -> WifiMode {
         .ok()
         .and_then(|value| WifiMode::parse(value.lines().next().unwrap_or_default().trim()))
         .unwrap_or(WifiMode::Ap)
+}
+
+#[cfg(target_os = "linux")]
+fn read_current_antenna_linux() -> WifiAntenna {
+    fs::read_to_string(wifi_antenna_file_path())
+        .ok()
+        .and_then(|value| WifiAntenna::parse(value.lines().next().unwrap_or_default().trim()))
+        .unwrap_or(WifiAntenna::Internal)
+}
+
+#[cfg(target_os = "linux")]
+fn machine_supports_antenna_linux() -> bool {
+    let Ok(machine) = fs::read_to_string(machine_file_path()) else {
+        return false;
+    };
+    matches!(
+        machine.lines().next().unwrap_or_default().trim(),
+        "stm32mp1-kaonic-protob" | "stm32mp1-kaonic-protoc"
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -519,6 +607,20 @@ fn wifi_mode_file_path() -> PathBuf {
 }
 
 #[cfg(target_os = "linux")]
+fn wifi_antenna_file_path() -> PathBuf {
+    std::env::var_os("KAONIC_WIFI_ANTENNA_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_WIFI_ANTENNA_FILE))
+}
+
+#[cfg(target_os = "linux")]
+fn machine_file_path() -> PathBuf {
+    std::env::var_os("KAONIC_MACHINE_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_MACHINE_FILE))
+}
+
+#[cfg(target_os = "linux")]
 fn wpa_conf_path() -> PathBuf {
     std::env::var_os("KAONIC_WIFI_WPA_CONF")
         .map(PathBuf::from)
@@ -552,13 +654,20 @@ fn mock_interface_details() -> String {
 mod tests {
     #[cfg(not(target_os = "linux"))]
     use super::NetworkService;
-    use super::{validate_wifi_credentials, NetworkError, WifiMode};
+    use super::{validate_wifi_credentials, NetworkError, WifiAntenna, WifiMode};
 
     #[test]
     fn parse_wifi_modes() {
         assert_eq!(WifiMode::parse("ap"), Some(WifiMode::Ap));
         assert_eq!(WifiMode::parse("sta"), Some(WifiMode::Sta));
         assert_eq!(WifiMode::parse("nope"), None);
+    }
+
+    #[test]
+    fn parse_wifi_antennas() {
+        assert_eq!(WifiAntenna::parse("internal"), Some(WifiAntenna::Internal));
+        assert_eq!(WifiAntenna::parse("external"), Some(WifiAntenna::External));
+        assert_eq!(WifiAntenna::parse("nope"), None);
     }
 
     #[test]
@@ -577,5 +686,17 @@ mod tests {
         service
             .set_wifi_mode_mock(WifiMode::Sta)
             .expect("station mode should be allowed without saved config");
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn mock_antenna_mode_is_exposed_in_snapshot() {
+        let service = NetworkService::new();
+        service
+            .set_wifi_antenna_mock(WifiAntenna::External)
+            .expect("antenna mode should switch in mock");
+        let snapshot = service.snapshot_mock().expect("snapshot should succeed");
+        assert_eq!(snapshot.wifi.antenna, "external");
+        assert!(snapshot.wifi.antenna_supported);
     }
 }

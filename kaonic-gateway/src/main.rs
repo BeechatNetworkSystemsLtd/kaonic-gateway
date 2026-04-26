@@ -201,6 +201,7 @@ async fn async_main() -> Result<(), process::ExitCode> {
     let vpn = match VpnRuntime::start(
         VpnConfig {
             network: config.network,
+            allow_all_peers: config.allow_all_peers,
             peers: config.peers.clone(),
             advertised_routes: config.advertised_routes.clone(),
             announce_freq_secs: config.announce_freq_secs,

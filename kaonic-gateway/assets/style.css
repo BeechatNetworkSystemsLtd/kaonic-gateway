@@ -2222,6 +2222,79 @@ select.field-input {
 
 .vpn-peer-row:last-child { border-bottom: none; }
 
+.vpn-access-card {
+  margin-bottom: 18px;
+}
+
+.vpn-access-copy {
+  margin-bottom: 12px;
+}
+
+.vpn-access-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+  font-size: 14px;
+  color: var(--text);
+}
+
+.vpn-access-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.vpn-allowlist-input {
+  flex: 1 1 320px;
+  font-family: var(--font-mono);
+}
+
+.vpn-access-hint {
+  margin: 10px 0 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.vpn-access-status {
+  min-height: 18px;
+  margin-bottom: 10px;
+  font-size: 13px;
+}
+
+.vpn-access-table-wrap {
+  overflow-x: auto;
+}
+
+.vpn-access-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.vpn-access-table th,
+.vpn-access-table td {
+  padding: 10px 12px;
+  border-top: 1px solid var(--border);
+  text-align: left;
+}
+
+.vpn-access-table th {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--text-muted);
+}
+
+.vpn-access-actions {
+  width: 1%;
+  white-space: nowrap;
+  text-align: right;
+}
+
+.vpn-allowlist-empty-row td {
+  color: var(--text-muted);
+}
+
 .vpn-peer-left {
   display: flex;
   align-items: center;

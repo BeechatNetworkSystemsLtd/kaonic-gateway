@@ -83,7 +83,7 @@ pub struct CorePluginSpec {
 impl CorePluginSpec {
     pub fn new(target: Arc<Target>, plugins_root: &Path) -> Self {
         let plugin_id = target
-            .bin_path
+            .symlink_path
             .file_name()
             .and_then(OsStr::to_str)
             .unwrap_or(target.name)
@@ -107,8 +107,8 @@ struct PluginManifest {
     channel: Option<String>,
     #[serde(default)]
     github_url: Option<String>,
-    #[serde(default)]
-    bin_path: Option<String>,
+    #[serde(default, alias = "bin_path")]
+    symlink: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -254,7 +254,10 @@ pub fn refresh_systemd_status_cache(
     init_db(&conn)?;
     let mut statuses = HashMap::new();
     for record in load_all_plugins(&conn)? {
-        statuses.insert(record.service.clone(), read_service_systemd_status(&record.service));
+        statuses.insert(
+            record.service.clone(),
+            read_service_systemd_status(&record.service),
+        );
     }
     Ok(statuses)
 }
@@ -332,7 +335,13 @@ pub fn install_plugin(
     core_plugins: &[CorePluginSpec],
     zip_bytes: &[u8],
 ) -> PluginResult<PluginMessage> {
-    initialize_store(plugins_root, db_path, systemd_dir, Some(cert_path), core_plugins)?;
+    initialize_store(
+        plugins_root,
+        db_path,
+        systemd_dir,
+        Some(cert_path),
+        core_plugins,
+    )?;
     let package = parse_plugin_package(zip_bytes)?;
     log::info!(
         "installing plugin id={} version={} service={} payload_bytes={}",
@@ -347,7 +356,10 @@ pub fn install_plugin(
         "plugin install state id={} existing={} enabled_preference={}",
         package.id,
         existing.is_some(),
-        existing.as_ref().map(|record| record.enabled).unwrap_or(true)
+        existing
+            .as_ref()
+            .map(|record| record.enabled)
+            .unwrap_or(true)
     );
     ensure_service_available(&conn, &package.service_name, Some(&package.id))?;
     ensure_bin_path_available(&conn, package.bin_path.as_deref(), Some(&package.id))?;
@@ -406,7 +418,10 @@ pub fn install_plugin(
 
     let install_result = (|| -> PluginResult<()> {
         if current_dir.exists() {
-            log::debug!("removing previous plugin files from {}", current_dir.display());
+            log::debug!(
+                "removing previous plugin files from {}",
+                current_dir.display()
+            );
             fs::remove_dir_all(&current_dir).map_err(|err| {
                 PluginError::internal(format!("remove previous plugin files: {err}"))
             })?;
@@ -462,7 +477,11 @@ pub fn install_plugin(
         }
 
         if should_start {
-            log::debug!("starting plugin service id={} service={}", package.id, package.service_name);
+            log::debug!(
+                "starting plugin service id={} service={}",
+                package.id,
+                package.service_name
+            );
             systemctl("start", &package.service_name)
                 .map_err(|err| PluginError::internal(format!("start plugin service: {err}")))?;
             if !poll_running(&package.service_name, 10, Duration::from_secs(1)) {
@@ -643,7 +662,13 @@ pub fn upload_plugin_update(
     plugin_id: &str,
     zip_bytes: &[u8],
 ) -> PluginResult<PluginMessage> {
-    initialize_store(plugins_root, db_path, systemd_dir, Some(cert_path), core_plugins)?;
+    initialize_store(
+        plugins_root,
+        db_path,
+        systemd_dir,
+        Some(cert_path),
+        core_plugins,
+    )?;
     let conn = open_db(db_path)?;
     let plugin = load_plugin(&conn, plugin_id)?
         .ok_or_else(|| PluginError::not_found(format!("unknown plugin: {plugin_id}")))?;
@@ -668,8 +693,7 @@ pub fn upload_plugin_update(
             plugin_id,
             target_name
         );
-        let detail = apply_update(&spec.target, zip_bytes)
-            .map_err(PluginError::internal)?;
+        let detail = apply_update(&spec.target, zip_bytes).map_err(PluginError::internal)?;
         sync_core_plugins(&conn, core_plugins)?;
         return Ok(PluginMessage { detail });
     }
@@ -712,7 +736,7 @@ fn parse_plugin_package(zip_bytes: &[u8]) -> PluginResult<PluginPackage> {
 
     let service_name = manifest.service.trim().to_string();
     let binary_name = derive_binary_name(&service_name)?;
-    let bin_path = normalize_bin_path(manifest.bin_path.as_deref())?;
+    let bin_path = normalize_bin_path(manifest.symlink.as_deref())?;
     let id = binary_name.clone();
     let sha256_name = format!("{binary_name}.sha256");
     let service_bytes = read_zip_entry_bytes(&mut archive, &service_name)?;
@@ -726,7 +750,7 @@ fn parse_plugin_package(zip_bytes: &[u8]) -> PluginResult<PluginPackage> {
     let signature_name = format!("{binary_name}.sign");
     let signature_bytes = read_optional_zip_entry_bytes(&mut archive, &signature_name)?;
     log::debug!(
-        "parsed plugin manifest id={} version={} service={} has_signature={} has_bin_path={} custom_files={}",
+        "parsed plugin manifest id={} version={} service={} has_signature={} has_symlink={} custom_files={}",
         id,
         manifest.version,
         service_name,
@@ -755,7 +779,10 @@ fn discover_plugins(
     conn: &Connection,
     cert_path: Option<&Path>,
 ) -> PluginResult<()> {
-    log::debug!("scanning plugin root for discovery path={}", plugins_root.display());
+    log::debug!(
+        "scanning plugin root for discovery path={}",
+        plugins_root.display()
+    );
     let entries = fs::read_dir(plugins_root)
         .map_err(|err| PluginError::internal(format!("scan plugin root: {err}")))?;
 
@@ -826,8 +853,9 @@ fn recover_plugins_after_interruption(
         .map_err(|err| PluginError::internal(format!("scan plugin root for recovery: {err}")))?;
 
     for entry in entries {
-        let entry = entry
-            .map_err(|err| PluginError::internal(format!("read recovery directory entry: {err}")))?;
+        let entry = entry.map_err(|err| {
+            PluginError::internal(format!("read recovery directory entry: {err}"))
+        })?;
         if !entry
             .file_type()
             .map_err(|err| PluginError::internal(format!("inspect recovery entry type: {err}")))?
@@ -867,13 +895,17 @@ fn recover_plugins_after_interruption(
                     let attempted_target = existing
                         .as_ref()
                         .map(current_binary_path)
-                        .unwrap_or_else(|| plugin_binary_target(&plugin_dir, &rollback_record.binary_name));
+                        .unwrap_or_else(|| {
+                            plugin_binary_target(&plugin_dir, &rollback_record.binary_name)
+                        });
                     rollback_install(
                         &plugin_dir,
                         &rollback_dir,
                         &systemd_dir.join(&rollback_record.service),
                         &rollback_record.service,
-                        existing.as_ref().and_then(|record| record.bin_path.as_deref()),
+                        existing
+                            .as_ref()
+                            .and_then(|record| record.bin_path.as_deref()),
                         &attempted_target,
                         existing.as_ref(),
                     )?;
@@ -980,7 +1012,7 @@ fn discover_plugin_record(
         channel: normalize_channel(manifest.channel.as_deref())?,
         github_url: normalize_github_url(manifest.github_url.as_deref()),
         binary_name,
-        bin_path: normalize_bin_path(manifest.bin_path.as_deref())?,
+        bin_path: normalize_bin_path(manifest.symlink.as_deref())?,
         sha256,
         install_dir: plugin_dir.to_string_lossy().into_owned(),
         package_path: package_path.to_string_lossy().into_owned(),
@@ -1012,7 +1044,7 @@ fn validate_manifest(manifest: &PluginManifest) -> PluginResult<()> {
     }
     let _ = normalize_channel(manifest.channel.as_deref())?;
     let _ = normalize_github_url(manifest.github_url.as_deref());
-    normalize_bin_path(manifest.bin_path.as_deref())?;
+    normalize_bin_path(manifest.symlink.as_deref())?;
     derive_binary_name(manifest.service.trim()).map(|_| ())
 }
 
@@ -1126,9 +1158,9 @@ fn read_custom_files<R: io::Read + io::Seek>(
             continue;
         }
 
-        let relative = Path::new(&entry_name)
-            .strip_prefix("files")
-            .map_err(|_| PluginError::bad_request(format!("plugin package contains invalid path {entry_name}")))?;
+        let relative = Path::new(&entry_name).strip_prefix("files").map_err(|_| {
+            PluginError::bad_request(format!("plugin package contains invalid path {entry_name}"))
+        })?;
         let relative = normalize_custom_file_path(relative)?;
         if relative == Path::new(binary_name) {
             return Err(PluginError::bad_request(format!(
@@ -1146,7 +1178,10 @@ fn read_custom_files<R: io::Read + io::Seek>(
 
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).map_err(|err| {
-            PluginError::bad_request(format!("read custom plugin file {}: {err}", relative.display()))
+            PluginError::bad_request(format!(
+                "read custom plugin file {}: {err}",
+                relative.display()
+            ))
         })?;
         files.push(PluginPackageFile {
             relative_path: PathBuf::from(relative_key),
@@ -1187,7 +1222,10 @@ fn normalize_custom_file_path(path: &Path) -> PluginResult<PathBuf> {
                 }
                 normalized.push(value);
             }
-            Component::CurDir | Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
                 return Err(PluginError::bad_request(format!(
                     "plugin custom file path {} is invalid",
                     path.display()
@@ -1255,8 +1293,8 @@ fn collect_plugin_paths(root: &Path, current: &Path, out: &mut Vec<String>) -> P
         .map_err(|err| PluginError::internal(format!("scan plugin inventory path: {err}")))?;
 
     for entry in entries {
-        let entry =
-            entry.map_err(|err| PluginError::internal(format!("read plugin inventory entry: {err}")))?;
+        let entry = entry
+            .map_err(|err| PluginError::internal(format!("read plugin inventory entry: {err}")))?;
         let path = entry.path();
         let relative = path
             .strip_prefix(root)
@@ -1294,7 +1332,10 @@ fn current_binary_path(record: &PluginRecord) -> PathBuf {
     }
 }
 
-fn normalize_service_working_directory(service_bytes: &[u8], current_dir: &Path) -> PluginResult<Vec<u8>> {
+fn normalize_service_working_directory(
+    service_bytes: &[u8],
+    current_dir: &Path,
+) -> PluginResult<Vec<u8>> {
     let service_text = std::str::from_utf8(service_bytes).map_err(|err| {
         PluginError::bad_request(format!("plugin service file is not utf-8: {err}"))
     })?;
@@ -1351,8 +1392,9 @@ fn install_custom_files(current_dir: &Path, files: &[PluginPackageFile]) -> Plug
     for file in files {
         let target_path = current_dir.join(&file.relative_path);
         if let Some(parent) = target_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|err| PluginError::internal(format!("create custom file parent: {err}")))?;
+            fs::create_dir_all(parent).map_err(|err| {
+                PluginError::internal(format!("create custom file parent: {err}"))
+            })?;
         }
         fs::write(&target_path, &file.bytes)
             .map_err(|err| PluginError::internal(format!("write custom plugin file: {err}")))?;
@@ -2003,17 +2045,20 @@ fn ensure_bin_path_available(
 fn sync_core_plugins(conn: &Connection, core_plugins: &[CorePluginSpec]) -> PluginResult<()> {
     for spec in core_plugins {
         let manifest_path = spec.plugin_dir.join(MANIFEST_NAME);
-        let manifest_raw = fs::read_to_string(&manifest_path)
-            .map_err(|err| PluginError::internal(format!("read built-in plugin manifest: {err}")))?;
+        let manifest_raw = fs::read_to_string(&manifest_path).map_err(|err| {
+            PluginError::internal(format!("read built-in plugin manifest: {err}"))
+        })?;
         let manifest: PluginManifest = toml::from_str::<PluginManifestFile>(&manifest_raw)
             .map(|file| file.plugin)
-            .map_err(|err| PluginError::bad_request(format!("bad built-in plugin manifest: {err}")))?;
+            .map_err(|err| {
+                PluginError::bad_request(format!("bad built-in plugin manifest: {err}"))
+            })?;
         validate_manifest(&manifest)?;
 
         let service_name = manifest.service.trim().to_string();
         let binary_name = spec
             .target
-            .bin_path
+            .symlink_path
             .file_name()
             .and_then(OsStr::to_str)
             .unwrap_or(spec.target.name)
@@ -2031,30 +2076,28 @@ fn sync_core_plugins(conn: &Connection, core_plugins: &[CorePluginSpec]) -> Plug
                 manifest_binary_name, binary_name
             )));
         }
-        let manifest_bin_path = normalize_bin_path(manifest.bin_path.as_deref())?;
-        if manifest_bin_path.as_deref() != Some(spec.target.bin_path.to_string_lossy().as_ref()) {
+        let manifest_bin_path = normalize_bin_path(manifest.symlink.as_deref())?;
+        if manifest_bin_path.as_deref() != Some(spec.target.symlink_path.to_string_lossy().as_ref())
+        {
             return Err(PluginError::bad_request(format!(
                 "built-in plugin manifest bin_path {:?} does not match target path {}",
                 manifest_bin_path,
-                spec.target.bin_path.display()
+                spec.target.symlink_path.display()
             )));
         }
 
-        let version_path = spec
-            .target
-            .meta_dir
-            .join(format!("{binary_name}.version"));
+        let version_path = spec.target.meta_dir.join(format!("{binary_name}.version"));
         let hash_path = spec.target.meta_dir.join(format!("{binary_name}.sha256"));
         let version = read_trimmed(&version_path).unwrap_or_else(|| manifest.version.clone());
-        let sha256 = read_trimmed(&hash_path).unwrap_or_else(|| {
-            sha256_file(&spec.target.bin_path).unwrap_or_default()
-        });
+        let sha256 = read_trimmed(&hash_path)
+            .unwrap_or_else(|| sha256_file(&spec.target.binary_path).unwrap_or_default());
         let current_binary_path = plugin_binary_target(&spec.plugin_dir, &binary_name);
         let installed_at = first_available_timestamp(&[
             spec.plugin_dir.as_path(),
             manifest_path.as_path(),
             current_binary_path.as_path(),
-            spec.target.bin_path.as_path(),
+            spec.target.binary_path.as_path(),
+            spec.target.symlink_path.as_path(),
             version_path.as_path(),
             hash_path.as_path(),
         ])
@@ -2063,7 +2106,8 @@ fn sync_core_plugins(conn: &Connection, core_plugins: &[CorePluginSpec]) -> Plug
             spec.plugin_dir.as_path(),
             manifest_path.as_path(),
             current_binary_path.as_path(),
-            spec.target.bin_path.as_path(),
+            spec.target.binary_path.as_path(),
+            spec.target.symlink_path.as_path(),
             version_path.as_path(),
             hash_path.as_path(),
         ])
@@ -2196,16 +2240,16 @@ fn daemon_reload() -> PluginResult<()> {
 
     #[cfg(not(test))]
     {
-    let status = Command::new("systemctl")
-        .arg("daemon-reload")
-        .status()
-        .map_err(|err| PluginError::internal(format!("systemctl daemon-reload: {err}")))?;
-    if status.success() {
-        log::debug!("systemctl daemon-reload succeeded");
-    } else {
-        log::warn!("systemctl daemon-reload exited with status {}", status);
-    }
-    Ok(())
+        let status = Command::new("systemctl")
+            .arg("daemon-reload")
+            .status()
+            .map_err(|err| PluginError::internal(format!("systemctl daemon-reload: {err}")))?;
+        if status.success() {
+            log::debug!("systemctl daemon-reload succeeded");
+        } else {
+            log::warn!("systemctl daemon-reload exited with status {}", status);
+        }
+        Ok(())
     }
 }
 
@@ -2218,13 +2262,18 @@ fn systemctl(action: &str, service: &str) -> io::Result<()> {
 
     #[cfg(not(test))]
     {
-    let status = Command::new("systemctl").args([action, service]).status()?;
-    if status.success() {
-        log::debug!("systemctl {} {} succeeded", action, service);
-    } else {
-        log::warn!("systemctl {} {} exited with status {}", action, service, status);
-    }
-    Ok(())
+        let status = Command::new("systemctl").args([action, service]).status()?;
+        if status.success() {
+            log::debug!("systemctl {} {} succeeded", action, service);
+        } else {
+            log::warn!(
+                "systemctl {} {} exited with status {}",
+                action,
+                service,
+                status
+            );
+        }
+        Ok(())
     }
 }
 
@@ -2237,11 +2286,11 @@ fn is_service_running(service: &str) -> bool {
 
     #[cfg(not(test))]
     {
-    Command::new("systemctl")
-        .args(["is-active", "--quiet", service])
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        Command::new("systemctl")
+            .args(["is-active", "--quiet", service])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
     }
 }
 
@@ -2259,7 +2308,9 @@ fn summarize_service_status(status: &PluginSystemdStatus) -> String {
     if status.active_state == "unknown" && status.sub_state == "unknown" {
         return "unknown".into();
     }
-    if status.sub_state.is_empty() || status.sub_state == "unknown" || status.sub_state == status.active_state
+    if status.sub_state.is_empty()
+        || status.sub_state == "unknown"
+        || status.sub_state == status.active_state
     {
         status.active_state.clone()
     } else {
@@ -2394,7 +2445,9 @@ fn read_sha256_file(path: &Path) -> PluginResult<String> {
 }
 
 fn read_trimmed(path: &Path) -> Option<String> {
-    fs::read_to_string(path).ok().map(|value| value.trim().to_string())
+    fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_string())
 }
 
 fn sha256_file(path: &Path) -> io::Result<String> {
@@ -2529,7 +2582,9 @@ mod tests {
         )
         .unwrap();
         let text = String::from_utf8(normalized).unwrap();
-        assert!(text.contains("[Service]\nExecStart=/bin/true\nWorkingDirectory=/etc/kaonic/plugins/sample/current\n"));
+        assert!(text.contains(
+            "[Service]\nExecStart=/bin/true\nWorkingDirectory=/etc/kaonic/plugins/sample/current\n"
+        ));
     }
 
     #[test]
@@ -2638,7 +2693,7 @@ version = "0.1.0"
 service = "kaonic-plugin-sample.service"
 developer = "Beechat"
 channel = "stable"
-bin_path = "{}"
+symlink = "{}"
 "#,
                 bin_link.display()
             ),
@@ -2758,14 +2813,19 @@ channel = "experimental"
         let systemd_dir = tmp.path().join("systemd");
         let target = Arc::new(Target {
             name: "gateway",
-            bin_path: tmp.path().join("usr/bin/kaonic-gateway"),
+            symlink_path: tmp.path().join("usr/bin/kaonic-gateway"),
+            binary_path: tmp
+                .path()
+                .join("plugins/kaonic-gateway/current/kaonic-gateway"),
             service: "kaonic-gateway.service",
             meta_dir: tmp.path().join("meta"),
         });
 
-        fs::create_dir_all(target.bin_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(target.symlink_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(target.binary_path.parent().unwrap()).unwrap();
         fs::create_dir_all(&target.meta_dir).unwrap();
-        fs::write(&target.bin_path, b"gateway").unwrap();
+        fs::write(&target.binary_path, b"gateway").unwrap();
+        std::os::unix::fs::symlink(&target.binary_path, &target.symlink_path).unwrap();
         fs::write(target.meta_dir.join("kaonic-gateway.version"), "1.0.0\n").unwrap();
         fs::write(target.meta_dir.join("kaonic-gateway.sha256"), "abcd\n").unwrap();
         let plugin_dir = plugins_root.join("kaonic-gateway");
@@ -2773,12 +2833,16 @@ channel = "experimental"
         fs::write(
             plugin_dir.join(MANIFEST_NAME),
             format!(
-                "[kaonic-plugin]\nname = \"Kaonic Gateway\"\ndescription = \"Built-in gateway service.\"\nversion = \"0.1.0\"\nservice = \"kaonic-gateway.service\"\ndeveloper = \"Beechat\"\nchannel = \"stable\"\nbin_path = \"{}\"\n",
-                target.bin_path.display()
+                "[kaonic-plugin]\nname = \"Kaonic Gateway\"\ndescription = \"Built-in gateway service.\"\nversion = \"0.1.0\"\nservice = \"kaonic-gateway.service\"\ndeveloper = \"Beechat\"\nchannel = \"stable\"\nsymlink = \"{}\"\n",
+                target.symlink_path.display()
             ),
         )
         .unwrap();
-        fs::write(plugin_dir.join("kaonic-gateway.service"), "[Service]\nExecStart=/usr/bin/kaonic-gateway\n").unwrap();
+        fs::write(
+            plugin_dir.join("kaonic-gateway.service"),
+            "[Service]\nExecStart=/usr/bin/kaonic-gateway\n",
+        )
+        .unwrap();
         fs::write(plugin_dir.join("current/kaonic-gateway"), b"gateway").unwrap();
 
         initialize_store(
@@ -2790,7 +2854,8 @@ channel = "experimental"
         )
         .unwrap();
 
-        let err = delete_plugin(&plugins_root, &db_path, &systemd_dir, "kaonic-gateway").unwrap_err();
+        let err =
+            delete_plugin(&plugins_root, &db_path, &systemd_dir, "kaonic-gateway").unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert!(err.detail.contains("built-in"));
     }
@@ -2803,14 +2868,19 @@ channel = "experimental"
         let systemd_dir = tmp.path().join("systemd");
         let target = Arc::new(Target {
             name: "gateway",
-            bin_path: tmp.path().join("usr/bin/kaonic-gateway"),
+            symlink_path: tmp.path().join("usr/bin/kaonic-gateway"),
+            binary_path: tmp
+                .path()
+                .join("plugins/kaonic-gateway/current/kaonic-gateway"),
             service: "kaonic-gateway.service",
             meta_dir: tmp.path().join("meta"),
         });
 
-        fs::create_dir_all(target.bin_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(target.symlink_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(target.binary_path.parent().unwrap()).unwrap();
         fs::create_dir_all(&target.meta_dir).unwrap();
-        fs::write(&target.bin_path, b"gateway").unwrap();
+        fs::write(&target.binary_path, b"gateway").unwrap();
+        std::os::unix::fs::symlink(&target.binary_path, &target.symlink_path).unwrap();
         fs::write(target.meta_dir.join("kaonic-gateway.version"), "1.2.3\n").unwrap();
         fs::write(target.meta_dir.join("kaonic-gateway.sha256"), "abcd\n").unwrap();
 
@@ -2819,12 +2889,16 @@ channel = "experimental"
         fs::write(
             plugin_dir.join(MANIFEST_NAME),
             format!(
-                "[kaonic-plugin]\nname = \"Gateway From Manifest\"\ndescription = \"Loaded from kaonic-plugin.toml\"\nversion = \"0.9.0\"\nservice = \"kaonic-gateway.service\"\ndeveloper = \"Manifest Dev\"\nchannel = \"stable\"\ngithub_url = \"https://example.invalid/gateway\"\nbin_path = \"{}\"\n",
-                target.bin_path.display()
+                "[kaonic-plugin]\nname = \"Gateway From Manifest\"\ndescription = \"Loaded from kaonic-plugin.toml\"\nversion = \"0.9.0\"\nservice = \"kaonic-gateway.service\"\ndeveloper = \"Manifest Dev\"\nchannel = \"stable\"\ngithub_url = \"https://example.invalid/gateway\"\nsymlink = \"{}\"\n",
+                target.symlink_path.display()
             ),
         )
         .unwrap();
-        fs::write(plugin_dir.join("kaonic-gateway.service"), "[Service]\nExecStart=/usr/bin/kaonic-gateway\n").unwrap();
+        fs::write(
+            plugin_dir.join("kaonic-gateway.service"),
+            "[Service]\nExecStart=/usr/bin/kaonic-gateway\n",
+        )
+        .unwrap();
         fs::write(plugin_dir.join("current/kaonic-gateway"), b"gateway").unwrap();
 
         initialize_store(
@@ -2848,7 +2922,7 @@ channel = "experimental"
         );
         assert_eq!(
             plugins[0].bin_path.as_deref(),
-            Some(target.bin_path.to_string_lossy().as_ref())
+            Some(target.symlink_path.to_string_lossy().as_ref())
         );
         assert_eq!(plugins[0].version, "1.2.3");
     }
@@ -2917,11 +2991,7 @@ developer = "Beechat"
             format!("{previous_hash}\n"),
         )
         .unwrap();
-        fs::write(
-            rollback_dir.join("package.zip"),
-            b"rollback-zip",
-        )
-        .unwrap();
+        fs::write(rollback_dir.join("package.zip"), b"rollback-zip").unwrap();
 
         {
             let conn = open_db(&db_path).unwrap();
@@ -2940,7 +3010,10 @@ developer = "Beechat"
                     bin_path: None,
                     sha256: previous_hash.clone(),
                     install_dir: plugin_dir.to_string_lossy().into_owned(),
-                    package_path: plugin_dir.join("package.zip").to_string_lossy().into_owned(),
+                    package_path: plugin_dir
+                        .join("package.zip")
+                        .to_string_lossy()
+                        .into_owned(),
                     official: false,
                     enabled: false,
                     removable: true,

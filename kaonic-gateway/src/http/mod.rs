@@ -76,6 +76,7 @@ pub async fn serve(state: AppState, addr: SocketAddr) {
             "/api/vpn/routes",
             get(handlers::get_vpn_routes).put(handlers::put_vpn_routes),
         )
+        .route("/api/vpn/access", post(handlers::put_vpn_access))
         .route("/api/vpn/ping", post(handlers::post_vpn_ping))
         .route("/api/vpn/speed-test", post(handlers::post_vpn_speed_test))
         .route("/api/plugins", get(installer::list_plugins))
@@ -102,6 +103,7 @@ pub async fn serve(state: AppState, addr: SocketAddr) {
         )
         .route("/api/plugins/{plugin_id}", delete(installer::delete_plugin))
         .route("/network/wifi/mode", post(handlers::post_wifi_mode))
+        .route("/network/wifi/antenna", post(handlers::post_wifi_antenna))
         .route("/network/wifi/connect", post(handlers::post_wifi_connect))
         .route("/api/ws/status", get(ws::ws_status))
         .route("/assets/{*path}", get(serve_asset))

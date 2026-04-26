@@ -119,6 +119,8 @@ pub struct VpnRuntime {
 
 /// Mutable bookkeeping that only changes on user action or periodic sync.
 struct SlowState {
+    allow_all_peers: bool,
+    allowed_peers: HashSet<AddressHash>,
     advertised_routes: Vec<Ipv4Cidr>,
     local_routes: Vec<Ipv4Cidr>,
     installed_routes: BTreeSet<String>,
@@ -180,6 +182,8 @@ impl VpnRuntime {
             router: Router::new(),
             out_links: LinkRegistry::new(),
             slow: PlRwLock::new(SlowState {
+                allow_all_peers: config.allow_all_peers,
+                allowed_peers: configured_peers.clone(),
                 advertised_routes: config.advertised_routes.clone(),
                 local_routes,
                 installed_routes: BTreeSet::new(),
@@ -246,6 +250,46 @@ impl VpnRuntime {
 
     pub async fn snapshot(&self) -> VpnSnapshot {
         self.snapshot_blocking()
+    }
+
+    pub async fn replace_peer_policy(
+        &self,
+        allow_all_peers: bool,
+        peers: Vec<String>,
+    ) -> Result<(), VpnRuntimeError> {
+        let allowed_peers = parse_configured_peers(&peers)?;
+        {
+            let mut slow = self.slow.write();
+            slow.allow_all_peers = allow_all_peers;
+            slow.allowed_peers = allowed_peers.clone();
+            slow.last_error = None;
+        }
+
+        for hash in &allowed_peers {
+            if *hash == self.destination {
+                continue;
+            }
+            if self.peers.get(hash).is_some() {
+                continue;
+            }
+            let tunnel_ip = derive_tunnel_ip(self.network, hash)?;
+            self.peers
+                .insert(Peer::new(*hash, tunnel_ip, LinkState::Configured));
+        }
+
+        if !allow_all_peers {
+            for peer in self.peers.all() {
+                if peer.hash == self.destination || allowed_peers.contains(&peer.hash) {
+                    continue;
+                }
+                self.peers.remove(&peer.hash);
+                self.out_links.remove(&peer.hash);
+            }
+        }
+
+        self.rebuild_router();
+        self.sync_routes();
+        Ok(())
     }
 
     pub async fn replace_advertised_routes(&self, routes: Vec<Ipv4Cidr>) {
@@ -486,6 +530,18 @@ impl VpnRuntime {
         slow.local_routes = merge_routes(&discovered, &slow.advertised_routes);
     }
 
+    fn allow_all_peers(&self) -> bool {
+        self.slow.read().allow_all_peers
+    }
+
+    fn peer_allowed(&self, hash: &AddressHash) -> bool {
+        if *hash == self.destination {
+            return false;
+        }
+        let slow = self.slow.read();
+        slow.allow_all_peers || slow.allowed_peers.contains(hash)
+    }
+
     fn handle_peer_announce(
         &self,
         desc: reticulum::destination::DestinationDesc,
@@ -495,11 +551,14 @@ impl VpnRuntime {
         if hash == self.destination {
             return false;
         }
+        if !self.peer_allowed(&hash) {
+            log::debug!("vpn peer={} announce ignored by allowlist", hash);
+            return false;
+        }
         let tunnel_ip = match derive_tunnel_ip(self.network, &hash) {
             Ok(ip) => ip,
             Err(_) => return false,
         };
-        let is_new = self.peers.get(&hash).is_none();
         let peer = self
             .peers
             .get_or_create(hash, || Peer::new(hash, tunnel_ip, LinkState::Discovered));
@@ -512,7 +571,7 @@ impl VpnRuntime {
         peer.clear_error();
         self.rebuild_router();
         self.sync_routes();
-        is_new
+        true
     }
 
     // ── Peer state updates ───────────────────────────────────────────────────
@@ -583,7 +642,9 @@ fn spawn_announce_rx(
                         }
                         match decode_announce(app_data) {
                             Ok(routes) => {
-                                runtime.handle_peer_announce(desc, routes);
+                                if !runtime.handle_peer_announce(desc.clone(), routes) {
+                                    continue;
+                                }
                                 // Announces are the primary trigger for opening
                                 // a fresh outbound link after a disconnect. If a
                                 // link is already active/pending, request_out_link
@@ -882,19 +943,33 @@ async fn handle_link_data(
         }
         return;
     }
+    let src_ip = packet_source(data);
+    let dst_ip = packet_destination(data);
+    let credited = sender_hint.and_then(|h| runtime.peers.get(&h)).or_else(|| {
+        let src = src_ip?;
+        let owner = runtime.router.snapshot().resolve(src)?;
+        runtime.peers.get(&owner)
+    });
+    if credited.is_none() && (sender_hint.is_some() || !runtime.allow_all_peers()) {
+        log::debug!(
+            "vpn drop peer=unknown src={} dst={} len={} reason=peer-filter",
+            src_ip
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            dst_ip
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            data.len()
+        );
+        runtime.record_drop();
+        return;
+    }
     // Forward to TUN and credit the peer that sent it. Prefer the explicit
     // hint from the out-link event; fall back to resolving the packet source
     // IP through the router (the same lookup used on the TX path).
     match tun.send(data).await {
         Ok(_) => {
             runtime.metrics.record_rx(data.len());
-            let src_ip = packet_source(data);
-            let dst_ip = packet_destination(data);
-            let credited = sender_hint.and_then(|h| runtime.peers.get(&h)).or_else(|| {
-                let src = src_ip?;
-                let owner = runtime.router.snapshot().resolve(src)?;
-                runtime.peers.get(&owner)
-            });
             if let Some(peer) = credited {
                 peer.metrics.record_rx(data.len());
                 peer.mark_seen();
@@ -932,6 +1007,10 @@ async fn request_out_link(
     desc: reticulum::destination::DestinationDesc,
 ) {
     let hash = desc.address_hash;
+    if !runtime.peer_allowed(&hash) {
+        runtime.out_links.remove(&hash);
+        return;
+    }
     let peer = runtime.peers.get(&hash);
     let existing = transport.lock().await.find_out_link(&hash).await;
     let existing_status = if let Some(link) = existing.as_ref() {

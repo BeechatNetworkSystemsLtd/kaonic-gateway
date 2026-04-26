@@ -11,6 +11,8 @@ pub struct VpnPageSnapshot {
     pub local_hash: String,
     pub wlan0_ip: Option<String>,
     pub usb0_ip: Option<String>,
+    pub allow_all_peers: bool,
+    pub allowed_peers: Vec<String>,
     pub vpn: VpnSnapshot,
 }
 
@@ -21,11 +23,22 @@ pub async fn load_vpn_snapshot() -> Result<VpnPageSnapshot, ServerFnError> {
 
     let state = leptos::context::use_context::<AppState>()
         .ok_or_else(|| ServerFnError::new("missing AppState context"))?;
+    let config = {
+        let settings = state
+            .settings
+            .lock()
+            .map_err(|_| ServerFnError::new("settings lock poisoned"))?;
+        settings
+            .load_config()
+            .map_err(|err| ServerFnError::new(err.to_string()))?
+    };
 
     Ok(VpnPageSnapshot {
         local_hash: state.vpn_hash.clone(),
         wlan0_ip: read_interface_ipv4("wlan0"),
         usb0_ip: read_interface_ipv4("usb0"),
+        allow_all_peers: config.allow_all_peers,
+        allowed_peers: config.peers,
         vpn: match &state.vpn {
             Some(vpn) => vpn.snapshot().await,
             None => VpnSnapshot::default(),
@@ -262,6 +275,11 @@ fn VpnContent(snapshot: VpnPageSnapshot) -> impl IntoView {
             />
         </div>
 
+        <VpnAccessCard
+            allow_all_peers=snapshot.allow_all_peers
+            allowed_peers=snapshot.allowed_peers.clone()
+        />
+
         // ── Peers ─────────────────────────────────────────────────────────────
         <VpnPeersCard peers=vpn.peers.clone() />
 
@@ -277,6 +295,83 @@ fn VpnContent(snapshot: VpnPageSnapshot) -> impl IntoView {
         />
 
         <script>{VPN_WS_JS}</script>
+    }
+}
+
+#[component]
+fn VpnAccessCard(allow_all_peers: bool, allowed_peers: Vec<String>) -> impl IntoView {
+    let peers_json = serde_json::to_string(&allowed_peers).unwrap_or_else(|_| "[]".into());
+
+    view! {
+        <div class="card vpn-access-card" id="vpn-access-card" data-allow-all=allow_all_peers.to_string() data-peers=peers_json>
+            <div class="card-header">
+                <span class="card-title">"Peer Access"</span>
+                <span class=if allow_all_peers {
+                    "badge badge-ok"
+                } else {
+                    "badge badge-warn"
+                } id="vpn-access-mode-badge">
+                    {if allow_all_peers { "Allow all peers" } else { "Allowlist only" }}
+                </span>
+            </div>
+            <p class="card-body-text vpn-access-copy">
+                "Choose whether any discovered VPN peer may connect, or only peers whose destination hash is stored in the allowlist."
+            </p>
+            <label class="vpn-access-toggle">
+                <input type="checkbox" id="vpn-allow-all-toggle" checked=allow_all_peers />
+                <span>"Allow connections from any peer"</span>
+            </label>
+            <div class="vpn-access-row">
+                <input
+                    type="text"
+                    id="vpn-allowlist-input"
+                    class="field-input vpn-allowlist-input"
+                    placeholder="Destination hash"
+                    autocomplete="off"
+                    spellcheck="false"
+                    inputmode="text"
+                />
+                <button type="button" class="btn-secondary" id="vpn-allowlist-add">"Add"</button>
+            </div>
+            <p class="vpn-access-hint">
+                "Use the peer destination hash shown on another Kaonic device. Only one hash per entry."
+            </p>
+            <div class="vpn-access-status" id="vpn-access-status"></div>
+            <div class="vpn-access-table-wrap">
+                <table class="vpn-access-table">
+                    <thead>
+                        <tr>
+                            <th>"Destination hash"</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody id="vpn-allowlist-table">
+                        {if allowed_peers.is_empty() {
+                            view! {
+                                <tr class="vpn-allowlist-empty-row" id="vpn-allowlist-empty-row">
+                                    <td colspan="2">"No allowlist entries saved."</td>
+                                </tr>
+                            }.into_any()
+                        } else {
+                            allowed_peers.into_iter().map(|peer| {
+                                let peer_attr = peer.clone();
+                                let peer_button = peer.clone();
+                                view! {
+                                    <tr data-vpn-allow-peer=peer_attr>
+                                        <td><code>{peer.clone()}</code></td>
+                                        <td class="vpn-access-actions">
+                                            <button type="button" class="btn-secondary vpn-allowlist-remove" data-vpn-remove-peer=peer_button>
+                                                "Remove"
+                                            </button>
+                                        </td>
+                                    </tr>
+                                }
+                            }).collect_view().into_any()
+                        }}
+                    </tbody>
+                </table>
+            </div>
+        </div>
     }
 }
 
@@ -699,6 +794,7 @@ const VPN_WS_JS: &str = r#"
 (function() {
     var pingState = Object.create(null);
     var speedState = Object.create(null);
+    var accessState = loadAccessState();
 
     // ── Utilities ──────────────────────────────────────────────────────────
 
@@ -740,6 +836,81 @@ const VPN_WS_JS: &str = r#"
         var octets = network.trim().split('.');
         if (octets.length !== 4 || octets[3] !== '0') { return ''; }
         return octets[0] + '.' + octets[1] + '.' + octets[2] + '.1';
+    }
+
+    function loadAccessState() {
+        var root = document.getElementById('vpn-access-card');
+        if (!root) { return { allowAll: true, peers: [], saving: false }; }
+        var peers = [];
+        try { peers = JSON.parse(root.getAttribute('data-peers') || '[]') || []; } catch (_) {}
+        return {
+            allowAll: root.getAttribute('data-allow-all') === 'true',
+            peers: peers.filter(Boolean),
+            saving: false
+        };
+    }
+
+    function validPeerHash(value) {
+        return /^[0-9a-fA-F]{32}$/.test(String(value || '').trim());
+    }
+
+    function setAccessStatus(text, kind) {
+        var el = document.getElementById('vpn-access-status');
+        if (!el) { return; }
+        el.textContent = text || '';
+        el.className = 'vpn-access-status' + (kind ? ' ' + kind : '');
+    }
+
+    function renderAccessTable() {
+        var body = document.getElementById('vpn-allowlist-table');
+        var toggle = document.getElementById('vpn-allow-all-toggle');
+        var badge = document.getElementById('vpn-access-mode-badge');
+        if (!(body instanceof HTMLElement)) { return; }
+        if (toggle instanceof HTMLInputElement) {
+            toggle.checked = !!accessState.allowAll;
+        }
+        if (badge) {
+            badge.textContent = accessState.allowAll ? 'Allow all peers' : 'Allowlist only';
+            badge.className = accessState.allowAll ? 'badge badge-ok' : 'badge badge-warn';
+        }
+        body.innerHTML = accessState.peers.length
+            ? accessState.peers.map(function(peer) {
+                return '<tr data-vpn-allow-peer="' + esc(peer) + '">'
+                    + '<td><code>' + esc(peer) + '</code></td>'
+                    + '<td class="vpn-access-actions"><button type="button" class="btn-secondary vpn-allowlist-remove" data-vpn-remove-peer="' + esc(peer) + '">Remove</button></td>'
+                    + '</tr>';
+            }).join('')
+            : '<tr class="vpn-allowlist-empty-row" id="vpn-allowlist-empty-row"><td colspan="2">No allowlist entries saved.</td></tr>';
+    }
+
+    function saveAccessState(successText) {
+        accessState.saving = true;
+        setAccessStatus('Saving…', '');
+        return fetch('/api/vpn/access', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                allow_all_peers: !!accessState.allowAll,
+                peers: accessState.peers.slice()
+            })
+        }).then(function(resp) {
+            return resp.text().then(function(t) {
+                var d = {};
+                try { d = t ? JSON.parse(t) : {}; } catch (_) { d = {}; }
+                if (!resp.ok) {
+                    throw new Error((d && d.status) || (d && d.error) || t || 'Failed to save');
+                }
+                accessState.allowAll = !!d.allow_all_peers;
+                accessState.peers = Array.isArray(d.peers) ? d.peers.slice() : accessState.peers;
+                renderAccessTable();
+                setAccessStatus(successText || d.status || 'Saved', 'flash-ok');
+            });
+        }).catch(function(err) {
+            renderAccessTable();
+            setAccessStatus(err && err.message ? err.message : 'Failed to save', 'flash-err');
+        }).finally(function() {
+            accessState.saving = false;
+        });
     }
 
     function fmtRelative(ts) {
@@ -1117,6 +1288,38 @@ const VPN_WS_JS: &str = r#"
             return;
         }
 
+        if (target.id === 'vpn-allowlist-add') {
+            var input = document.getElementById('vpn-allowlist-input');
+            if (!(input instanceof HTMLInputElement)) { return; }
+            var peer = String(input.value || '').trim().toLowerCase();
+            if (!validPeerHash(peer)) {
+                setAccessStatus('Enter a valid destination hash.', 'flash-err');
+                input.focus();
+                return;
+            }
+            if (accessState.peers.indexOf(peer) !== -1) {
+                setAccessStatus('Peer is already in the allowlist.', 'flash-err');
+                input.focus();
+                input.select();
+                return;
+            }
+            accessState.peers.push(peer);
+            accessState.peers.sort();
+            renderAccessTable();
+            saveAccessState('Peer added');
+            input.value = '';
+            return;
+        }
+
+        var removePeerBtn = target.closest('[data-vpn-remove-peer]');
+        if (removePeerBtn) {
+            var removePeer = String(removePeerBtn.getAttribute('data-vpn-remove-peer') || '');
+            accessState.peers = accessState.peers.filter(function(peer) { return peer !== removePeer; });
+            renderAccessTable();
+            saveAccessState('Peer removed');
+            return;
+        }
+
         // Ping
         var pingBtn = target.closest('[data-vpn-ping]');
         if (pingBtn) {
@@ -1236,6 +1439,23 @@ const VPN_WS_JS: &str = r#"
         if (ev.key === 'Escape') { closeRouteEditor(); }
     });
 
+    document.addEventListener('change', function(ev) {
+        var target = ev.target;
+        if (!(target instanceof HTMLInputElement) || target.id !== 'vpn-allow-all-toggle') { return; }
+        accessState.allowAll = !!target.checked;
+        renderAccessTable();
+        saveAccessState(accessState.allowAll ? 'Allow-all mode enabled' : 'Allowlist-only mode enabled');
+    });
+
+    document.addEventListener('keydown', function(ev) {
+        var target = ev.target;
+        if (!(target instanceof HTMLInputElement) || target.id !== 'vpn-allowlist-input') { return; }
+        if (ev.key !== 'Enter') { return; }
+        ev.preventDefault();
+        var addBtn = document.getElementById('vpn-allowlist-add');
+        if (addBtn instanceof HTMLButtonElement) { addBtn.click(); }
+    });
+
     // ── Route editor ────────────────────────────────────────────────────────
 
     function setRouteEditorStatus(text, kind) {
@@ -1294,5 +1514,6 @@ const VPN_WS_JS: &str = r#"
     });
 
     connect();
+    renderAccessTable();
 })();
 "#;
