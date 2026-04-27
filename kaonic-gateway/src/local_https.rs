@@ -68,10 +68,11 @@ pub fn ensure_root_ca_files() -> io::Result<PathBuf> {
 pub fn ensure_gateway_tls_files() -> io::Result<PathBuf> {
     let dir = ensure_root_ca_files()?;
     let root_ca = load_or_create_root_ca_artifacts(&dir)?;
+    let device_identity = device_identity();
     let gateway_tls = generate_service_tls_material(
         &root_ca,
         "gateway-tls-v2",
-        &read_device_serial().unwrap_or_else(|| "kaonic-gateway".to_string()),
+        &service_common_name("kaonic-gateway", &device_identity),
         deterministic_gateway_tls_key_pair()
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?,
     )
@@ -96,10 +97,11 @@ pub fn ensure_gateway_tls_files() -> io::Result<PathBuf> {
 pub fn ensure_plugin_tls_files(current_dir: &Path, plugin_id: &str) -> io::Result<()> {
     let dir = ensure_root_ca_files()?;
     let root_ca = load_or_create_root_ca_artifacts(&dir)?;
+    let device_identity = device_identity();
     let plugin_tls = generate_service_tls_material(
         &root_ca,
         &format!("plugin-tls-v1:{plugin_id}"),
-        plugin_id,
+        &service_common_name(plugin_id, &device_identity),
         deterministic_plugin_tls_key_pair(plugin_id)?,
     )
     .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
@@ -161,12 +163,17 @@ fn generate_root_ca_artifacts(
 
     let mut params = CertificateParams::default();
     let mut dn = DistinguishedName::new();
-    dn.push(DnType::CommonName, root_ca_common_name(device_serial));
+    let common_name = root_ca_common_name(device_serial);
+    dn.push(DnType::CommonName, common_name.clone());
     dn.push(DnType::OrganizationName, "Beechat Network Systems Ltd");
     params.distinguished_name = dn;
     params.not_before = date_time_ymd(2024, 1, 1);
     params.not_after = date_time_ymd(2044, 1, 1);
-    params.serial_number = Some(derived_serial_number("root-ca-v3", key_der));
+    params.serial_number = Some(derived_serial_number(
+        "root-ca-v4",
+        key_der,
+        &[common_name.as_bytes()],
+    ));
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     params.use_authority_key_identifier_extension = true;
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
@@ -242,9 +249,16 @@ fn generate_service_tls_material(
     params.distinguished_name = dn;
     params.not_before = date_time_ymd(2024, 1, 1);
     params.not_after = date_time_ymd(2034, 1, 1);
+    let san_context = params
+        .subject_alt_names
+        .iter()
+        .map(|name| format!("{name:?}"))
+        .collect::<Vec<_>>()
+        .join("|");
     params.serial_number = Some(derived_serial_number(
         serial_label,
         key_pair.serialized_der(),
+        &[common_name.as_bytes(), san_context.as_bytes()],
     ));
     params.use_authority_key_identifier_extension = true;
     params.key_usages = vec![
@@ -263,9 +277,7 @@ fn generate_service_tls_material(
 }
 
 fn deterministic_gateway_tls_key_pair() -> Result<KeyPair, String> {
-    let device_identity = read_device_serial()
-        .or_else(read_hostname)
-        .unwrap_or_else(|| "kaonic-gateway".to_string());
+    let device_identity = device_identity();
     let signing_key = deterministic_p256_signing_key(&format!(
         "{}|gateway-tls|{device_identity}",
         ca_seed_phrase()
@@ -280,9 +292,7 @@ fn deterministic_gateway_tls_key_pair() -> Result<KeyPair, String> {
 }
 
 fn deterministic_plugin_tls_key_pair(plugin_id: &str) -> io::Result<KeyPair> {
-    let device_identity = read_device_serial()
-        .or_else(read_hostname)
-        .unwrap_or_else(|| "kaonic-gateway".to_string());
+    let device_identity = device_identity();
     let signing_key = deterministic_p256_signing_key(&format!(
         "{}|plugin-tls|{}|{}",
         ca_seed_phrase(),
@@ -328,11 +338,29 @@ fn service_subject_alt_names() -> Vec<String> {
     subject_alt_names
 }
 
-fn derived_serial_number(label: &str, material: &[u8]) -> SerialNumber {
-    let mut input = Vec::with_capacity(label.len() + 1 + material.len());
+fn service_common_name(service_name: &str, device_identity: &str) -> String {
+    format!("{service_name} {device_identity}")
+}
+
+fn device_identity() -> String {
+    read_device_serial()
+        .or_else(read_hostname)
+        .unwrap_or_else(|| "kaonic-gateway".to_string())
+}
+
+fn derived_serial_number(label: &str, material: &[u8], context_parts: &[&[u8]]) -> SerialNumber {
+    let extra_len = context_parts
+        .iter()
+        .map(|part| part.len() + 1)
+        .sum::<usize>();
+    let mut input = Vec::with_capacity(label.len() + 1 + material.len() + extra_len);
     input.extend_from_slice(label.as_bytes());
     input.push(0);
     input.extend_from_slice(material);
+    for part in context_parts {
+        input.push(0);
+        input.extend_from_slice(part);
+    }
     let digest = Sha256::digest(&input);
     let mut serial = digest[..16].to_vec();
     serial[0] &= 0x7f;
@@ -391,8 +419,8 @@ mod tests {
     use p256::pkcs8::EncodePrivateKey;
 
     use super::{
-        deterministic_gateway_tls_key_pair, deterministic_p256_signing_key,
-        generate_root_ca_artifacts, generate_service_tls_material,
+        derived_serial_number, deterministic_gateway_tls_key_pair, deterministic_p256_signing_key,
+        generate_root_ca_artifacts, generate_service_tls_material, service_common_name,
     };
 
     #[test]
@@ -431,12 +459,21 @@ mod tests {
         let gateway_tls = generate_service_tls_material(
             &root_ca,
             "gateway-tls-test",
-            "kaonic-gateway",
+            &service_common_name("kaonic-gateway", "kaonic-test-device"),
             deterministic_gateway_tls_key_pair().expect("gateway tls key"),
         )
         .expect("gateway tls");
 
         assert!(gateway_tls.cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(gateway_tls.key_pem.contains("BEGIN PRIVATE KEY"));
+    }
+
+    #[test]
+    fn serial_changes_when_certificate_identity_changes() {
+        let material = b"same-key-material";
+        let first = derived_serial_number("service-v1", material, &[b"kaonic-gateway device-a"]);
+        let second = derived_serial_number("service-v1", material, &[b"kaonic-gateway device-b"]);
+
+        assert_ne!(first, second);
     }
 }

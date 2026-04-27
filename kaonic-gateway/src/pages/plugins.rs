@@ -410,7 +410,15 @@ const PLUGINS_JS: &str = r#"
         var actionLocked = !!state.busyAction.pluginId;
         var appUrl = webviewUrl(plugin);
         var openAppAction = appUrl
-            ? '<a class=\"btn-secondary\" href=\"' + escaped(appUrl) + '\" target=\"_blank\" rel=\"noreferrer\">Open app</a>'
+            ? '<a class=\"btn-primary\" href=\"' + escaped(appUrl) + '\" target=\"_blank\" rel=\"noreferrer\">Open app</a>'
+            : '';
+        var updateAction = '<button type=\"button\" class=\"btn-secondary\" data-plugin-upload' + (actionLocked ? ' disabled' : '') + '>Update</button>';
+        var toggleAction = '<button type=\"button\" class=\"btn-secondary\" data-plugin-toggle' + (actionLocked ? ' disabled' : '') + '>' + (running ? 'Stop' : 'Start') + '</button>';
+        var restartAction = '<button type=\"button\" class=\"btn-secondary plugins-action-btn' + (restartBusy ? ' plugins-action-btn--busy' : '') + '\" data-plugin-restart' + (actionLocked ? ' disabled' : '') + '>'
+            + (restartBusy ? '<span class=\"plugins-inline-spinner\" aria-hidden=\"true\"></span>Restarting…' : 'Restart')
+            + '</button>';
+        var deleteDivider = plugin.removable
+            ? '<span aria-hidden=\"true\" style=\"width:1px;height:2rem;background:rgba(148,163,184,0.28);display:inline-block;\"></span>'
             : '';
         var deleteAction = plugin.removable
             ? '<button type=\"button\" class=\"btn-secondary plugins-delete-btn\" data-plugin-delete' + (actionLocked ? ' disabled' : '') + '>'
@@ -433,11 +441,11 @@ const PLUGINS_JS: &str = r#"
             + '<p class=\"card-body-text plugins-detail-summary\">' + escaped(plugin.description) + '</p>'
             + '<div class=\"plugins-detail-actions\">'
                 + openAppAction
-                + '<button type=\"button\" class=\"btn-primary\" data-plugin-toggle' + (actionLocked ? ' disabled' : '') + '>' + (running ? 'Stop' : 'Start') + '</button>'
-                + '<button type=\"button\" class=\"btn-secondary plugins-action-btn' + (restartBusy ? ' plugins-action-btn--busy' : '') + '\" data-plugin-restart' + (actionLocked ? ' disabled' : '') + '>'
-                    + (restartBusy ? '<span class=\"plugins-inline-spinner\" aria-hidden=\"true\"></span>Restarting…' : 'Restart')
-                + '</button>'
-                + '<button type=\"button\" class=\"btn-secondary\" data-plugin-upload' + (actionLocked ? ' disabled' : '') + '>Upload update</button>'
+                + updateAction
+                + '<span aria-hidden=\"true\" style=\"width:0.6rem;display:inline-block;\"></span>'
+                + toggleAction
+                + restartAction
+                + deleteDivider
                 + deleteAction
             + '</div>'
             + '<div class=\"plugins-detail-grid\">'

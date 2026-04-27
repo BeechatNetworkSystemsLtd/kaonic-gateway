@@ -38,6 +38,7 @@ use crate::config::{
 const PACKET_MAGIC: [u8; 4] = *b"KPT2";
 const PACKET_HEADER_LEN: usize = 8;
 const PLAYBACK_BUFFER_FRAMES: usize = 64;
+const RECEIVE_PLAYBACK_BUFFER_FRAMES: usize = 128;
 const AUDIO_PTT_ANNOUNCE_MAGIC: &[u8] = b"KAP1";
 const PLUGIN_TLS_CERT_FILE: &str = "plugin-tls.crt";
 const PLUGIN_TLS_KEY_FILE: &str = "plugin-tls.key";
@@ -82,7 +83,7 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
       min-width: 0;
       padding: 1.5rem;
       display: flex;
-      align-items: center;
+      align-items: flex-start;
       justify-content: center;
       box-sizing: border-box;
     }
@@ -195,9 +196,27 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
       border-radius: 1.4rem;
       box-shadow: 0 24px 48px rgba(0,0,0,0.35);
       text-align: center;
+      display: grid;
+      gap: 1.2rem;
+    }
+    .ptt-body {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(18rem, 20rem);
+      gap: 1rem;
+      align-items: start;
+    }
+    .ptt-main {
+      min-height: 100%;
+      display: grid;
+      align-content: start;
+      gap: 1rem;
+    }
+    .ptt-stats {
+      display: grid;
+      gap: 0.85rem;
+      align-content: start;
     }
     .selection-card {
-      margin-bottom: 1.2rem;
       padding: 1rem 1.1rem;
       border-radius: 1rem;
       border: 1px solid #1f2937;
@@ -227,7 +246,8 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
     .mic-wrap {
       display: flex;
       justify-content: center;
-      margin: 1.35rem 0 1rem;
+      min-height: min(21rem, 66vw);
+      align-items: center;
     }
     .mic-btn {
       width: min(20rem, 62vw);
@@ -257,14 +277,18 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
       box-shadow: 0 0 0 0.85rem rgba(251, 113, 133, 0.18);
     }
     .status {
-      min-height: 5.5rem;
+      min-height: 6.5rem;
+      padding: 0.95rem 1rem;
+      border-radius: 1rem;
+      border: 1px solid #1f2937;
+      background: #0b1220;
       color: #cbd5e1;
       font-size: 0.98rem;
       white-space: pre-line;
       line-height: 1.45;
+      text-align: left;
     }
     .playback-status {
-      margin-top: 1rem;
       padding: 0.95rem 1rem;
       border-radius: 1rem;
       border: 1px solid #1f2937;
@@ -306,6 +330,15 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
       .ptt-shell {
         width: 100%;
       }
+      .ptt-body {
+        grid-template-columns: 1fr;
+      }
+      .ptt-main {
+        order: 1;
+      }
+      .ptt-stats {
+        order: 2;
+      }
     }
   </style>
 </head>
@@ -326,23 +359,29 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
     </aside>
     <section class="content">
       <div class="ptt-shell">
-        <div class="selection-card">
-          <div class="selection-label">Selected contact</div>
-          <div id="selected-peer-name" class="selection-name">No contact selected</div>
-          <div id="selected-peer-status" class="selection-status">
-            <span class="status-dot"></span>
-            <span>Choose a contact from the list</span>
+        <div class="ptt-body">
+          <div class="ptt-main">
+            <div class="selection-card">
+              <div class="selection-label">Selected contact</div>
+              <div id="selected-peer-name" class="selection-name">No contact selected</div>
+              <div id="selected-peer-status" class="selection-status">
+                <span class="status-dot"></span>
+                <span>Choose a contact from the list</span>
+              </div>
+            </div>
+            <div class="mic-wrap">
+              <button id="mic-btn" class="mic-btn" type="button">Hold to Talk</button>
+            </div>
+          </div>
+          <div class="ptt-stats">
+            <div class="playback-status">
+              <div class="playback-status-title">Last received audio</div>
+              <div id="playback-status" class="playback-status-body">Waiting for audio…</div>
+            </div>
+            <div id="status" class="status">Loading…</div>
+            <div class="hint">Audio is sent over Reticulum links and played by the remote Kaonic audio-ptt plugin on ALSA output.</div>
           </div>
         </div>
-        <div class="mic-wrap">
-          <button id="mic-btn" class="mic-btn" type="button">Hold to Talk</button>
-        </div>
-        <div class="playback-status">
-          <div class="playback-status-title">Last received audio</div>
-          <div id="playback-status" class="playback-status-body">Waiting for audio…</div>
-        </div>
-        <div id="status" class="status">Loading…</div>
-        <div class="hint">Audio is sent over Reticulum links and played by the remote Kaonic audio-ptt plugin on ALSA output.</div>
       </div>
     </section>
   </main>
@@ -922,8 +961,13 @@ async fn main() -> Result<(), std::process::ExitCode> {
         local_destination,
         cfg.rns_module.min(1)
     );
+    log::info!(
+        "kaonic-audio-ptt local audio path capture_device={} playback_device={} (browser UI can provide transmit microphone audio, but received audio is rendered on local ALSA playback hardware)",
+        cfg.capture_device,
+        cfg.playback_device
+    );
 
-    let (playback_tx, playback_rx) = mpsc::channel(PLAYBACK_BUFFER_FRAMES);
+    let (playback_tx, playback_rx) = mpsc::channel(RECEIVE_PLAYBACK_BUFFER_FRAMES);
     let playback_cancel = CancellationToken::new();
 
     let state = AppState {
@@ -1469,14 +1513,27 @@ async fn handle_received_audio(
     let frame_len = frame_samples(cfg);
     let mut codec = RxCodec::new(cfg)?;
     let pcm = codec.decode(body, frame_len)?;
-    if state.playback_tx.try_send(pcm).is_err() {
-        log::warn!("playback buffer full, dropping received frame");
-        state.stats.playback_drops.fetch_add(1, Ordering::Relaxed);
-        state
-            .stats
-            .record_playback_error("playback buffer full, dropping received frame")
-            .await;
-        return Ok(());
+    let playback_wait = Duration::from_millis(std::cmp::max((cfg.frame_ms as u64) * 6, 120));
+    match tokio::time::timeout(playback_wait, state.playback_tx.send(pcm)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            return Err("playback loop is unavailable".into());
+        }
+        Err(_) => {
+            log::warn!(
+                "playback buffer stayed full for {} ms, dropping received frame",
+                playback_wait.as_millis()
+            );
+            state.stats.playback_drops.fetch_add(1, Ordering::Relaxed);
+            state
+                .stats
+                .record_playback_error(format!(
+                    "playback buffer stayed full for {} ms, dropping received frame",
+                    playback_wait.as_millis()
+                ))
+                .await;
+            return Ok(());
+        }
     }
     *state.stats.last_remote.lock().await = Some(remote);
     state.stats.rx_packets.fetch_add(1, Ordering::Relaxed);
