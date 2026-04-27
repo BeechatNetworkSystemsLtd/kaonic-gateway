@@ -1,5 +1,6 @@
 use kaonic_vpn::{VpnPeerSnapshot, VpnRouteSnapshot, VpnSnapshot};
 use leptos::prelude::*;
+use qrcodegen::{QrCode, QrCodeEcc};
 use serde::{Deserialize, Serialize};
 
 use super::PageTitle;
@@ -9,6 +10,7 @@ use super::PageTitle;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VpnPageSnapshot {
     pub local_hash: String,
+    pub codename: String,
     pub wlan0_ip: Option<String>,
     pub usb0_ip: Option<String>,
     pub allow_all_peers: bool,
@@ -32,9 +34,19 @@ pub async fn load_vpn_snapshot() -> Result<VpnPageSnapshot, ServerFnError> {
             .load_config()
             .map_err(|err| ServerFnError::new(err.to_string()))?
     };
+    let codename = {
+        let settings = state
+            .settings
+            .lock()
+            .map_err(|_| ServerFnError::new("settings lock poisoned"))?;
+        settings
+            .load_or_create_codename()
+            .map_err(|err| ServerFnError::new(err.to_string()))?
+    };
 
     Ok(VpnPageSnapshot {
         local_hash: state.vpn_hash.clone(),
+        codename,
         wlan0_ip: read_interface_ipv4("wlan0"),
         usb0_ip: read_interface_ipv4("usb0"),
         allow_all_peers: config.allow_all_peers,
@@ -159,6 +171,45 @@ fn default_advertised_route_strings(routes: Vec<String>) -> Vec<String> {
     }
 }
 
+fn vpn_add_peer_url(hash: &str, codename: &str) -> String {
+    format!("http://192.168.10.1/vpn?vpn-add-peer={hash}&codename={codename}")
+}
+
+fn split_hash_rows(value: &str, row_len: usize) -> Vec<String> {
+    if row_len == 0 {
+        return vec![value.to_string()];
+    }
+    value
+        .as_bytes()
+        .chunks(row_len)
+        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+        .collect()
+}
+
+fn render_hash_qr_svg(value: &str) -> Option<String> {
+    let qr = QrCode::encode_text(value, QrCodeEcc::Medium).ok()?;
+    let border = 2;
+    let size = qr.size();
+    let dimension = size + border * 2;
+    let mut svg = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {dimension} {dimension}\" shape-rendering=\"crispEdges\" aria-hidden=\"true\">\
+         <rect width=\"100%\" height=\"100%\" fill=\"#ffffff\"/>"
+    );
+    for y in 0..size {
+        for x in 0..size {
+            if qr.get_module(x, y) {
+                let px = x + border;
+                let py = y + border;
+                svg.push_str(&format!(
+                    "<rect x=\"{px}\" y=\"{py}\" width=\"1\" height=\"1\" fill=\"#111827\"/>"
+                ));
+            }
+        }
+    }
+    svg.push_str("</svg>");
+    Some(svg)
+}
+
 // ── Page ──────────────────────────────────────────────────────────────────────
 
 #[component]
@@ -269,6 +320,7 @@ fn VpnContent(snapshot: VpnPageSnapshot) -> impl IntoView {
         <div class="vpn-twin-row">
             <VpnThisDeviceCard
                 local_hash=snapshot.local_hash.clone()
+                codename=snapshot.codename.clone()
                 local_routes=vpn.local_routes.clone()
                 advertised_routes=vpn.advertised_routes.clone()
                 interface_name=vpn.interface_name.clone()
@@ -297,6 +349,7 @@ fn VpnContent(snapshot: VpnPageSnapshot) -> impl IntoView {
         <VpnRouteEditorModal
             advertised_routes=vpn.advertised_routes.clone()
         />
+        <VpnShortcutModal />
 
         <script>{VPN_WS_JS}</script>
     }
@@ -338,7 +391,7 @@ fn VpnAccessCard(allow_all_peers: bool, allowed_peers: Vec<String>) -> impl Into
                 <button type="button" class="btn-secondary" id="vpn-allowlist-add">"Add"</button>
             </div>
             <p class="vpn-access-hint">
-                "Use the peer destination hash shown on another Kaonic device. Only one hash per entry."
+                "Use the peer destination hash from another Kaonic device, or scan its QR code with an external camera app to open an add-peer shortcut."
             </p>
             <div class="vpn-access-status" id="vpn-access-status"></div>
             <div class="vpn-access-table-wrap">
@@ -379,11 +432,41 @@ fn VpnAccessCard(allow_all_peers: bool, allowed_peers: Vec<String>) -> impl Into
     }
 }
 
+#[component]
+fn VpnShortcutModal() -> impl IntoView {
+    view! {
+        <div class="modal-backdrop" id="vpn-shortcut-modal" hidden>
+            <div class="modal-card vpn-shortcut-modal">
+                <div class="modal-header">
+                    <h2 class="modal-title">"Add VPN peer?"</h2>
+                    <button type="button" class="modal-close" data-close-vpn-shortcut>"×"</button>
+                </div>
+                <p class="card-body-text vpn-shortcut-copy">
+                    "This shortcut was opened from a scanned Kaonic QR code."
+                </p>
+                <div class="info-row vpn-shortcut-peer-row">
+                    <span class="info-label">"Peer hash"</span>
+                    <code class="info-value vpn-shortcut-peer" id="vpn-shortcut-peer">"—"</code>
+                </div>
+                <div class="info-row vpn-shortcut-peer-row" id="vpn-shortcut-codename-row" hidden>
+                    <span class="info-label">"Codename"</span>
+                    <code class="info-value vpn-shortcut-peer" id="vpn-shortcut-codename">"—"</code>
+                </div>
+                <div class="modal-actions">
+                    <button type="button" class="btn-secondary" data-close-vpn-shortcut>"Cancel"</button>
+                    <button type="button" class="btn-primary" id="vpn-shortcut-confirm">"Add peer"</button>
+                </div>
+            </div>
+        </div>
+    }
+}
+
 // ── This Device card ──────────────────────────────────────────────────────────
 
 #[component]
 fn VpnThisDeviceCard(
     local_hash: String,
+    codename: String,
     local_routes: Vec<String>,
     advertised_routes: Vec<String>,
     interface_name: Option<String>,
@@ -391,6 +474,12 @@ fn VpnThisDeviceCard(
 ) -> impl IntoView {
     let iface = interface_name.unwrap_or_else(|| "—".into());
     let _ = advertised_routes;
+    let add_peer_url = vpn_add_peer_url(&local_hash, &codename);
+    let qr_svg = render_hash_qr_svg(&add_peer_url);
+    let hash_rows = split_hash_rows(&local_hash, 8);
+    let local_hash_display = local_hash.clone();
+    let local_hash_copy = local_hash.clone();
+    let codename_display = codename.clone();
     let backend_badge = format!(
         "badge {}",
         if backend == "linux" {
@@ -421,9 +510,35 @@ fn VpnThisDeviceCard(
             <div class="info-row">
                 <span class="info-label">"Identity"</span>
                 <code class="info-value vpn-hash-display" id="vpn-identity-short">
-                    {local_hash}
+                    {local_hash_display}
                 </code>
             </div>
+
+            {qr_svg.map(|svg| view! {
+                <div class="vpn-hash-qr-block">
+                    <div class="vpn-hash-qr-side">
+                        <div class="vpn-hash-qr" inner_html=svg></div>
+                        <p class="vpn-hash-qr-caption">
+                            "Scan with a camera app to open an add-peer shortcut"
+                        </p>
+                    </div>
+                    <div class="vpn-hash-qr-meta">
+                        <div class="vpn-hash-qr-rows">
+                            {hash_rows.iter().map(|row| view! {
+                                <code class="vpn-hash-qr-row">{row.clone()}</code>
+                            }).collect_view()}
+                        </div>
+                        <div class="vpn-hash-qr-codename">{codename_display.clone()}</div>
+                        <button
+                            type="button"
+                            class="btn-secondary vpn-hash-qr-copy"
+                            data-vpn-copy=local_hash_copy.clone()
+                        >
+                            "Copy"
+                        </button>
+                    </div>
+                </div>
+            })}
 
             // Advertised routes (alias → local)
             <div style="margin-top:12px;">
@@ -793,6 +908,7 @@ const VPN_WS_JS: &str = r#"
     var pingState = Object.create(null);
     var speedState = Object.create(null);
     var accessState = loadAccessState();
+    var shortcutState = { peer: '', codename: '' };
 
     // ── Utilities ──────────────────────────────────────────────────────────
 
@@ -850,6 +966,10 @@ const VPN_WS_JS: &str = r#"
 
     function validPeerHash(value) {
         return /^[0-9a-fA-F]{32}$/.test(String(value || '').trim());
+    }
+
+    function validCodename(value) {
+        return /^[a-z0-9]{8}$/.test(String(value || '').trim());
     }
 
     function setAccessStatus(text, kind) {
@@ -990,6 +1110,112 @@ const VPN_WS_JS: &str = r#"
     function shortHash(h) {
         var c = String(h || '').replace(/\s+/g, '');
         return c.length > 16 ? c.substring(0, 16) + '\u2026' : c;
+    }
+
+    function isModalOpen(id) {
+        var modal = document.getElementById(id);
+        return !!(modal instanceof HTMLElement) && !modal.hidden;
+    }
+
+    function syncModalOpenClass() {
+        if (!document.body) { return; }
+        if (isModalOpen('vpn-routes-modal') || isModalOpen('vpn-shortcut-modal')) {
+            document.body.classList.add('modal-open');
+        } else {
+            document.body.classList.remove('modal-open');
+        }
+    }
+
+    function clearAddPeerShortcutParam() {
+        try {
+            var url = new URL(window.location.href);
+            if (!url.searchParams.has('vpn-add-peer')) { return; }
+            url.searchParams.delete('vpn-add-peer');
+            url.searchParams.delete('codename');
+            var next = url.pathname + (url.search ? url.search : '') + (url.hash ? url.hash : '');
+            window.history.replaceState({}, '', next || '/vpn');
+        } catch (_) {}
+    }
+
+    function addPeerToAllowlist(peer, successText) {
+        var normalized = String(peer || '').trim().toLowerCase();
+        if (!validPeerHash(normalized)) {
+            setAccessStatus('Enter a valid destination hash.', 'flash-err');
+            return false;
+        }
+        if (accessState.peers.indexOf(normalized) !== -1) {
+            setAccessStatus('Peer is already in the allowlist.', 'flash-err');
+            return false;
+        }
+        accessState.peers.push(normalized);
+        accessState.peers.sort();
+        renderAccessTable();
+        saveAccessState(successText || 'Peer added');
+        return true;
+    }
+
+    function closeShortcutModal(cancelled) {
+        var modal = document.getElementById('vpn-shortcut-modal');
+        if (!(modal instanceof HTMLElement)) { return; }
+        modal.hidden = true;
+        shortcutState.peer = '';
+        shortcutState.codename = '';
+        syncModalOpenClass();
+        if (cancelled) {
+            setAccessStatus('Peer add cancelled.', '');
+        }
+    }
+
+    function confirmShortcutPeer() {
+        var peer = shortcutState.peer;
+        closeShortcutModal(false);
+        if (!peer) { return; }
+        addPeerToAllowlist(peer, 'Peer added from shortcut');
+    }
+
+    function openShortcutModal(peer, codename) {
+        var modal = document.getElementById('vpn-shortcut-modal');
+        var peerEl = document.getElementById('vpn-shortcut-peer');
+        var codenameEl = document.getElementById('vpn-shortcut-codename');
+        var codenameRow = document.getElementById('vpn-shortcut-codename-row');
+        var confirmBtn = document.getElementById('vpn-shortcut-confirm');
+        if (!(modal instanceof HTMLElement) || !(peerEl instanceof HTMLElement)) { return; }
+        shortcutState.peer = peer;
+        shortcutState.codename = codename || '';
+        peerEl.textContent = peer;
+        if (codenameEl instanceof HTMLElement) {
+            codenameEl.textContent = shortcutState.codename || '—';
+        }
+        if (codenameRow instanceof HTMLElement) {
+            codenameRow.hidden = !shortcutState.codename;
+        }
+        modal.hidden = false;
+        syncModalOpenClass();
+        if (confirmBtn instanceof HTMLButtonElement) {
+            window.setTimeout(function() { confirmBtn.focus(); }, 0);
+        }
+    }
+
+    function maybeHandleAddPeerShortcut() {
+        var params;
+        try {
+            params = new URLSearchParams(window.location.search || '');
+        } catch (_) {
+            return;
+        }
+        if (!params.has('vpn-add-peer')) { return; }
+        var peer = String(params.get('vpn-add-peer') || '').trim().toLowerCase();
+        var codename = String(params.get('codename') || '').trim().toLowerCase();
+        if (!validPeerHash(peer)) {
+            clearAddPeerShortcutParam();
+            setAccessStatus('Shortcut did not contain a valid destination hash.', 'flash-err');
+            return;
+        }
+        if (codename && !validCodename(codename)) {
+            codename = '';
+        }
+        clearAddPeerShortcutParam();
+        openShortcutModal(peer, codename);
     }
 
     // ── Banner + error bar ──────────────────────────────────────────────────
@@ -1289,21 +1515,12 @@ const VPN_WS_JS: &str = r#"
             var input = document.getElementById('vpn-allowlist-input');
             if (!(input instanceof HTMLInputElement)) { return; }
             var peer = String(input.value || '').trim().toLowerCase();
-            if (!validPeerHash(peer)) {
-                setAccessStatus('Enter a valid destination hash.', 'flash-err');
-                input.focus();
-                return;
-            }
-            if (accessState.peers.indexOf(peer) !== -1) {
-                setAccessStatus('Peer is already in the allowlist.', 'flash-err');
+            var added = addPeerToAllowlist(peer, 'Peer added');
+            if (!added) {
                 input.focus();
                 input.select();
                 return;
             }
-            accessState.peers.push(peer);
-            accessState.peers.sort();
-            renderAccessTable();
-            saveAccessState('Peer added');
             input.value = '';
             return;
         }
@@ -1429,11 +1646,27 @@ const VPN_WS_JS: &str = r#"
         // Close route editor
         if (target.closest('[data-close-vpn-routes]') || target.id === 'vpn-routes-modal') {
             closeRouteEditor();
+            return;
+        }
+
+        if (target.closest('[data-close-vpn-shortcut]') || target.id === 'vpn-shortcut-modal') {
+            closeShortcutModal(true);
+            return;
+        }
+
+        if (target.id === 'vpn-shortcut-confirm') {
+            confirmShortcutPeer();
+            return;
         }
     });
 
     document.addEventListener('keydown', function(ev) {
-        if (ev.key === 'Escape') { closeRouteEditor(); }
+        if (ev.key === 'Escape') {
+            closeRouteEditor();
+            if (isModalOpen('vpn-shortcut-modal')) {
+                closeShortcutModal(true);
+            }
+        }
     });
 
     document.addEventListener('change', function(ev) {
@@ -1465,7 +1698,7 @@ const VPN_WS_JS: &str = r#"
         if (!modal) { return; }
         setRouteEditorStatus('', '');
         modal.hidden = false;
-        document.body.classList.add('modal-open');
+        syncModalOpenClass();
         var input = document.getElementById('vpn-routes-editor-input');
         if (input) { input.focus(); input.select(); }
     }
@@ -1474,7 +1707,7 @@ const VPN_WS_JS: &str = r#"
         var modal = document.getElementById('vpn-routes-modal');
         if (!modal) { return; }
         modal.hidden = true;
-        document.body.classList.remove('modal-open');
+        syncModalOpenClass();
     }
 
     document.addEventListener('submit', function(ev) {
@@ -1512,5 +1745,19 @@ const VPN_WS_JS: &str = r#"
 
     connect();
     renderAccessTable();
+    maybeHandleAddPeerShortcut();
 })();
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_shortcut_url_for_external_scanner() {
+        assert_eq!(
+            vpn_add_peer_url("0123456789abcdef0123456789abcdef", "abcd1234"),
+            "http://192.168.10.1/vpn?vpn-add-peer=0123456789abcdef0123456789abcdef&codename=abcd1234"
+        );
+    }
+}

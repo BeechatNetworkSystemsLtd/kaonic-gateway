@@ -98,6 +98,23 @@ const PLUGINS_JS: &str = r#"
         return '<a class=\"plugins-detail-link\" href=\"' + escaped(url) + '\" target=\"_blank\" rel=\"noreferrer\">' + escaped(url) + '</a>';
     }
 
+    function webviewLink(port) {
+        var url = webviewUrl(port);
+        return url ? '<a class=\"plugins-detail-link\" href=\"' + escaped(url) + '\" target=\"_blank\" rel=\"noreferrer\">' + escaped(url) + '</a>' : '—';
+    }
+
+    function webviewUrl(port) {
+        if (port == null || port === '') { return ''; }
+        var numericPort = Number(port);
+        if (!Number.isInteger(numericPort) || numericPort < 1 || numericPort > 65535) { return ''; }
+        var host = window.location.hostname || window.location.host || '';
+        if (!host) { return ''; }
+        if (host.includes(':') && host.charAt(0) !== '[') {
+            host = '[' + host + ']';
+        }
+        return 'http://' + host + ':' + numericPort;
+    }
+
     function ensureSelection() {
         if (!state.plugins.length) {
             state.selectedId = '';
@@ -352,6 +369,10 @@ const PLUGINS_JS: &str = r#"
         var restartBusy = isBusyAction(plugin.id, 'restart');
         var deleteBusy = isBusyAction(plugin.id, 'delete');
         var actionLocked = !!state.busyAction.pluginId;
+        var appUrl = webviewUrl(plugin.webview);
+        var openAppAction = appUrl
+            ? '<a class=\"btn-secondary\" href=\"' + escaped(appUrl) + '\" target=\"_blank\" rel=\"noreferrer\">Open app</a>'
+            : '';
         var deleteAction = plugin.removable
             ? '<button type=\"button\" class=\"btn-secondary plugins-delete-btn\" data-plugin-delete' + (actionLocked ? ' disabled' : '') + '>'
                 + (deleteBusy ? '<span class=\"plugins-inline-spinner\" aria-hidden=\"true\"></span>Deleting…' : 'Delete')
@@ -372,6 +393,7 @@ const PLUGINS_JS: &str = r#"
             + '</div>'
             + '<p class=\"card-body-text plugins-detail-summary\">' + escaped(plugin.description) + '</p>'
             + '<div class=\"plugins-detail-actions\">'
+                + openAppAction
                 + '<button type=\"button\" class=\"btn-primary\" data-plugin-toggle' + (actionLocked ? ' disabled' : '') + '>' + (running ? 'Stop' : 'Start') + '</button>'
                 + '<button type=\"button\" class=\"btn-secondary plugins-action-btn' + (restartBusy ? ' plugins-action-btn--busy' : '') + '\" data-plugin-restart' + (actionLocked ? ' disabled' : '') + '>'
                     + (restartBusy ? '<span class=\"plugins-inline-spinner\" aria-hidden=\"true\"></span>Restarting…' : 'Restart')
@@ -385,7 +407,8 @@ const PLUGINS_JS: &str = r#"
                  + '<div class=\"info-row\"><span class=\"info-label\">Service name</span><code class=\"info-value\">' + escaped(detailValue(plugin.service)) + '</code></div>'
                  + '<div class=\"info-row\"><span class=\"info-label\">SHA-256</span><code class=\"info-value\">' + escaped(detailValue(plugin.sha256)) + '</code></div>'
                  + '<div class=\"info-row\"><span class=\"info-label\">GitHub URL</span><span class=\"info-value\">' + githubLink(plugin.github_url) + '</span></div>'
-             + '</div>';
+                 + '<div class=\"info-row\"><span class=\"info-label\">Webview</span><span class=\"info-value\">' + webviewLink(plugin.webview) + '</span></div>'
+              + '</div>';
         if (plugin.systemd_status) {
             panel.innerHTML += ''
                 + '<div class=\"plugins-runtime-card\">'

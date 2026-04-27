@@ -290,7 +290,10 @@ pub(crate) fn normalize_uploaded_zip<'a>(zip_bytes: &'a [u8]) -> Result<Cow<'a, 
     Ok(Cow::Borrowed(zip_bytes))
 }
 
-fn hydrate_version_from_plugin_manifest(tmp_path: &Path, version_path: &Path) -> Result<(), String> {
+fn hydrate_version_from_plugin_manifest(
+    tmp_path: &Path,
+    version_path: &Path,
+) -> Result<(), String> {
     if version_path.exists() {
         return Ok(());
     }

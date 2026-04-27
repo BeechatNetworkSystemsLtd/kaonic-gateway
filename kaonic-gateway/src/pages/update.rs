@@ -6,6 +6,7 @@ use super::PageTitle;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SystemAbout {
     serial: String,
+    codename: String,
     hostname: String,
     os_details: String,
     architecture: String,
@@ -25,11 +26,18 @@ pub async fn load_system_about() -> Result<SystemAbout, ServerFnError> {
 
     let state = leptos::context::use_context::<AppState>()
         .ok_or_else(|| ServerFnError::new("missing AppState context"))?;
+    let codename = state
+        .settings
+        .lock()
+        .map_err(|_| ServerFnError::new("settings lock poisoned"))?
+        .load_or_create_codename()
+        .map_err(|err| ServerFnError::new(err.to_string()))?;
     let (_, ram_total_mb) = read_mem_mb();
     let (_, fs_total_mb) = read_fs_mb();
 
     Ok(SystemAbout {
         serial: state.serial.clone(),
+        codename,
         hostname: read_hostname(),
         os_details: read_os_details(),
         architecture: read_architecture(),
@@ -42,6 +50,19 @@ pub async fn load_system_about() -> Result<SystemAbout, ServerFnError> {
 
 const SYSTEM_JS: &str = r#"
 (function() {
+    function setModalOpen(modal, open) {
+        if (!(modal instanceof HTMLElement)) { return; }
+        modal.hidden = !open;
+        if (!document.body) { return; }
+        if (open) {
+            document.body.classList.add('modal-open');
+            return;
+        }
+        if (!document.querySelector('.modal-backdrop:not([hidden])')) {
+            document.body.classList.remove('modal-open');
+        }
+    }
+
     function setRebootStatus(text, kind) {
         var status = document.getElementById('system-reboot-status');
         if (!status) { return; }
@@ -49,19 +70,43 @@ const SYSTEM_JS: &str = r#"
         status.className = kind || '';
     }
 
+    function setCodenameStatus(text, kind) {
+        var status = document.getElementById('system-codename-status');
+        if (!status) { return; }
+        status.textContent = text;
+        status.className = kind || '';
+    }
+
+    function applyCodename(codename) {
+        document.querySelectorAll('[data-system-codename-value]').forEach(function(node) {
+            node.textContent = codename;
+        });
+    }
+
     function openRebootModal() {
-        var modal = document.getElementById('system-reboot-modal');
-        if (!modal) { return; }
-        modal.hidden = false;
-        document.body.classList.add('modal-open');
         setRebootStatus('', '');
+        setModalOpen(document.getElementById('system-reboot-modal'), true);
     }
 
     function closeRebootModal() {
-        var modal = document.getElementById('system-reboot-modal');
-        if (!modal) { return; }
-        modal.hidden = true;
-        document.body.classList.remove('modal-open');
+        setModalOpen(document.getElementById('system-reboot-modal'), false);
+    }
+
+    function openCodenameModal() {
+        var input = document.getElementById('system-codename-input');
+        var current = document.querySelector('[data-system-codename-value]');
+        if (!(input instanceof HTMLInputElement)) { return; }
+        input.value = current ? String(current.textContent || '') : '';
+        setCodenameStatus('', '');
+        setModalOpen(document.getElementById('system-codename-modal'), true);
+        window.setTimeout(function() {
+            input.focus();
+            input.select();
+        }, 0);
+    }
+
+    function closeCodenameModal() {
+        setModalOpen(document.getElementById('system-codename-modal'), false);
     }
 
     document.addEventListener('click', function(ev) {
@@ -73,20 +118,35 @@ const SYSTEM_JS: &str = r#"
             return;
         }
 
+        if (target.closest('#system-codename-open')) {
+            openCodenameModal();
+            return;
+        }
+
         if (target.closest('[data-close-system-reboot]')) {
             closeRebootModal();
             return;
         }
 
+        if (target.closest('[data-close-system-codename]')) {
+            closeCodenameModal();
+            return;
+        }
+
         if (target.id === 'system-reboot-modal') {
             closeRebootModal();
+            return;
+        }
+
+        if (target.id === 'system-codename-modal') {
+            closeCodenameModal();
         }
     });
 
-    var confirmBtn = document.getElementById('system-reboot-confirm');
-    if (confirmBtn) {
-        confirmBtn.addEventListener('click', function() {
-            confirmBtn.disabled = true;
+    var rebootBtn = document.getElementById('system-reboot-confirm');
+    if (rebootBtn) {
+        rebootBtn.addEventListener('click', function() {
+            rebootBtn.disabled = true;
             setRebootStatus('Requesting reboot…', 'flash-ok');
             fetch('/api/system/reboot', { method: 'POST' })
                 .then(function(resp) {
@@ -102,14 +162,61 @@ const SYSTEM_JS: &str = r#"
                 })
                 .catch(function(err) {
                     setRebootStatus('Error: ' + (err.message || err), 'flash-err');
-                    confirmBtn.disabled = false;
+                    rebootBtn.disabled = false;
+                });
+        });
+    }
+
+    var renameBtn = document.getElementById('system-codename-confirm');
+    if (renameBtn) {
+        renameBtn.addEventListener('click', function() {
+            var input = document.getElementById('system-codename-input');
+            if (!(input instanceof HTMLInputElement)) { return; }
+            renameBtn.disabled = true;
+            setCodenameStatus('Saving…', '');
+            fetch('/api/system/codename', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ codename: String(input.value || '').trim().toLowerCase() })
+            })
+                .then(function(resp) {
+                    if (!resp.ok) {
+                        return resp.text().then(function(text) {
+                            throw new Error(text || ('HTTP ' + resp.status));
+                        });
+                    }
+                    return resp.json();
+                })
+                .then(function(data) {
+                    var codename = String((data && data.codename) || '').trim();
+                    if (codename) { applyCodename(codename); }
+                    closeCodenameModal();
+                })
+                .catch(function(err) {
+                    setCodenameStatus('Error: ' + (err.message || err), 'flash-err');
+                })
+                .finally(function() {
+                    renameBtn.disabled = false;
                 });
         });
     }
 
     window.addEventListener('keydown', function(ev) {
+        var codenameModal = document.getElementById('system-codename-modal');
         if (ev.key === 'Escape') {
             closeRebootModal();
+            closeCodenameModal();
+            return;
+        }
+        if (
+            ev.key === 'Enter' &&
+            codenameModal instanceof HTMLElement &&
+            !codenameModal.hidden &&
+            document.activeElement &&
+            document.activeElement.id === 'system-codename-input' &&
+            renameBtn
+        ) {
+            renameBtn.click();
         }
     });
 })();
@@ -134,6 +241,38 @@ pub fn SystemPage() -> impl IntoView {
                     Some(Ok(about)) => view! { <SystemSections about=about /> }.into_any(),
                 }}
             </Suspense>
+            <div class="modal-backdrop" id="system-codename-modal" hidden>
+                <div class="modal-card">
+                    <div class="modal-header">
+                        <h2 class="modal-title">"Rename codename"</h2>
+                        <button type="button" class="modal-close" data-close-system-codename>"×"</button>
+                    </div>
+                    <div class="modal-form">
+                        <p class="card-body-text">
+                            "Set a new 8-character codename using letters and digits."
+                        </p>
+                        <input
+                            type="text"
+                            id="system-codename-input"
+                            class="form-input system-codename-input"
+                            maxlength="8"
+                            spellcheck="false"
+                            autocapitalize="none"
+                            autocomplete="off"
+                        />
+                        <p class="system-codename-hint">"Exactly 8 letters or digits."</p>
+                        <div id="system-codename-status"></div>
+                        <div class="modal-actions">
+                            <button type="button" class="btn-secondary" data-close-system-codename>
+                                "Cancel"
+                            </button>
+                            <button type="button" id="system-codename-confirm" class="btn-primary">
+                                "Rename"
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
             <div class="modal-backdrop" id="system-reboot-modal" hidden>
                 <div class="modal-card">
                     <div class="modal-header">
@@ -183,6 +322,15 @@ fn SystemAboutSection(about: SystemAbout) -> impl IntoView {
                 <div class="info-row">
                     <span class="info-label">"Serial"</span>
                     <code class="info-value">{about.serial}</code>
+                </div>
+                <div class="info-row">
+                    <span class="info-label">"Codename"</span>
+                    <div class="system-codename-row">
+                        <code class="info-value" data-system-codename-value>{about.codename}</code>
+                        <button type="button" class="btn-secondary system-codename-btn" id="system-codename-open">
+                            "Rename"
+                        </button>
+                    </div>
                 </div>
                 <div class="info-row">
                     <span class="info-label">"Hostname"</span>

@@ -77,6 +77,7 @@ pub struct PluginSummaryDto {
     pub service: String,
     pub developer: String,
     pub channel: Option<String>,
+    pub webview: Option<u16>,
     pub binary_name: String,
     pub bin_path: Option<String>,
     pub sha256: String,

@@ -107,6 +107,8 @@ struct PluginManifest {
     channel: Option<String>,
     #[serde(default)]
     github_url: Option<String>,
+    #[serde(default)]
+    webview: Option<u16>,
     #[serde(default, alias = "bin_path")]
     symlink: Option<String>,
 }
@@ -148,6 +150,7 @@ struct PluginRecord {
     developer: String,
     channel: Option<String>,
     github_url: Option<String>,
+    webview: Option<u16>,
     binary_name: String,
     bin_path: Option<String>,
     sha256: String,
@@ -171,6 +174,7 @@ pub struct PluginSummary {
     pub developer: String,
     pub channel: Option<String>,
     pub github_url: Option<String>,
+    pub webview: Option<u16>,
     pub binary_name: String,
     pub bin_path: Option<String>,
     pub sha256: String,
@@ -514,6 +518,7 @@ pub fn install_plugin(
                 developer: package.manifest.developer.clone(),
                 channel: normalize_channel(package.manifest.channel.as_deref())?,
                 github_url: normalize_github_url(package.manifest.github_url.as_deref()),
+                webview: normalize_webview_port(package.manifest.webview)?,
                 binary_name: package.binary_name.clone(),
                 bin_path: package.bin_path.clone(),
                 sha256: package.sha256.clone(),
@@ -1025,6 +1030,7 @@ fn discover_plugin_record(
         developer: manifest.developer,
         channel: normalize_channel(manifest.channel.as_deref())?,
         github_url: normalize_github_url(manifest.github_url.as_deref()),
+        webview: normalize_webview_port(manifest.webview)?,
         binary_name,
         bin_path: normalize_bin_path(manifest.symlink.as_deref())?,
         sha256,
@@ -1058,6 +1064,7 @@ fn validate_manifest(manifest: &PluginManifest) -> PluginResult<()> {
     }
     let _ = normalize_channel(manifest.channel.as_deref())?;
     let _ = normalize_github_url(manifest.github_url.as_deref());
+    let _ = normalize_webview_port(manifest.webview)?;
     normalize_bin_path(manifest.symlink.as_deref())?;
     derive_binary_name(manifest.service.trim()).map(|_| ())
 }
@@ -1305,6 +1312,16 @@ fn normalize_github_url(github_url: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn normalize_webview_port(webview: Option<u16>) -> PluginResult<Option<u16>> {
+    match webview {
+        Some(0) => Err(PluginError::bad_request(
+            "plugin webview port must be between 1 and 65535",
+        )),
+        Some(port) => Ok(Some(port)),
+        None => Ok(None),
+    }
 }
 
 fn normalize_channel(channel: Option<&str>) -> PluginResult<Option<String>> {
@@ -1844,6 +1861,7 @@ fn init_db(conn: &Connection) -> PluginResult<()> {
             developer TEXT NOT NULL,
             channel TEXT,
             github_url TEXT,
+            webview INTEGER,
             binary_name TEXT NOT NULL,
             bin_path TEXT,
             sha256 TEXT NOT NULL DEFAULT '',
@@ -1885,6 +1903,12 @@ fn init_db(conn: &Connection) -> PluginResult<()> {
     ensure_column_exists(
         conn,
         "plugins",
+        "webview",
+        "ALTER TABLE plugins ADD COLUMN webview INTEGER",
+    )?;
+    ensure_column_exists(
+        conn,
+        "plugins",
         "target_name",
         "ALTER TABLE plugins ADD COLUMN target_name TEXT",
     )?;
@@ -1909,7 +1933,7 @@ fn init_db(conn: &Connection) -> PluginResult<()> {
 
 fn load_plugin(conn: &Connection, plugin_id: &str) -> PluginResult<Option<PluginRecord>> {
     conn.query_row(
-        "SELECT id, name, description, version, service, developer, channel, github_url, binary_name, bin_path, sha256, install_dir, package_path, official, enabled, removable, target_name, installed_at, updated_at
+        "SELECT id, name, description, version, service, developer, channel, github_url, webview, binary_name, bin_path, sha256, install_dir, package_path, official, enabled, removable, target_name, installed_at, updated_at
          FROM plugins
          WHERE id = ?1",
         params![plugin_id],
@@ -1923,17 +1947,18 @@ fn load_plugin(conn: &Connection, plugin_id: &str) -> PluginResult<Option<Plugin
                 developer: row.get(5)?,
                 channel: row.get(6)?,
                 github_url: row.get(7)?,
-                binary_name: row.get(8)?,
-                bin_path: row.get(9)?,
-                sha256: row.get(10)?,
-                install_dir: row.get(11)?,
-                package_path: row.get(12)?,
-                official: row.get::<_, i64>(13)? != 0,
-                enabled: row.get::<_, i64>(14)? != 0,
-                removable: row.get::<_, i64>(15)? != 0,
-                target_name: row.get(16)?,
-                installed_at: row.get(17)?,
-                updated_at: row.get(18)?,
+                webview: row.get(8)?,
+                binary_name: row.get(9)?,
+                bin_path: row.get(10)?,
+                sha256: row.get(11)?,
+                install_dir: row.get(12)?,
+                package_path: row.get(13)?,
+                official: row.get::<_, i64>(14)? != 0,
+                enabled: row.get::<_, i64>(15)? != 0,
+                removable: row.get::<_, i64>(16)? != 0,
+                target_name: row.get(17)?,
+                installed_at: row.get(18)?,
+                updated_at: row.get(19)?,
             })
         },
     )
@@ -1944,7 +1969,7 @@ fn load_plugin(conn: &Connection, plugin_id: &str) -> PluginResult<Option<Plugin
 fn load_all_plugins(conn: &Connection) -> PluginResult<Vec<PluginRecord>> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, name, description, version, service, developer, channel, github_url, binary_name, bin_path, sha256, install_dir, package_path, official, enabled, removable, target_name, installed_at, updated_at
+            "SELECT id, name, description, version, service, developer, channel, github_url, webview, binary_name, bin_path, sha256, install_dir, package_path, official, enabled, removable, target_name, installed_at, updated_at
              FROM plugins
              ORDER BY name COLLATE NOCASE, id",
         )
@@ -1961,17 +1986,18 @@ fn load_all_plugins(conn: &Connection) -> PluginResult<Vec<PluginRecord>> {
                 developer: row.get(5)?,
                 channel: row.get(6)?,
                 github_url: row.get(7)?,
-                binary_name: row.get(8)?,
-                bin_path: row.get(9)?,
-                sha256: row.get(10)?,
-                install_dir: row.get(11)?,
-                package_path: row.get(12)?,
-                official: row.get::<_, i64>(13)? != 0,
-                enabled: row.get::<_, i64>(14)? != 0,
-                removable: row.get::<_, i64>(15)? != 0,
-                target_name: row.get(16)?,
-                installed_at: row.get(17)?,
-                updated_at: row.get(18)?,
+                webview: row.get(8)?,
+                binary_name: row.get(9)?,
+                bin_path: row.get(10)?,
+                sha256: row.get(11)?,
+                install_dir: row.get(12)?,
+                package_path: row.get(13)?,
+                official: row.get::<_, i64>(14)? != 0,
+                enabled: row.get::<_, i64>(15)? != 0,
+                removable: row.get::<_, i64>(16)? != 0,
+                target_name: row.get(17)?,
+                installed_at: row.get(18)?,
+                updated_at: row.get(19)?,
             })
         })
         .map_err(|err| PluginError::internal(format!("query plugins: {err}")))?;
@@ -2000,6 +2026,7 @@ fn build_plugin_summaries(
             developer: record.developer,
             channel: record.channel,
             github_url: record.github_url,
+            webview: record.webview,
             binary_name: record.binary_name,
             bin_path: record.bin_path,
             sha256: record.sha256,
@@ -2182,6 +2209,7 @@ fn sync_core_plugins(conn: &Connection, core_plugins: &[CorePluginSpec]) -> Plug
                 developer: manifest.developer,
                 channel: normalize_channel(manifest.channel.as_deref())?,
                 github_url: normalize_github_url(manifest.github_url.as_deref()),
+                webview: normalize_webview_port(manifest.webview)?,
                 binary_name,
                 bin_path: manifest_bin_path,
                 sha256,
@@ -2206,8 +2234,8 @@ fn sync_core_plugins(conn: &Connection, core_plugins: &[CorePluginSpec]) -> Plug
 fn upsert_plugin(conn: &Connection, record: PluginRecord) -> PluginResult<()> {
     conn.execute(
         "INSERT INTO plugins (
-            id, name, description, version, service, developer, channel, github_url, binary_name, bin_path, sha256, install_dir, package_path, official, enabled, removable, target_name, installed_at, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+            id, name, description, version, service, developer, channel, github_url, webview, binary_name, bin_path, sha256, install_dir, package_path, official, enabled, removable, target_name, installed_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
         ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             description = excluded.description,
@@ -2216,6 +2244,7 @@ fn upsert_plugin(conn: &Connection, record: PluginRecord) -> PluginResult<()> {
             developer = excluded.developer,
             channel = excluded.channel,
             github_url = excluded.github_url,
+            webview = excluded.webview,
             binary_name = excluded.binary_name,
             bin_path = excluded.bin_path,
             sha256 = excluded.sha256,
@@ -2236,6 +2265,7 @@ fn upsert_plugin(conn: &Connection, record: PluginRecord) -> PluginResult<()> {
             record.developer,
             record.channel,
             record.github_url,
+            record.webview,
             record.binary_name,
             record.bin_path,
             record.sha256,
@@ -2595,12 +2625,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_zero_webview_port() {
+        let err = normalize_webview_port(Some(0)).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
     fn parses_plugin_package() {
         let zip_bytes = build_test_plugin_zip();
         let package = parse_plugin_package(&zip_bytes).unwrap();
         assert_eq!(package.id, "kaonic-plugin-sample");
         assert_eq!(package.manifest.name, "Sample");
         assert_eq!(package.manifest.channel.as_deref(), Some("experimental"));
+        assert_eq!(package.manifest.webview, Some(8780));
         assert_eq!(package.sha256.len(), 64);
         assert_eq!(package.custom_files.len(), 2);
         assert_eq!(
@@ -2615,14 +2652,20 @@ mod tests {
     fn parses_plugin_package_sig_signature() {
         let zip_bytes = build_test_plugin_zip_with_signature("kaonic-plugin-sample.sig");
         let package = parse_plugin_package(&zip_bytes).unwrap();
-        assert_eq!(package.signature_bytes.as_deref(), Some(b"signature-bytes".as_slice()));
+        assert_eq!(
+            package.signature_bytes.as_deref(),
+            Some(b"signature-bytes".as_slice())
+        );
     }
 
     #[test]
     fn parses_plugin_package_legacy_sign_signature() {
         let zip_bytes = build_test_plugin_zip_with_signature("kaonic-plugin-sample.sign");
         let package = parse_plugin_package(&zip_bytes).unwrap();
-        assert_eq!(package.signature_bytes.as_deref(), Some(b"signature-bytes".as_slice()));
+        assert_eq!(
+            package.signature_bytes.as_deref(),
+            Some(b"signature-bytes".as_slice())
+        );
     }
 
     #[test]
@@ -2729,6 +2772,7 @@ service = "kaonic-plugin-sample.service"
 developer = "Beechat"
 channel = "stable"
 github_url = "https://github.com/BeechatNetworkSystemsLtd/kaonic-gateway"
+webview = 8780
 "#,
         )
         .unwrap();
@@ -2757,6 +2801,7 @@ github_url = "https://github.com/BeechatNetworkSystemsLtd/kaonic-gateway"
         assert_eq!(plugins[0].id, "kaonic-plugin-sample");
         assert_eq!(plugins[0].service, "kaonic-plugin-sample.service");
         assert_eq!(plugins[0].channel.as_deref(), Some("stable"));
+        assert_eq!(plugins[0].webview, Some(8780));
         assert_eq!(plugins[0].sha256, binary_hash);
     }
 
@@ -2974,7 +3019,7 @@ channel = "experimental"
         fs::write(
             plugin_dir.join(MANIFEST_NAME),
             format!(
-                "[kaonic-plugin]\nname = \"Gateway From Manifest\"\ndescription = \"Loaded from kaonic-plugin.toml\"\nversion = \"0.9.0\"\nservice = \"kaonic-gateway.service\"\ndeveloper = \"Manifest Dev\"\nchannel = \"stable\"\ngithub_url = \"https://example.invalid/gateway\"\nsymlink = \"{}\"\n",
+                "[kaonic-plugin]\nname = \"Gateway From Manifest\"\ndescription = \"Loaded from kaonic-plugin.toml\"\nversion = \"0.9.0\"\nservice = \"kaonic-gateway.service\"\ndeveloper = \"Manifest Dev\"\nchannel = \"stable\"\ngithub_url = \"https://example.invalid/gateway\"\nwebview = 8085\nsymlink = \"{}\"\n",
                 target.symlink_path.display()
             ),
         )
@@ -3009,6 +3054,7 @@ channel = "experimental"
             plugins[0].bin_path.as_deref(),
             Some(target.symlink_path.to_string_lossy().as_ref())
         );
+        assert_eq!(plugins[0].webview, Some(8085));
         assert_eq!(plugins[0].version, "1.2.3");
     }
 
@@ -3091,6 +3137,7 @@ developer = "Beechat"
                     developer: "Beechat".into(),
                     channel: Some("stable".into()),
                     github_url: None,
+                    webview: None,
                     binary_name: "kaonic-plugin-sample".into(),
                     bin_path: None,
                     sha256: previous_hash.clone(),
@@ -3165,7 +3212,7 @@ developer = "Beechat"
             let options = SimpleFileOptions::default();
             writer.start_file(MANIFEST_NAME, options).unwrap();
             let manifest = format!(
-                "[kaonic-plugin]\nname = \"Sample\"\ndescription = \"Sample plugin\"\nversion = \"0.1.0\"\nservice = \"kaonic-plugin-sample.service\"\ndeveloper = \"Beechat\"\nchannel = \"{channel}\"\ngithub_url = \"https://github.com/BeechatNetworkSystemsLtd/kaonic-gateway\"\n"
+                "[kaonic-plugin]\nname = \"Sample\"\ndescription = \"Sample plugin\"\nversion = \"0.1.0\"\nservice = \"kaonic-plugin-sample.service\"\ndeveloper = \"Beechat\"\nchannel = \"{channel}\"\ngithub_url = \"https://github.com/BeechatNetworkSystemsLtd/kaonic-gateway\"\nwebview = 8780\n"
             );
             writer.write_all(manifest.as_bytes()).unwrap();
             writer

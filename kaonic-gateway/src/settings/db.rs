@@ -11,6 +11,9 @@ const DEFAULT_NETWORK: &str = "10.20.0.0/16";
 const DEFAULT_ANNOUNCE_FREQ_SECS: u32 = 5;
 const DEFAULT_ADVERTISED_ROUTES: &str = "[\"192.168.10.0/24\"]";
 const DEFAULT_ALLOW_ALL_PEERS: bool = true;
+const CODENAME_KEY: &str = "system_codename";
+const CODENAME_LEN: usize = 8;
+const CODENAME_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 
 pub struct Database {
     conn: Connection,
@@ -70,6 +73,20 @@ impl Database {
         self.set(key, &seed)?;
         log::info!("generated new seed for '{key}'");
         Ok(seed)
+    }
+
+    pub fn load_or_create_codename(&self) -> Result<String> {
+        if let Some(codename) = self.get(CODENAME_KEY)? {
+            return Ok(codename);
+        }
+        let codename = generate_codename();
+        self.set(CODENAME_KEY, &codename)?;
+        log::info!("generated system codename '{codename}'");
+        Ok(codename)
+    }
+
+    pub fn save_codename(&self, codename: &str) -> Result<()> {
+        self.set(CODENAME_KEY, codename)
     }
 
     pub fn load_config(&self) -> Result<GatewayConfig> {
@@ -183,5 +200,43 @@ impl Database {
             &serde_json::to_string(&cfg.modulation).unwrap(),
         )?;
         Ok(())
+    }
+}
+
+fn generate_codename() -> String {
+    let mut bytes = [0u8; CODENAME_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    bytes
+        .into_iter()
+        .map(|byte| CODENAME_ALPHABET[(byte as usize) % CODENAME_ALPHABET.len()] as char)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Database;
+
+    #[test]
+    fn codename_is_created_once_and_persisted() {
+        let db = Database::open(":memory:").expect("open db");
+
+        let first = db.load_or_create_codename().expect("create codename");
+        let second = db.load_or_create_codename().expect("load codename");
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 8);
+        assert!(first.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn codename_can_be_overridden() {
+        let db = Database::open(":memory:").expect("open db");
+
+        db.save_codename("abcd1234").expect("save codename");
+
+        assert_eq!(
+            db.load_or_create_codename().expect("load codename"),
+            "abcd1234"
+        );
     }
 }

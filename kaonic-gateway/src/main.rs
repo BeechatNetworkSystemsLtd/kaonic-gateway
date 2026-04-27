@@ -99,6 +99,15 @@ async fn async_main() -> Result<(), process::ExitCode> {
             process::exit(1);
         });
 
+    let codename = settings
+        .lock()
+        .unwrap()
+        .load_or_create_codename()
+        .unwrap_or_else(|err| {
+            eprintln!("failed to load codename from database: {err}");
+            process::exit(1);
+        });
+
     env_logger::Builder::new()
         .parse_filters(
             "warn,kaonic_gateway=trace,kaonic_vpn=debug,kaonic_reticulum=warn,reticulum=warn",
@@ -112,6 +121,7 @@ async fn async_main() -> Result<(), process::ExitCode> {
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
     log::info!("device serial: {serial}");
+    log::info!("system codename: {codename}");
 
     if webapp_only {
         log::info!("starting in webapp-only mode; skipping radio and transport initialization");

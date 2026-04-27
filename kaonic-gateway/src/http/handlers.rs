@@ -11,6 +11,7 @@ use kaonic_gateway::audio::{
 use kaonic_gateway::config::GatewayConfig;
 use kaonic_gateway::network::{read_interface_ipv4, NetworkError, WifiAntenna, WifiMode};
 use kaonic_gateway::radio::{transmit_test_frame, RadioModuleConfig};
+use kaonic_gateway::settings::normalize_codename;
 use kaonic_gateway::system_metrics::{
     is_gateway_service_unit, read_cpu_percent_async, read_fs_mb, read_gateway_services,
     read_mem_mb, read_os_details,
@@ -199,6 +200,34 @@ pub async fn post_radio_test(
 pub async fn post_system_reboot() -> Result<Json<SystemActionResponse>, (StatusCode, String)> {
     let status = request_system_reboot().map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
     Ok(Json(SystemActionResponse { status }))
+}
+
+pub async fn post_system_codename(
+    State(state): State<AppState>,
+    Json(request): Json<SetSystemCodenameRequest>,
+) -> Result<Json<SystemCodenameResponse>, (StatusCode, String)> {
+    let codename = normalize_codename(&request.codename)
+        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+
+    {
+        let settings = state.settings.lock().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "settings lock poisoned".to_string(),
+            )
+        })?;
+        settings.save_codename(&codename).map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to save codename: {err}"),
+            )
+        })?;
+    }
+
+    Ok(Json(SystemCodenameResponse {
+        status: "Codename updated".into(),
+        codename,
+    }))
 }
 
 pub async fn post_system_service_restart(
@@ -483,6 +512,11 @@ pub struct ServiceActionRequest {
     pub unit: String,
 }
 
+#[derive(Deserialize)]
+pub struct SetSystemCodenameRequest {
+    pub codename: String,
+}
+
 #[derive(Serialize)]
 pub struct AudioSaveResponse {
     pub status: String,
@@ -496,6 +530,12 @@ pub struct RadioTestResponse {
 #[derive(Serialize)]
 pub struct SystemActionResponse {
     pub status: String,
+}
+
+#[derive(Serialize)]
+pub struct SystemCodenameResponse {
+    pub status: String,
+    pub codename: String,
 }
 
 #[derive(Serialize)]

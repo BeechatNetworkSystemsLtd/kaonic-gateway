@@ -11,6 +11,17 @@ use crate::pages::{
     radio::RadioPage, reticulum::ReticulumPage, update::SystemPage, vpn::VpnPage,
 };
 
+const VPN_SHORTCUT_REDIRECT_JS: &str = r#"
+(function() {
+    try {
+        var params = new URLSearchParams(window.location.search || '');
+        if (!params.has('vpn-add-peer')) { return; }
+        if (window.location.pathname === '/vpn') { return; }
+        window.location.replace('/vpn' + (window.location.search || '') + (window.location.hash || ''));
+    } catch (_) {}
+})();
+"#;
+
 pub fn shell(options: leptos::config::LeptosOptions) -> impl IntoView {
     let _ = options;
     view! {
@@ -24,6 +35,7 @@ pub fn shell(options: leptos::config::LeptosOptions) -> impl IntoView {
             </head>
             <body>
                 <App/>
+                <script>{VPN_SHORTCUT_REDIRECT_JS}</script>
             </body>
         </html>
     }
