@@ -40,6 +40,13 @@ jobs:
             manifest_path: kaonic-gateway/kaonic-plugin.toml
             service_path: kaonic-gateway/kaonic-gateway.service
             files_dir: kaonic-gateway/files
+          - plugin_id: kaonic-audio-ptt
+            crate: kaonic-audio-ptt
+            binary: kaonic-audio-ptt
+            service: kaonic-audio-ptt.service
+            manifest_path: kaonic-audio-ptt/kaonic-plugin.toml
+            service_path: kaonic-audio-ptt/kaonic-audio-ptt.service
+            files_dir: kaonic-audio-ptt/files
 
     steps:
       - name: Checkout repository
