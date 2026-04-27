@@ -1,10 +1,11 @@
 [kaonic-plugin]
 name = "Kaonic Audio PTT"
-description = "Standalone ALSA-based push-to-talk service with PCM audio over UDP/VPN for native mobile and browser clients."
+description = "Standalone ALSA-based push-to-talk service with PCM audio over Reticulum"
 version = "0.1.0"
 service = "kaonic-audio-ptt.service"
 developer = "Beechat Network Systems Ltd"
 channel = "experimental"
 github_url = "https://github.com/BeechatNetworkSystemsLtd/kaonic-gateway"
 webview = 8780
+tls = true
 symlink = "/usr/bin/kaonic-audio-ptt"

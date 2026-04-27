@@ -1286,6 +1286,16 @@ select.field-input {
   color: var(--text-muted);
 }
 
+.system-download-link {
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.system-download-link:hover {
+  text-decoration: underline;
+}
+
 .update-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;

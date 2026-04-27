@@ -2,6 +2,7 @@ use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use super::PageTitle;
+use crate::local_https;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SystemAbout {
@@ -14,6 +15,10 @@ pub struct SystemAbout {
     cpu_cores: usize,
     ram_total_mb: u64,
     fs_total_mb: u64,
+    certs_dir: String,
+    tls_cert_path: String,
+    tls_key_path: String,
+    root_ca_available: bool,
 }
 
 #[server]
@@ -32,6 +37,14 @@ pub async fn load_system_about() -> Result<SystemAbout, ServerFnError> {
         .map_err(|_| ServerFnError::new("settings lock poisoned"))?
         .load_or_create_codename()
         .map_err(|err| ServerFnError::new(err.to_string()))?;
+    let certs_dir = match local_https::ensure_root_ca_files() {
+        Ok(path) => path,
+        Err(err) => {
+            log::warn!("failed to ensure local Root CA files exist: {err}");
+            local_https::certs_dir()
+        }
+    };
+    let root_ca_available = local_https::root_ca_cert_path_for(&certs_dir).is_file();
     let (_, ram_total_mb) = read_mem_mb();
     let (_, fs_total_mb) = read_fs_mb();
 
@@ -45,6 +58,18 @@ pub async fn load_system_about() -> Result<SystemAbout, ServerFnError> {
         cpu_cores: read_cpu_cores(),
         ram_total_mb,
         fs_total_mb,
+        certs_dir: certs_dir.display().to_string(),
+        tls_cert_path: std::env::current_dir()
+            .unwrap_or_else(|_| ".".into())
+            .join(local_https::PLUGIN_TLS_CERT_FILE)
+            .display()
+            .to_string(),
+        tls_key_path: std::env::current_dir()
+            .unwrap_or_else(|_| ".".into())
+            .join(local_https::PLUGIN_TLS_KEY_FILE)
+            .display()
+            .to_string(),
+        root_ca_available,
     })
 }
 
@@ -343,6 +368,38 @@ fn SystemAboutSection(about: SystemAbout) -> impl IntoView {
                 <div class="info-row">
                     <span class="info-label">"Arch"</span>
                     <span class="info-value">{about.architecture}</span>
+                </div>
+                <div class="info-row">
+                    <span class="info-label">"Certs dir"</span>
+                    <code class="info-value">{about.certs_dir}</code>
+                </div>
+                <div class="info-row">
+                    <span class="info-label">"Root CA"</span>
+                    <span class="info-value">
+                        {if about.root_ca_available {
+                            view! {
+                                <a class="system-download-link" href="/api/system/rootca">
+                                    "Download rootca.crt"
+                                </a>
+                            }.into_any()
+                        } else {
+                            view! {
+                                <span>
+                                    "Generation failed; expected "
+                                    <code>"rootca.crt"</code>
+                                    " in the certs dir for browser download."
+                                </span>
+                            }.into_any()
+                        }}
+                    </span>
+                </div>
+                <div class="info-row">
+                    <span class="info-label">"TLS cert"</span>
+                    <code class="info-value">{about.tls_cert_path}</code>
+                </div>
+                <div class="info-row">
+                    <span class="info-label">"TLS key"</span>
+                    <code class="info-value">{about.tls_key_path}</code>
                 </div>
             </div>
 

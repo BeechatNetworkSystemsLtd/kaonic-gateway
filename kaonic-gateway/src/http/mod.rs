@@ -4,13 +4,14 @@ pub(crate) mod ws;
 
 use std::net::SocketAddr;
 
-use axum::extract::Path;
-use axum::http::header;
-use axum::response::IntoResponse;
+use axum::extract::{OriginalUri, Path, State};
+use axum::http::{header, HeaderMap};
+use axum::response::{IntoResponse, Redirect};
 use axum::{
-    routing::{delete, get, post},
+    routing::{any, delete, get, post},
     Router,
 };
+use kaonic_gateway::local_https;
 use leptos::config::LeptosOptions;
 use leptos::prelude::*;
 use leptos_axum::{generate_route_list, LeptosRoutes};
@@ -22,13 +23,18 @@ pub use kaonic_gateway::state::{AppState, SharedSettings};
 #[folder = "assets/"]
 struct Assets;
 
-/// Start the HTTP server: Leptos SSR pages + REST/WebSocket API. Runs forever.
-pub async fn serve(state: AppState, addr: SocketAddr) {
+#[derive(Clone)]
+struct RedirectState {
+    https_addr: SocketAddr,
+}
+
+/// Start the gateway web listeners: HTTP redirect + HTTPS app. Runs forever.
+pub async fn serve(state: AppState, http_addr: SocketAddr, https_addr: SocketAddr) {
     let leptos_options = LeptosOptions::builder()
         .output_name("kaonic-gateway")
         .site_root(".")
         .site_pkg_dir("pkg")
-        .site_addr(addr)
+        .site_addr(https_addr)
         .build();
 
     ws::spawn_status_publishers(state.clone());
@@ -64,6 +70,7 @@ pub async fn serve(state: AppState, addr: SocketAddr) {
         )
         .route("/api/radio/{module}/test", post(handlers::post_radio_test))
         .route("/api/system/codename", post(handlers::post_system_codename))
+        .route("/api/system/rootca", get(handlers::get_system_rootca))
         .route("/api/system/reboot", post(handlers::post_system_reboot))
         .route(
             "/api/system/service/restart",
@@ -86,6 +93,10 @@ pub async fn serve(state: AppState, addr: SocketAddr) {
             get(installer::installer_version),
         )
         .route("/api/plugins/install", post(installer::install_plugin))
+        .route(
+            "/api/plugins/kaonic-installer/upgrade",
+            post(installer::upgrade_installer_binary),
+        )
         .route(
             "/api/plugins/{plugin_id}/upload",
             post(installer::upload_plugin),
@@ -133,12 +144,31 @@ pub async fn serve(state: AppState, addr: SocketAddr) {
 
     let app = api.merge(leptos_app);
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .expect("failed to bind HTTP listener");
+    let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+        local_https::PLUGIN_TLS_CERT_FILE,
+        local_https::PLUGIN_TLS_KEY_FILE,
+    )
+    .await
+    .expect("failed to load HTTPS certificate files");
+    let redirect_app = Router::new()
+        .fallback(any(redirect_to_https))
+        .with_state(RedirectState { https_addr });
 
-    log::info!("HTTP server listening on http://{addr}");
-    axum::serve(listener, app).await.expect("HTTP server error");
+    log::info!("HTTP redirect listening on http://{http_addr}");
+    log::info!("HTTPS server listening on https://{https_addr}");
+    let http_server = axum::serve(
+        tokio::net::TcpListener::bind(http_addr)
+            .await
+            .expect("failed to bind HTTP redirect listener"),
+        redirect_app,
+    );
+    let https_server =
+        axum_server::bind_rustls(https_addr, tls_config).serve(app.into_make_service());
+
+    tokio::select! {
+        result = http_server => result.expect("HTTP redirect server error"),
+        result = https_server => result.expect("HTTPS server error"),
+    }
 }
 
 // ── Asset handlers ────────────────────────────────────────────────────────────
@@ -180,4 +210,42 @@ async fn file_and_error_handler(
         req,
     )
     .await
+}
+
+async fn redirect_to_https(
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    State(state): State<RedirectState>,
+) -> Redirect {
+    let authority = https_authority(
+        headers
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok()),
+        state.https_addr,
+    );
+    Redirect::permanent(&format!("https://{authority}{}", uri))
+}
+
+fn https_authority(host: Option<&str>, https_addr: SocketAddr) -> String {
+    let fallback = https_addr.ip().to_string();
+    let raw_host = host.unwrap_or(&fallback);
+    let normalized_host = strip_port(raw_host);
+    if https_addr.port() == 443 {
+        normalized_host.to_string()
+    } else {
+        format!("{normalized_host}:{}", https_addr.port())
+    }
+}
+
+fn strip_port(host: &str) -> &str {
+    if host.starts_with('[') {
+        if let Some(end) = host.find(']') {
+            return &host[..=end];
+        }
+        return host;
+    }
+    if host.matches(':').count() == 1 {
+        return host.split(':').next().unwrap_or(host);
+    }
+    host
 }

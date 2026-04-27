@@ -26,6 +26,7 @@ kaonic-reticulum = { path = "../kaonic-reticulum" }
 reticulum        = { git = "https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs", branch = "fix/add-timer-configs" }
 kaonic-vpn       = { path = "../kaonic-vpn", features = ["run"] }
 axum             = { version = "0.8", features = ["ws"] }
+axum-server      = { version = "0.7", features = ["tls-rustls"] }
 leptos_axum      = { version = "0.8" }
 tokio            = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "fs"] }
 tokio-util       = "0.7"
@@ -38,8 +39,12 @@ rand             = "0.8"
 rusqlite         = { version = "0.31", features = ["bundled"] }
 cidr             = { version = "0.2", features = ["serde"] }
 crc32fast        = "1"
-reqwest          = { version = "0.12", features = ["json", "multipart"], default-features = false }
+p256            = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+reqwest          = { version = "0.12", features = ["json", "multipart", "rustls-tls"], default-features = false }
+rcgen            = { version = "0.13", features = ["crypto", "pem", "ring"] }
+rustls           = { version = "0.23", features = ["ring"] }
 rust-embed       = "8"
 mime_guess       = "2"
 libc             = "0.2"
 qrcodegen        = "1.8"
+sha2             = "0.10"

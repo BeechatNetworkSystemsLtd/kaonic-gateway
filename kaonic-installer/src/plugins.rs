@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::http::StatusCode;
+use kaonic_gateway::local_https;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -109,6 +110,8 @@ struct PluginManifest {
     github_url: Option<String>,
     #[serde(default)]
     webview: Option<u16>,
+    #[serde(default)]
+    tls: bool,
     #[serde(default, alias = "bin_path")]
     symlink: Option<String>,
 }
@@ -151,6 +154,7 @@ struct PluginRecord {
     channel: Option<String>,
     github_url: Option<String>,
     webview: Option<u16>,
+    tls: bool,
     binary_name: String,
     bin_path: Option<String>,
     sha256: String,
@@ -175,6 +179,7 @@ pub struct PluginSummary {
     pub channel: Option<String>,
     pub github_url: Option<String>,
     pub webview: Option<u16>,
+    pub tls: bool,
     pub binary_name: String,
     pub bin_path: Option<String>,
     pub sha256: String,
@@ -441,6 +446,11 @@ pub fn install_plugin(
         make_executable(&binary_path)
             .map_err(|err| PluginError::internal(format!("chmod plugin binary: {err}")))?;
         install_custom_files(&current_dir, &package.custom_files)?;
+        if package.manifest.tls {
+            local_https::ensure_plugin_tls_files(&current_dir, &package.id).map_err(|err| {
+                PluginError::internal(format!("generate plugin TLS files: {err}"))
+            })?;
+        }
         fs::write(&package_path, normalized_zip.as_ref())
             .map_err(|err| PluginError::internal(format!("persist plugin package: {err}")))?;
         fs::write(&manifest_path, package.manifest_raw.as_bytes())
@@ -519,6 +529,7 @@ pub fn install_plugin(
                 channel: normalize_channel(package.manifest.channel.as_deref())?,
                 github_url: normalize_github_url(package.manifest.github_url.as_deref()),
                 webview: normalize_webview_port(package.manifest.webview)?,
+                tls: package.manifest.tls,
                 binary_name: package.binary_name.clone(),
                 bin_path: package.bin_path.clone(),
                 sha256: package.sha256.clone(),
@@ -959,7 +970,13 @@ fn discover_plugin_record(
 
     let service_name = manifest.service.trim().to_string();
     let binary_name = derive_binary_name(&service_name)?;
-    let binary_path = plugin_dir.join("current").join(&binary_name);
+    let current_dir = plugin_dir.join("current");
+    if manifest.tls && current_dir.is_dir() {
+        local_https::ensure_plugin_tls_files(&current_dir, &binary_name).map_err(|err| {
+            PluginError::internal(format!("generate discovered plugin TLS files: {err}"))
+        })?;
+    }
+    let binary_path = current_dir.join(&binary_name);
     let service_path = plugin_dir.join(&service_name);
     let hash_path = plugin_dir.join(format!("{}.sha256", binary_name));
     let package_path = plugin_dir.join("package.zip");
@@ -1031,6 +1048,7 @@ fn discover_plugin_record(
         channel: normalize_channel(manifest.channel.as_deref())?,
         github_url: normalize_github_url(manifest.github_url.as_deref()),
         webview: normalize_webview_port(manifest.webview)?,
+        tls: manifest.tls,
         binary_name,
         bin_path: normalize_bin_path(manifest.symlink.as_deref())?,
         sha256,
@@ -1862,6 +1880,7 @@ fn init_db(conn: &Connection) -> PluginResult<()> {
             channel TEXT,
             github_url TEXT,
             webview INTEGER,
+            tls INTEGER NOT NULL DEFAULT 0,
             binary_name TEXT NOT NULL,
             bin_path TEXT,
             sha256 TEXT NOT NULL DEFAULT '',
@@ -1909,6 +1928,12 @@ fn init_db(conn: &Connection) -> PluginResult<()> {
     ensure_column_exists(
         conn,
         "plugins",
+        "tls",
+        "ALTER TABLE plugins ADD COLUMN tls INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column_exists(
+        conn,
+        "plugins",
         "target_name",
         "ALTER TABLE plugins ADD COLUMN target_name TEXT",
     )?;
@@ -1933,7 +1958,7 @@ fn init_db(conn: &Connection) -> PluginResult<()> {
 
 fn load_plugin(conn: &Connection, plugin_id: &str) -> PluginResult<Option<PluginRecord>> {
     conn.query_row(
-        "SELECT id, name, description, version, service, developer, channel, github_url, webview, binary_name, bin_path, sha256, install_dir, package_path, official, enabled, removable, target_name, installed_at, updated_at
+        "SELECT id, name, description, version, service, developer, channel, github_url, webview, tls, binary_name, bin_path, sha256, install_dir, package_path, official, enabled, removable, target_name, installed_at, updated_at
          FROM plugins
          WHERE id = ?1",
         params![plugin_id],
@@ -1948,17 +1973,18 @@ fn load_plugin(conn: &Connection, plugin_id: &str) -> PluginResult<Option<Plugin
                 channel: row.get(6)?,
                 github_url: row.get(7)?,
                 webview: row.get(8)?,
-                binary_name: row.get(9)?,
-                bin_path: row.get(10)?,
-                sha256: row.get(11)?,
-                install_dir: row.get(12)?,
-                package_path: row.get(13)?,
-                official: row.get::<_, i64>(14)? != 0,
-                enabled: row.get::<_, i64>(15)? != 0,
-                removable: row.get::<_, i64>(16)? != 0,
-                target_name: row.get(17)?,
-                installed_at: row.get(18)?,
-                updated_at: row.get(19)?,
+                tls: row.get::<_, i64>(9)? != 0,
+                binary_name: row.get(10)?,
+                bin_path: row.get(11)?,
+                sha256: row.get(12)?,
+                install_dir: row.get(13)?,
+                package_path: row.get(14)?,
+                official: row.get::<_, i64>(15)? != 0,
+                enabled: row.get::<_, i64>(16)? != 0,
+                removable: row.get::<_, i64>(17)? != 0,
+                target_name: row.get(18)?,
+                installed_at: row.get(19)?,
+                updated_at: row.get(20)?,
             })
         },
     )
@@ -1969,7 +1995,7 @@ fn load_plugin(conn: &Connection, plugin_id: &str) -> PluginResult<Option<Plugin
 fn load_all_plugins(conn: &Connection) -> PluginResult<Vec<PluginRecord>> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, name, description, version, service, developer, channel, github_url, webview, binary_name, bin_path, sha256, install_dir, package_path, official, enabled, removable, target_name, installed_at, updated_at
+            "SELECT id, name, description, version, service, developer, channel, github_url, webview, tls, binary_name, bin_path, sha256, install_dir, package_path, official, enabled, removable, target_name, installed_at, updated_at
              FROM plugins
              ORDER BY name COLLATE NOCASE, id",
         )
@@ -1987,17 +2013,18 @@ fn load_all_plugins(conn: &Connection) -> PluginResult<Vec<PluginRecord>> {
                 channel: row.get(6)?,
                 github_url: row.get(7)?,
                 webview: row.get(8)?,
-                binary_name: row.get(9)?,
-                bin_path: row.get(10)?,
-                sha256: row.get(11)?,
-                install_dir: row.get(12)?,
-                package_path: row.get(13)?,
-                official: row.get::<_, i64>(14)? != 0,
-                enabled: row.get::<_, i64>(15)? != 0,
-                removable: row.get::<_, i64>(16)? != 0,
-                target_name: row.get(17)?,
-                installed_at: row.get(18)?,
-                updated_at: row.get(19)?,
+                tls: row.get::<_, i64>(9)? != 0,
+                binary_name: row.get(10)?,
+                bin_path: row.get(11)?,
+                sha256: row.get(12)?,
+                install_dir: row.get(13)?,
+                package_path: row.get(14)?,
+                official: row.get::<_, i64>(15)? != 0,
+                enabled: row.get::<_, i64>(16)? != 0,
+                removable: row.get::<_, i64>(17)? != 0,
+                target_name: row.get(18)?,
+                installed_at: row.get(19)?,
+                updated_at: row.get(20)?,
             })
         })
         .map_err(|err| PluginError::internal(format!("query plugins: {err}")))?;
@@ -2027,6 +2054,7 @@ fn build_plugin_summaries(
             channel: record.channel,
             github_url: record.github_url,
             webview: record.webview,
+            tls: record.tls,
             binary_name: record.binary_name,
             bin_path: record.bin_path,
             sha256: record.sha256,
@@ -2171,6 +2199,12 @@ fn sync_core_plugins(conn: &Connection, core_plugins: &[CorePluginSpec]) -> Plug
         let sha256 = read_trimmed(&hash_path)
             .unwrap_or_else(|| sha256_file(&spec.target.binary_path).unwrap_or_default());
         let current_binary_path = plugin_binary_target(&spec.plugin_dir, &binary_name);
+        let current_dir = spec.plugin_dir.join("current");
+        if manifest.tls && current_dir.is_dir() {
+            local_https::ensure_plugin_tls_files(&current_dir, &spec.plugin_id).map_err(|err| {
+                PluginError::internal(format!("generate built-in plugin TLS files: {err}"))
+            })?;
+        }
         let installed_at = first_available_timestamp(&[
             spec.plugin_dir.as_path(),
             manifest_path.as_path(),
@@ -2210,6 +2244,7 @@ fn sync_core_plugins(conn: &Connection, core_plugins: &[CorePluginSpec]) -> Plug
                 channel: normalize_channel(manifest.channel.as_deref())?,
                 github_url: normalize_github_url(manifest.github_url.as_deref()),
                 webview: normalize_webview_port(manifest.webview)?,
+                tls: manifest.tls,
                 binary_name,
                 bin_path: manifest_bin_path,
                 sha256,
@@ -2234,8 +2269,8 @@ fn sync_core_plugins(conn: &Connection, core_plugins: &[CorePluginSpec]) -> Plug
 fn upsert_plugin(conn: &Connection, record: PluginRecord) -> PluginResult<()> {
     conn.execute(
         "INSERT INTO plugins (
-            id, name, description, version, service, developer, channel, github_url, webview, binary_name, bin_path, sha256, install_dir, package_path, official, enabled, removable, target_name, installed_at, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+            id, name, description, version, service, developer, channel, github_url, webview, tls, binary_name, bin_path, sha256, install_dir, package_path, official, enabled, removable, target_name, installed_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
         ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             description = excluded.description,
@@ -2245,6 +2280,7 @@ fn upsert_plugin(conn: &Connection, record: PluginRecord) -> PluginResult<()> {
             channel = excluded.channel,
             github_url = excluded.github_url,
             webview = excluded.webview,
+            tls = excluded.tls,
             binary_name = excluded.binary_name,
             bin_path = excluded.bin_path,
             sha256 = excluded.sha256,
@@ -2266,6 +2302,7 @@ fn upsert_plugin(conn: &Connection, record: PluginRecord) -> PluginResult<()> {
             record.channel,
             record.github_url,
             record.webview,
+            if record.tls { 1 } else { 0 },
             record.binary_name,
             record.bin_path,
             record.sha256,

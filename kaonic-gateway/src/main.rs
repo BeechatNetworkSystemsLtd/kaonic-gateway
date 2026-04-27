@@ -13,6 +13,7 @@ use crc32fast::hash as crc32_hash;
 use env_logger;
 use http::{AppState, SharedSettings};
 use kaonic_gateway::gateway_reticulum::GatewayReticulum;
+use kaonic_gateway::local_https;
 use kaonic_gateway::radio::{
     attach_radio_interface, connect_radio_client, SharedErrorObserver, SharedRadioClient,
     SharedTxObserver,
@@ -80,6 +81,7 @@ fn main() -> Result<(), process::ExitCode> {
 
 async fn async_main() -> Result<(), process::ExitCode> {
     let cmd = Command::parse();
+    let https_addr = std::net::SocketAddr::new(cmd.http_addr.ip(), 443);
 
     let db_path =
         std::env::var("KAONIC_GATEWAY_DB_PATH").unwrap_or_else(|_| DEFAULT_DB_PATH.to_string());
@@ -122,6 +124,15 @@ async fn async_main() -> Result<(), process::ExitCode> {
         .unwrap_or_else(|_| "unknown".to_string());
     log::info!("device serial: {serial}");
     log::info!("system codename: {codename}");
+    local_https::install_rustls_crypto_provider();
+    if let Err(err) = local_https::ensure_root_ca_files() {
+        log::warn!("failed to prepare local Root CA files: {err}");
+    }
+    if let Ok(current_dir) = std::env::current_dir() {
+        if let Err(err) = local_https::ensure_plugin_tls_files(&current_dir, "kaonic-gateway") {
+            log::warn!("failed to prepare gateway plugin TLS files: {err}");
+        }
+    }
 
     if webapp_only {
         log::info!("starting in webapp-only mode; skipping radio and transport initialization");
@@ -139,7 +150,7 @@ async fn async_main() -> Result<(), process::ExitCode> {
             serial,
         );
 
-        tokio::spawn(http::serve(app_state, cmd.http_addr));
+        tokio::spawn(http::serve(app_state, cmd.http_addr, https_addr));
         shutdown_signal(CancellationToken::new()).await;
         return Ok(());
     }
@@ -363,7 +374,7 @@ async fn async_main() -> Result<(), process::ExitCode> {
         });
     }
 
-    tokio::spawn(http::serve(app_state, cmd.http_addr));
+    tokio::spawn(http::serve(app_state, cmd.http_addr, https_addr));
 
     shutdown_signal(cancel.clone()).await;
 

@@ -9,6 +9,7 @@ use kaonic_gateway::audio::{
     AudioCardSnapshot, AudioControlSnapshot, AudioControlState, AudioError, AudioOutput,
 };
 use kaonic_gateway::config::GatewayConfig;
+use kaonic_gateway::local_https;
 use kaonic_gateway::network::{read_interface_ipv4, NetworkError, WifiAntenna, WifiMode};
 use kaonic_gateway::radio::{transmit_test_frame, RadioModuleConfig};
 use kaonic_gateway::settings::normalize_codename;
@@ -47,6 +48,41 @@ pub async fn get_serial(State(state): State<AppState>) -> impl IntoResponse {
         )],
         state.serial.clone(),
     )
+}
+
+pub async fn get_system_rootca() -> Result<impl IntoResponse, (StatusCode, String)> {
+    let path = local_https::root_ca_cert_path();
+    let bytes = tokio::fs::read(&path).await.map_err(|err| {
+        let status = if err.kind() == std::io::ErrorKind::NotFound {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        (
+            status,
+            format!(
+                "failed to read root CA certificate {}: {err}",
+                path.display()
+            ),
+        )
+    })?;
+
+    Ok((
+        [
+            (
+                header::CONTENT_TYPE,
+                "application/x-x509-ca-cert".to_string(),
+            ),
+            (
+                header::CONTENT_DISPOSITION,
+                format!(
+                    "attachment; filename=\"{}\"",
+                    local_https::ROOT_CA_DOWNLOAD_NAME
+                ),
+            ),
+        ],
+        bytes,
+    ))
 }
 
 /// `GET /api/settings` — return the full gateway config.
@@ -385,10 +421,23 @@ pub async fn post_vpn_speed_test(
         return Err((StatusCode::NOT_FOUND, "peer tunnel IP not found".into()));
     }
 
-    let url = format!("http://{peer_ip}/");
+    let url = format!("https://{peer_ip}/");
+    let root_ca_pem = std::fs::read(local_https::root_ca_cert_path()).map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to read local Root CA certificate: {err}"),
+        )
+    })?;
+    let root_ca = reqwest::Certificate::from_pem(&root_ca_pem).map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to parse local Root CA certificate: {err}"),
+        )
+    })?;
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(3))
         .timeout(Duration::from_secs(15))
+        .add_root_certificate(root_ca)
         .build()
         .map_err(|err| {
             (

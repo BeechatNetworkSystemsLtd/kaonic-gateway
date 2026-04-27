@@ -172,7 +172,7 @@ fn default_advertised_route_strings(routes: Vec<String>) -> Vec<String> {
 }
 
 fn vpn_add_peer_url(hash: &str, codename: &str) -> String {
-    format!("http://192.168.10.1/vpn?vpn-add-peer={hash}&codename={codename}")
+    format!("https://192.168.10.1/vpn?vpn-add-peer={hash}&codename={codename}")
 }
 
 fn split_hash_rows(value: &str, row_len: usize) -> Vec<String> {
@@ -1757,7 +1757,7 @@ mod tests {
     fn builds_shortcut_url_for_external_scanner() {
         assert_eq!(
             vpn_add_peer_url("0123456789abcdef0123456789abcdef", "abcd1234"),
-            "http://192.168.10.1/vpn?vpn-add-peer=0123456789abcdef0123456789abcdef&codename=abcd1234"
+            "https://192.168.10.1/vpn?vpn-add-peer=0123456789abcdef0123456789abcdef&codename=abcd1234"
         );
     }
 }

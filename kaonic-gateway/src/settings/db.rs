@@ -225,7 +225,9 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first.len(), 8);
-        assert!(first.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        assert!(first
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
     }
 
     #[test]

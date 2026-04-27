@@ -6,4 +6,5 @@ service = "kaonic-gateway.service"
 developer = "Beechat Network Systems Ltd"
 channel = "stable"
 github_url = "https://github.com/BeechatNetworkSystemsLtd/kaonic-gateway"
+tls = true
 symlink = "/usr/bin/kaonic-gateway"

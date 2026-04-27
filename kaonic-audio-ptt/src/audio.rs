@@ -148,6 +148,7 @@ pub async fn playback_loop(
     cfg: PluginConfig,
     mut frames: mpsc::Receiver<Vec<i16>>,
     cancel: CancellationToken,
+    stats: std::sync::Arc<crate::Stats>,
 ) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
@@ -178,6 +179,7 @@ pub async fn playback_loop(
                 _ = cancel.cancelled() => break,
                 next = frames.recv() => {
                     let Some(frame) = next else { break; };
+                    let sample_count = frame.len();
                     let mut raw = Vec::with_capacity(frame.len() * 2);
                     for sample in frame {
                         raw.extend_from_slice(&sample.to_le_bytes());
@@ -186,6 +188,7 @@ pub async fn playback_loop(
                         .write_all(&raw)
                         .await
                         .map_err(|err| format!("write aplay frame: {err}"))?;
+                    stats.record_played_frame(sample_count);
                 }
             }
         }
@@ -203,7 +206,9 @@ pub async fn playback_loop(
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 next = frames.recv() => {
-                    if next.is_none() {
+                    if let Some(frame) = next {
+                        stats.record_played_frame(frame.len());
+                    } else {
                         break;
                     }
                 }

@@ -2,10 +2,12 @@ mod audio;
 mod codec;
 mod config;
 
-use std::net::SocketAddr;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -15,19 +17,30 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
 use futures_util::StreamExt;
+use kaonic_gateway::local_https;
+use kaonic_reticulum::KaonicCtrlInterface;
+use reticulum::destination::link::{LinkEvent, LinkStatus};
+use reticulum::destination::{DestinationDesc, DestinationName, SingleInputDestination};
+use reticulum::hash::AddressHash;
+use reticulum::identity::PrivateIdentity;
+use reticulum::transport::{TimerConfig, Transport, TransportConfig};
 use serde::{Deserialize, Serialize};
-use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::audio::{frame_samples, AudioDevices};
 use crate::codec::{RxCodec, TxCodec};
-use crate::config::{load_or_create_config, resolve_config_path, save_config, PluginConfig};
+use crate::config::{
+    load_or_create_config, normalize_selected_peer, resolve_config_path, save_config, PluginConfig,
+};
 
-const PACKET_MAGIC: [u8; 4] = *b"KPT1";
+const PACKET_MAGIC: [u8; 4] = *b"KPT2";
 const PACKET_HEADER_LEN: usize = 8;
 const PLAYBACK_BUFFER_FRAMES: usize = 64;
+const AUDIO_PTT_ANNOUNCE_MAGIC: &[u8] = b"KAP1";
+const PLUGIN_TLS_CERT_FILE: &str = "plugin-tls.crt";
+const PLUGIN_TLS_KEY_FILE: &str = "plugin-tls.key";
 const BROWSER_PAGE: &str = r#"<!doctype html>
 <html lang="en">
 <head>
@@ -42,107 +55,309 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
     body {
       margin: 0;
       min-height: 100vh;
+      background: #0f172a;
+      color: #e2e8f0;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-touch-callout: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .app {
+      min-height: 100vh;
+      display: flex;
+      align-items: stretch;
+    }
+    .sidebar {
+      width: min(25rem, 100%);
+      padding: 1.4rem 1.15rem;
+      background: rgba(2, 6, 23, 0.82);
+      border-right: 1px solid #1e293b;
+      box-sizing: border-box;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+    .content {
+      flex: 1;
+      min-width: 0;
+      padding: 1.5rem;
       display: flex;
       align-items: center;
       justify-content: center;
-      background: #0f172a;
-      color: #e2e8f0;
+      box-sizing: border-box;
     }
-    .app {
-      width: min(92vw, 30rem);
-      padding: 1.5rem;
+    .sidebar-header h1 {
+      margin: 0 0 0.35rem;
+      font-size: 1.6rem;
+    }
+    .sidebar-header p {
+      margin: 0;
+      color: #94a3b8;
+      line-height: 1.45;
+      font-size: 0.96rem;
+    }
+    .contacts-title {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      color: #cbd5e1;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+    }
+    .contacts-count {
+      font-size: 0.85rem;
+      color: #94a3b8;
+      font-weight: 600;
+    }
+    .peer-list {
+      display: grid;
+      gap: 0.7rem;
+      overflow-y: auto;
+      padding-right: 0.2rem;
+    }
+    .peer-card {
+      width: 100%;
+      text-align: left;
+      border: 1px solid #1f2937;
+      background: #111827;
+      color: inherit;
+      border-radius: 1rem;
+      padding: 0.95rem 1rem;
+      cursor: pointer;
+      transition: border-color 0.18s ease, transform 0.18s ease, background 0.18s ease;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    .peer-card:hover {
+      border-color: #334155;
+      transform: translateY(-1px);
+    }
+    .peer-card.is-selected {
+      border-color: #2563eb;
+      background: #0f1f47;
+      box-shadow: inset 0 0 0 1px rgba(37, 99, 235, 0.35);
+    }
+    .peer-card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+      margin-bottom: 0.45rem;
+    }
+    .peer-name {
+      font-size: 0.98rem;
+      font-weight: 700;
+      color: #f8fafc;
+      word-break: break-all;
+    }
+    .peer-status {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      white-space: nowrap;
+      font-size: 0.82rem;
+      color: #cbd5e1;
+    }
+    .status-dot {
+      width: 0.65rem;
+      height: 0.65rem;
+      border-radius: 999px;
+      background: #64748b;
+      box-shadow: 0 0 0 0.2rem rgba(100, 116, 139, 0.12);
+    }
+    .status-dot.is-online {
+      background: #22c55e;
+      box-shadow: 0 0 0 0.2rem rgba(34, 197, 94, 0.14);
+    }
+    .status-dot.is-waiting {
+      background: #f59e0b;
+      box-shadow: 0 0 0 0.2rem rgba(245, 158, 11, 0.14);
+    }
+    .peer-subtitle {
+      color: #94a3b8;
+      font-size: 0.84rem;
+      line-height: 1.35;
+      word-break: break-word;
+    }
+    .empty-peers {
+      padding: 1rem;
+      border: 1px dashed #334155;
+      border-radius: 1rem;
+      color: #94a3b8;
       text-align: center;
+      line-height: 1.5;
+    }
+    .ptt-shell {
+      width: min(100%, 40rem);
+      padding: 1.7rem;
       background: #111827;
       border: 1px solid #1f2937;
-      border-radius: 1.25rem;
+      border-radius: 1.4rem;
       box-shadow: 0 24px 48px rgba(0,0,0,0.35);
+      text-align: center;
     }
-    h1 {
-      margin: 0 0 0.5rem;
-      font-size: 1.8rem;
+    .selection-card {
+      margin-bottom: 1.2rem;
+      padding: 1rem 1.1rem;
+      border-radius: 1rem;
+      border: 1px solid #1f2937;
+      background: #0b1220;
     }
-    .lead {
-      margin: 0 0 1rem;
+    .selection-label {
       color: #94a3b8;
+      font-size: 0.86rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 0.35rem;
     }
-    .config {
-      display: flex;
-      gap: 0.5rem;
-      margin: 0 0 1rem;
-    }
-    .config input {
-      flex: 1;
-      min-width: 0;
-      border: 1px solid #334155;
-      background: #020617;
-      color: #e2e8f0;
-      border-radius: 0.8rem;
-      padding: 0.9rem 1rem;
-      font-size: 1rem;
-    }
-    .config button {
-      border: 0;
-      border-radius: 0.8rem;
-      padding: 0.9rem 1rem;
-      font-size: 1rem;
+    .selection-name {
+      font-size: 1.05rem;
       font-weight: 700;
-      color: white;
-      background: #2563eb;
+      color: #f8fafc;
+      word-break: break-all;
+      margin-bottom: 0.5rem;
+    }
+    .selection-status {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+      color: #cbd5e1;
+      font-size: 0.92rem;
+    }
+    .mic-wrap {
+      display: flex;
+      justify-content: center;
+      margin: 1.35rem 0 1rem;
     }
     .mic-btn {
-      width: 15rem;
-      height: 15rem;
-      max-width: 72vw;
-      max-height: 72vw;
+      width: min(20rem, 62vw);
+      height: min(20rem, 62vw);
       border: 0;
       border-radius: 999px;
       background: linear-gradient(180deg, #ef4444, #b91c1c);
       color: white;
-      font-size: 1.35rem;
+      font-size: 1.55rem;
       font-weight: 800;
       box-shadow: 0 20px 40px rgba(239, 68, 68, 0.35);
       touch-action: none;
       user-select: none;
+      -webkit-user-select: none;
+      -webkit-touch-callout: none;
+      transition: transform 0.16s ease, box-shadow 0.16s ease, opacity 0.16s ease;
+    }
+    .mic-btn:focus {
+      outline: none;
+    }
+    .mic-btn:disabled {
+      opacity: 0.6;
     }
     .mic-btn.is-active {
       transform: scale(0.97);
       background: linear-gradient(180deg, #fb7185, #e11d48);
-      box-shadow: 0 0 0 0.6rem rgba(251, 113, 133, 0.18);
+      box-shadow: 0 0 0 0.85rem rgba(251, 113, 133, 0.18);
     }
     .status {
-      margin-top: 1rem;
-      min-height: 2.5rem;
+      min-height: 5.5rem;
       color: #cbd5e1;
       font-size: 0.98rem;
       white-space: pre-line;
+      line-height: 1.45;
+    }
+    .playback-status {
+      margin-top: 1rem;
+      padding: 0.95rem 1rem;
+      border-radius: 1rem;
+      border: 1px solid #1f2937;
+      background: #0b1220;
+      text-align: left;
+    }
+    .playback-status-title {
+      color: #cbd5e1;
+      font-size: 0.82rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 0.55rem;
+    }
+    .playback-status-body {
+      color: #cbd5e1;
+      font-size: 0.92rem;
+      white-space: pre-line;
+      line-height: 1.45;
     }
     .hint {
       margin-top: 0.75rem;
       color: #94a3b8;
       font-size: 0.9rem;
+      line-height: 1.5;
+    }
+    @media (max-width: 880px) {
+      .app {
+        flex-direction: column;
+      }
+      .sidebar {
+        width: 100%;
+        border-right: 0;
+        border-bottom: 1px solid #1e293b;
+      }
+      .content {
+        padding-top: 1rem;
+      }
+      .ptt-shell {
+        width: 100%;
+      }
     }
   </style>
 </head>
 <body>
   <main class="app">
-    <h1>Kaonic Audio PTT</h1>
-    <p class="lead">Hold the microphone button to talk from this browser.</p>
-    <div class="config">
-      <input id="remote-peer" type="text" placeholder="Remote peer, e.g. 10.8.0.42:6790" />
-      <button id="save-peer" type="button">Save</button>
-    </div>
-    <button id="mic-btn" class="mic-btn" type="button">Hold to Talk</button>
-    <div id="status" class="status">Loading…</div>
-    <div class="hint">Remote Kaonic should run audio-ptt and listen on its media port.</div>
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <h1>Kaonic Audio PTT</h1>
+        <p>Select a contact on the left. Online contacts can be called immediately; offline ones stay saved until their Reticulum link appears.</p>
+      </div>
+      <div class="contacts-title">
+        <span>Contacts</span>
+        <span id="contacts-count" class="contacts-count">0 peers</span>
+      </div>
+      <div id="peer-list" class="peer-list">
+        <div class="empty-peers">Loading contacts…</div>
+      </div>
+    </aside>
+    <section class="content">
+      <div class="ptt-shell">
+        <div class="selection-card">
+          <div class="selection-label">Selected contact</div>
+          <div id="selected-peer-name" class="selection-name">No contact selected</div>
+          <div id="selected-peer-status" class="selection-status">
+            <span class="status-dot"></span>
+            <span>Choose a contact from the list</span>
+          </div>
+        </div>
+        <div class="mic-wrap">
+          <button id="mic-btn" class="mic-btn" type="button">Hold to Talk</button>
+        </div>
+        <div class="playback-status">
+          <div class="playback-status-title">Last received audio</div>
+          <div id="playback-status" class="playback-status-body">Waiting for audio…</div>
+        </div>
+        <div id="status" class="status">Loading…</div>
+        <div class="hint">Audio is sent over Reticulum links and played by the remote Kaonic audio-ptt plugin on ALSA output.</div>
+      </div>
+    </section>
   </main>
   <script>
     (function () {
       const SAMPLE_RATE = 16000;
       const FRAME_SAMPLES = 320;
+      const STATUS_POLL_MS = 3000;
       const micBtn = document.getElementById('mic-btn');
       const statusEl = document.getElementById('status');
-      const remotePeerInput = document.getElementById('remote-peer');
-      const savePeerBtn = document.getElementById('save-peer');
+      const playbackStatusEl = document.getElementById('playback-status');
+      const peerListEl = document.getElementById('peer-list');
+      const contactsCountEl = document.getElementById('contacts-count');
+      const selectedPeerNameEl = document.getElementById('selected-peer-name');
+      const selectedPeerStatusEl = document.getElementById('selected-peer-status');
 
       let stream = null;
       let audioContext = null;
@@ -153,32 +368,187 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
       let queue = [];
       let starting = false;
       let active = false;
-      let currentConfig = null;
+      let currentStatus = null;
+      let pollHandle = null;
+      let streamPromise = null;
 
       function setStatus(text) {
         statusEl.textContent = text;
       }
 
+      function setPlaybackStatus(text) {
+        playbackStatusEl.textContent = text;
+      }
+
+      async function primeMicrophone() {
+        if (stream && stream.active && stream.getTracks().some(function (track) { return track.readyState === 'live'; })) {
+          return stream;
+        }
+        if (!streamPromise) {
+          streamPromise = navigator.mediaDevices.getUserMedia({
+            audio: {
+              channelCount: 1,
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true
+            }
+          }).then(function (mediaStream) {
+            stream = mediaStream;
+            return mediaStream;
+          }).finally(function () {
+            streamPromise = null;
+          });
+        }
+        return streamPromise;
+      }
+
+      function selectedPeer() {
+        return currentStatus && currentStatus.config ? currentStatus.config.selected_peer : null;
+      }
+
+      function selectedPeerSnapshot() {
+        const selected = selectedPeer();
+        const peers = (currentStatus && currentStatus.peers) || [];
+        return peers.find(function (peer) { return peer.hash === selected; }) || null;
+      }
+
+      function peersWithSavedSelection() {
+        const peers = ((currentStatus && currentStatus.peers) || []).slice();
+        const selected = selectedPeer();
+        if (selected && !peers.some(function (peer) { return peer.hash === selected; })) {
+          peers.unshift({
+            hash: selected,
+            status: 'waiting',
+            last_seen_ts: 0
+          });
+        }
+        return peers;
+      }
+
+      function syncTalkButton() {
+        const peer = selectedPeerSnapshot();
+        micBtn.disabled = !peer || peer.status !== 'active';
+      }
+
+      function statusClass(status) {
+        if (status === 'active') { return 'is-online'; }
+        if (status === 'connecting' || status === 'pending' || status === 'waiting') { return 'is-waiting'; }
+        return '';
+      }
+
+      function statusLabel(status) {
+        if (status === 'active') { return 'Online'; }
+        if (status === 'connecting') { return 'Connecting'; }
+        if (status === 'pending') { return 'Pending'; }
+        if (status === 'waiting') { return 'Waiting for announce'; }
+        return 'Offline';
+      }
+
+      function peerSubtitle(peer) {
+        if (peer.last_seen_ts) {
+          return 'Last seen ' + new Date(peer.last_seen_ts * 1000).toLocaleTimeString();
+        }
+        if (peer.status === 'active') {
+          return 'Ready to talk';
+        }
+        return 'Saved contact';
+      }
+
+      function renderPeerList() {
+        const peers = peersWithSavedSelection();
+        contactsCountEl.textContent = peers.length === 1 ? '1 peer' : (peers.length + ' peers');
+        if (!peers.length) {
+          peerListEl.innerHTML = '<div class="empty-peers">No discovered contacts yet.\nWait for a Reticulum announce from another Kaonic audio-ptt node.</div>';
+          return;
+        }
+        const selected = selectedPeer();
+        peerListEl.innerHTML = peers.map(function (peer) {
+          const chosen = peer.hash === selected ? ' is-selected' : '';
+          const label = statusLabel(peer.status);
+          return ''
+            + '<button type="button" class="peer-card' + chosen + '" data-peer-hash="' + peer.hash + '">'
+            +   '<div class="peer-card-header">'
+            +     '<div class="peer-name">' + peer.hash + '</div>'
+            +     '<div class="peer-status"><span class="status-dot ' + statusClass(peer.status) + '"></span><span>' + label + '</span></div>'
+            +   '</div>'
+            +   '<div class="peer-subtitle">' + peerSubtitle(peer) + '</div>'
+            + '</button>';
+        }).join('');
+        peerListEl.querySelectorAll('[data-peer-hash]').forEach(function (button) {
+          button.addEventListener('click', function () {
+            choosePeer(button.getAttribute('data-peer-hash')).catch(function (err) {
+              setStatus('Error: ' + (err && err.message ? err.message : err));
+            });
+          });
+        });
+      }
+
+      function renderSelectedPeerCard() {
+        const selected = selectedPeer();
+        const peer = selectedPeerSnapshot();
+        if (!selected) {
+          selectedPeerNameEl.textContent = 'No contact selected';
+          selectedPeerStatusEl.innerHTML = '<span class="status-dot"></span><span>Choose a contact from the list</span>';
+          return;
+        }
+        selectedPeerNameEl.textContent = selected;
+        const status = peer ? peer.status : 'waiting';
+        selectedPeerStatusEl.innerHTML =
+          '<span class="status-dot ' + statusClass(status) + '"></span>' +
+          '<span>' + statusLabel(status) + '</span>';
+      }
+
       async function loadStatus() {
         const resp = await fetch('/api/status');
         const data = await resp.json();
-        currentConfig = data.config;
-        remotePeerInput.value = data.config.remote_peer || '';
-        setStatus(
-          'Remote peer: ' + (data.config.remote_peer || 'not configured') +
-          '\nPlayback device: ' + data.config.playback_device +
-          '\nCapture device: ' + data.config.capture_device
-        );
+        currentStatus = data;
+        renderPeerList();
+        renderSelectedPeerCard();
+        syncTalkButton();
+        const peer = selectedPeerSnapshot();
+        const lines = [
+          'My destination: ' + data.local_destination,
+          'Selected contact: ' + (selectedPeer() || 'not configured'),
+          'Link state: ' + (peer ? statusLabel(peer.status) : 'Waiting for announce'),
+          'Playback device: ' + data.config.playback_device,
+          'Capture device: ' + data.config.capture_device
+        ];
+        if (data.transmitting) {
+          lines.push('Transmit source: ' + (data.active_source || 'active'));
+        }
+        setStatus(lines.join('\n'));
+
+        const playbackLines = [];
+        playbackLines.push('Last source: ' + (data.last_remote || 'No audio received yet'));
+        playbackLines.push('Played frames: ' + data.played_frames);
+        playbackLines.push('Dropped frames: ' + data.playback_drops);
+        if (data.last_played_ts) {
+          playbackLines.push('Last played: ' + new Date(data.last_played_ts * 1000).toLocaleTimeString());
+        } else {
+          playbackLines.push('Last played: Waiting for audio');
+        }
+        if (data.last_played_samples) {
+          playbackLines.push('Last frame: ' + data.last_played_samples + ' samples');
+        }
+        if (data.last_playback_error) {
+          const when = data.last_playback_error_ts
+            ? ' at ' + new Date(data.last_playback_error_ts * 1000).toLocaleTimeString()
+            : '';
+          playbackLines.push('Last error: ' + data.last_playback_error + when);
+        } else {
+          playbackLines.push('Last error: None');
+        }
+        setPlaybackStatus(playbackLines.join('\n'));
       }
 
-      async function saveRemotePeer() {
-        if (!currentConfig) {
+      async function saveSelectedPeer(peerHash) {
+        if (!currentStatus) {
           await loadStatus();
         }
         const payload = {
-          remote_peer: remotePeerInput.value.trim() || null,
-          capture_device: currentConfig.capture_device,
-          playback_device: currentConfig.playback_device
+          selected_peer: peerHash || null,
+          capture_device: currentStatus.config.capture_device,
+          playback_device: currentStatus.config.playback_device
         };
         const resp = await fetch('/api/config', {
           method: 'PUT',
@@ -190,7 +560,14 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
           throw new Error(data.detail || ('HTTP ' + resp.status));
         }
         await loadStatus();
-        setStatus((data.detail || 'Remote peer saved') + '\nRemote peer: ' + (payload.remote_peer || 'not configured'));
+        setStatus((data.detail || 'Contact selected') + '\nSelected contact: ' + (payload.selected_peer || 'not configured'));
+      }
+
+      async function choosePeer(peerHash) {
+        if (!peerHash) {
+          return;
+        }
+        await saveSelectedPeer(peerHash);
       }
 
       function downsample(input, inputRate, outputRate) {
@@ -235,21 +612,20 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
 
       async function startTalk() {
         if (active || starting) { return; }
-        if (!remotePeerInput.value.trim()) {
-          setStatus('Configure remote peer first.');
+        const chosenPeer = selectedPeer();
+        if (!chosenPeer) {
+          setStatus('Select a contact first.');
+          return;
+        }
+        const peer = selectedPeerSnapshot();
+        if (!peer || peer.status !== 'active') {
+          setStatus('Selected contact is not online yet.');
           return;
         }
         starting = true;
         try {
-          await saveRemotePeer();
-          stream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-              channelCount: 1,
-              echoCancellation: true,
-              noiseSuppression: true,
-              autoGainControl: true
-            }
-          });
+          await saveSelectedPeer(chosenPeer);
+          await primeMicrophone();
           audioContext = new (window.AudioContext || window.webkitAudioContext)();
           sourceNode = audioContext.createMediaStreamSource(stream);
           processor = audioContext.createScriptProcessor(4096, 1, 1);
@@ -274,7 +650,7 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
           muteNode.connect(audioContext.destination);
           active = true;
           micBtn.classList.add('is-active');
-          setStatus('Talking… release to stop');
+          setStatus('Talking to ' + peer.hash + '… release to stop');
         } catch (err) {
           setStatus('Error: ' + (err && err.message ? err.message : err));
           await stopTalk();
@@ -304,10 +680,6 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
           try { await audioContext.close(); } catch (_) {}
           audioContext = null;
         }
-        if (stream) {
-          stream.getTracks().forEach(function (track) { track.stop(); });
-          stream = null;
-        }
         if (ws) {
           try { ws.close(); } catch (_) {}
           ws = null;
@@ -317,25 +689,39 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
 
       micBtn.addEventListener('pointerdown', function (event) {
         event.preventDefault();
+        if (document.activeElement instanceof HTMLElement) {
+          document.activeElement.blur();
+        }
         micBtn.setPointerCapture(event.pointerId);
         startTalk();
       });
       micBtn.addEventListener('pointerup', function () { stopTalk(); });
       micBtn.addEventListener('pointercancel', function () { stopTalk(); });
       micBtn.addEventListener('lostpointercapture', function () { stopTalk(); });
-      savePeerBtn.addEventListener('click', function () {
-        saveRemotePeer().catch(function (err) {
-          setStatus('Error: ' + (err && err.message ? err.message : err));
-        });
-      });
+      micBtn.addEventListener('contextmenu', function (event) { event.preventDefault(); });
 
       window.addEventListener('beforeunload', function () {
         stopTalk();
+        if (stream) {
+          stream.getTracks().forEach(function (track) { track.stop(); });
+          stream = null;
+        }
+        if (pollHandle) { clearInterval(pollHandle); }
       });
 
       loadStatus().catch(function (err) {
         setStatus('Error: ' + (err && err.message ? err.message : err));
       });
+      primeMicrophone().then(function () {
+        loadStatus().catch(function () {});
+      }).catch(function (err) {
+        setStatus('Microphone permission required: ' + (err && err.message ? err.message : err));
+      });
+      pollHandle = window.setInterval(function () {
+        loadStatus().catch(function (err) {
+          setStatus('Error: ' + (err && err.message ? err.message : err));
+        });
+      }, STATUS_POLL_MS);
     })();
   </script>
 </body>
@@ -353,7 +739,10 @@ struct Command {
 struct AppState {
     config_path: Arc<PathBuf>,
     config: Arc<RwLock<PluginConfig>>,
-    media_socket: Arc<UdpSocket>,
+    transport: Arc<Mutex<Transport>>,
+    destination: Arc<Mutex<SingleInputDestination>>,
+    local_destination: String,
+    peers: Arc<RwLock<HashMap<String, PeerState>>>,
     tx_session: Arc<Mutex<Option<ActiveTx>>>,
     stats: Arc<Stats>,
     playback_tx: mpsc::Sender<Vec<i16>>,
@@ -369,6 +758,13 @@ struct TxControl {
     handle: JoinHandle<()>,
 }
 
+#[derive(Clone)]
+struct PeerState {
+    desc: DestinationDesc,
+    status: String,
+    last_seen_ts: u64,
+}
+
 #[derive(Default)]
 struct Stats {
     transmitting: AtomicBool,
@@ -377,13 +773,45 @@ struct Stats {
     tx_bytes: AtomicU64,
     rx_bytes: AtomicU64,
     dropped_rx_while_talking: AtomicU64,
+    playback_drops: AtomicU64,
+    played_frames: AtomicU64,
+    last_played_ts: AtomicU64,
+    last_played_samples: AtomicU64,
+    last_playback_error_ts: AtomicU64,
     seq: AtomicU64,
-    last_remote: Mutex<Option<SocketAddr>>,
+    last_remote: Mutex<Option<String>>,
+    last_playback_error: StdMutex<Option<String>>,
+}
+
+impl Stats {
+    fn record_played_frame(&self, sample_count: usize) {
+        self.played_frames.fetch_add(1, Ordering::Relaxed);
+        self.last_played_samples
+            .store(sample_count as u64, Ordering::Relaxed);
+        self.last_played_ts.store(now_secs(), Ordering::Relaxed);
+    }
+
+    async fn record_playback_error(&self, detail: impl Into<String>) {
+        if let Ok(mut guard) = self.last_playback_error.lock() {
+            *guard = Some(detail.into());
+        }
+        self.last_playback_error_ts
+            .store(now_secs(), Ordering::Relaxed);
+    }
+
+    fn last_playback_error(&self) -> Option<String> {
+        self.last_playback_error
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
 }
 
 #[derive(Debug, Serialize)]
 struct StatusSnapshot {
     config: PluginConfig,
+    local_destination: String,
+    peers: Vec<PeerSnapshot>,
     transmitting: bool,
     active_source: Option<&'static str>,
     tx_packets: u64,
@@ -391,12 +819,25 @@ struct StatusSnapshot {
     tx_bytes: u64,
     rx_bytes: u64,
     dropped_rx_while_talking: u64,
-    last_remote: Option<SocketAddr>,
+    playback_drops: u64,
+    played_frames: u64,
+    last_played_ts: u64,
+    last_played_samples: u64,
+    last_playback_error_ts: u64,
+    last_remote: Option<String>,
+    last_playback_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PeerSnapshot {
+    hash: String,
+    status: String,
+    last_seen_ts: u64,
 }
 
 #[derive(Debug, Deserialize)]
 struct ConfigUpdate {
-    remote_peer: Option<SocketAddr>,
+    selected_peer: Option<String>,
     capture_device: String,
     playback_device: String,
 }
@@ -419,7 +860,7 @@ struct AudioDevicesResponse {
 #[tokio::main]
 async fn main() -> Result<(), std::process::ExitCode> {
     env_logger::Builder::new()
-        .parse_filters("info,kaonic_audio_ptt=debug")
+        .parse_filters("info,kaonic_audio_ptt=debug,reticulum=warn")
         .parse_default_env()
         .init();
 
@@ -432,37 +873,93 @@ async fn main() -> Result<(), std::process::ExitCode> {
         log::error!("load config {}: {err}", config_path.display());
         std::process::exit(1);
     });
+    local_https::install_rustls_crypto_provider();
 
-    let media_socket = Arc::new(UdpSocket::bind(cfg.media_bind).await.unwrap_or_else(|err| {
-        log::error!("bind media socket {}: {err}", cfg.media_bind);
+    let id = PrivateIdentity::new_from_name(&cfg.identity_seed);
+    let cancel = CancellationToken::new();
+    let radio_client = KaonicCtrlInterface::connect_client::<1400, 5>(
+        "0.0.0.0:0".parse().expect("listen addr"),
+        cfg.kaonic_ctrl_server,
+        cancel.clone(),
+    )
+    .await
+    .unwrap_or_else(|err| {
+        log::error!("connect kaonic-ctrl {}: {err:?}", cfg.kaonic_ctrl_server);
         std::process::exit(1);
-    }));
+    });
+    spawn_keepalive(radio_client.clone(), cancel.clone());
+
+    let mut transport_cfg = TransportConfig::new("kaonic-audio-ptt", &id, true);
+    transport_cfg.set_retransmit(true);
+    transport_cfg.set_timer_config(TimerConfig {
+        in_link_stale: Duration::from_secs(30),
+        in_link_close: Duration::from_secs(15),
+        out_link_restart: Duration::from_secs(45),
+        out_link_stale: Duration::from_secs(30),
+        out_link_close: Duration::from_secs(15),
+        out_link_repeat: Duration::from_secs(10),
+        out_link_keep: Duration::from_secs(5),
+        ..TimerConfig::default()
+    });
+    transport_cfg.set_restart_outlinks(true);
+    let transport = Arc::new(Mutex::new(Transport::new(transport_cfg)));
+
+    let iface = KaonicCtrlInterface::new(radio_client, cfg.rns_module.min(1), None, None);
+    let iface_mgr = transport.lock().await.iface_manager();
+    iface_mgr
+        .lock()
+        .await
+        .spawn(iface, KaonicCtrlInterface::spawn);
+
+    let destination = transport
+        .lock()
+        .await
+        .add_destination(id, DestinationName::new("kaonic", "audio-ptt"))
+        .await;
+    let local_destination = destination.lock().await.desc.address_hash.to_hex_string();
+    log::info!(
+        "kaonic-audio-ptt Reticulum destination {} via module {}",
+        local_destination,
+        cfg.rns_module.min(1)
+    );
+
     let (playback_tx, playback_rx) = mpsc::channel(PLAYBACK_BUFFER_FRAMES);
     let playback_cancel = CancellationToken::new();
-    let receiver_cancel = CancellationToken::new();
 
     let state = AppState {
         config_path: Arc::new(config_path),
         config: Arc::new(RwLock::new(cfg.clone())),
-        media_socket: media_socket.clone(),
+        transport: transport.clone(),
+        destination: destination.clone(),
+        local_destination,
+        peers: Arc::new(RwLock::new(HashMap::new())),
         tx_session: Arc::new(Mutex::new(None)),
         stats: Arc::new(Stats::default()),
         playback_tx,
     };
 
     let playback_cfg = cfg.clone();
+    let playback_stats = state.stats.clone();
     let playback_task = tokio::spawn(async move {
-        if let Err(err) = audio::playback_loop(playback_cfg, playback_rx, playback_cancel).await {
+        if let Err(err) = audio::playback_loop(
+            playback_cfg,
+            playback_rx,
+            playback_cancel,
+            playback_stats.clone(),
+        )
+        .await
+        {
+            playback_stats
+                .record_playback_error(format!("playback loop: {err}"))
+                .await;
             log::error!("playback loop: {err}");
         }
     });
 
-    let receiver_state = state.clone();
-    let receiver_task = tokio::spawn(async move {
-        if let Err(err) = receiver_loop(receiver_state, receiver_cancel).await {
-            log::error!("receiver loop: {err}");
-        }
-    });
+    spawn_announce_tx(state.clone(), cancel.clone());
+    spawn_announce_rx(state.clone(), cancel.clone());
+    spawn_out_link_events(state.clone(), cancel.clone());
+    spawn_in_link_events(state.clone(), cancel.clone());
 
     let app = Router::new()
         .route("/", get(get_browser_page))
@@ -474,19 +971,26 @@ async fn main() -> Result<(), std::process::ExitCode> {
         .route("/api/ptt/stop", post(post_ptt_stop))
         .with_state(state.clone());
 
-    log::info!("kaonic-audio-ptt listening on http://{}", cfg.http_bind);
-    let listener = tokio::net::TcpListener::bind(cfg.http_bind)
-        .await
-        .unwrap_or_else(|err| {
-            log::error!("bind HTTP listener {}: {err}", cfg.http_bind);
-            std::process::exit(1);
-        });
-    let server = axum::serve(listener, app);
+    let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+        PLUGIN_TLS_CERT_FILE,
+        PLUGIN_TLS_KEY_FILE,
+    )
+    .await
+    .unwrap_or_else(|err| {
+        log::error!(
+            "load plugin HTTPS certificate files {} and {}: {err}",
+            PLUGIN_TLS_CERT_FILE,
+            PLUGIN_TLS_KEY_FILE
+        );
+        std::process::exit(1);
+    });
+    log::info!("kaonic-audio-ptt listening on https://{}", cfg.http_bind);
+    let server = axum_server::bind_rustls(cfg.http_bind, tls_config).serve(app.into_make_service());
 
     tokio::select! {
         result = server => {
             if let Err(err) = result {
-                log::error!("HTTP server error: {err}");
+                log::error!("HTTPS server error: {err}");
             }
         }
         _ = shutdown_signal() => {
@@ -494,9 +998,9 @@ async fn main() -> Result<(), std::process::ExitCode> {
         }
     }
 
+    cancel.cancel();
     shutdown_tx_session(&state).await;
     playback_task.abort();
-    receiver_task.abort();
     Ok(())
 }
 
@@ -509,15 +1013,18 @@ async fn get_browser_ptt_ws(
     State(state): State<AppState>,
 ) -> axum::response::Response {
     let cfg = state.config.read().await.clone();
-    let Some(remote_peer) = cfg.remote_peer else {
+    let Some(remote_peer) = parse_selected_peer(&cfg) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(MessageResponse {
-                detail: "remote_peer must be configured before browser transmit".into(),
+                detail: "selected_peer must be configured before browser transmit".into(),
             }),
         )
             .into_response();
     };
+    if let Err(err) = ensure_out_link(&state, remote_peer).await {
+        return (StatusCode::CONFLICT, Json(MessageResponse { detail: err })).into_response();
+    }
 
     {
         let mut guard = state.tx_session.lock().await;
@@ -556,7 +1063,17 @@ async fn put_config(
     Json(update): Json<ConfigUpdate>,
 ) -> impl IntoResponse {
     let mut cfg = state.config.read().await.clone();
-    cfg.remote_peer = update.remote_peer;
+    let selected_peer = match normalize_selected_peer(update.selected_peer) {
+        Ok(value) => value,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(MessageResponse { detail: err }),
+            )
+                .into_response();
+        }
+    };
+    cfg.selected_peer = selected_peer.clone();
     cfg.capture_device = update.capture_device.trim().to_string();
     cfg.playback_device = update.playback_device.trim().to_string();
     if cfg.capture_device.is_empty() || cfg.playback_device.is_empty() {
@@ -576,10 +1093,19 @@ async fn put_config(
             .into_response();
     }
     *state.config.write().await = cfg.clone();
+    if let Some(hash) = parse_selected_peer(&cfg) {
+        if let Err(err) = ensure_out_link(&state, hash).await {
+            log::debug!("selected peer link not ready yet: {err}");
+        }
+    }
     (
         StatusCode::OK,
         Json(MessageResponse {
-            detail: "Config saved. remote_peer and capture_device apply on the next transmit start; playback_device and bind changes apply on restart.".into(),
+            detail: if let Some(peer) = selected_peer {
+                format!("Config saved. selected_peer={peer}; capture_device applies on the next transmit start and playback_device applies on restart.")
+            } else {
+                "Config saved. No peer selected; capture_device applies on the next transmit start and playback_device applies on restart.".into()
+            },
         }),
     )
         .into_response()
@@ -593,15 +1119,18 @@ async fn get_audio_devices() -> impl IntoResponse {
 
 async fn post_ptt_start(State(state): State<AppState>) -> impl IntoResponse {
     let cfg = state.config.read().await.clone();
-    let Some(remote_peer) = cfg.remote_peer else {
+    let Some(remote_peer) = parse_selected_peer(&cfg) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(MessageResponse {
-                detail: "remote_peer must be configured before transmit".into(),
+                detail: "selected_peer must be configured before transmit".into(),
             }),
         )
             .into_response();
     };
+    if let Err(err) = ensure_out_link(&state, remote_peer).await {
+        return (StatusCode::CONFLICT, Json(MessageResponse { detail: err })).into_response();
+    }
 
     let mut guard = state.tx_session.lock().await;
     if guard.is_some() {
@@ -628,7 +1157,7 @@ async fn post_ptt_start(State(state): State<AppState>) -> impl IntoResponse {
     (
         StatusCode::OK,
         Json(MessageResponse {
-            detail: format!("PTT transmit started to {remote_peer}"),
+            detail: format!("PTT transmit started to {}", remote_peer.to_hex_string()),
         }),
     )
         .into_response()
@@ -690,9 +1219,31 @@ async fn build_status(state: &AppState) -> StatusSnapshot {
             None => None,
         }
     };
+    let cfg = state.config.read().await.clone();
+    let selected = cfg.selected_peer.clone();
+    let mut peers = state
+        .peers
+        .read()
+        .await
+        .iter()
+        .map(|(hash, peer)| PeerSnapshot {
+            hash: hash.clone(),
+            status: peer.status.clone(),
+            last_seen_ts: peer.last_seen_ts,
+        })
+        .collect::<Vec<_>>();
+    peers.sort_by(|a, b| {
+        let a_selected = selected.as_deref() == Some(a.hash.as_str());
+        let b_selected = selected.as_deref() == Some(b.hash.as_str());
+        b_selected
+            .cmp(&a_selected)
+            .then_with(|| a.hash.cmp(&b.hash))
+    });
 
     StatusSnapshot {
-        config: state.config.read().await.clone(),
+        config: cfg,
+        local_destination: state.local_destination.clone(),
+        peers,
         transmitting: state.stats.transmitting.load(Ordering::Relaxed),
         active_source,
         tx_packets: state.stats.tx_packets.load(Ordering::Relaxed),
@@ -700,14 +1251,20 @@ async fn build_status(state: &AppState) -> StatusSnapshot {
         tx_bytes: state.stats.tx_bytes.load(Ordering::Relaxed),
         rx_bytes: state.stats.rx_bytes.load(Ordering::Relaxed),
         dropped_rx_while_talking: state.stats.dropped_rx_while_talking.load(Ordering::Relaxed),
-        last_remote: *state.stats.last_remote.lock().await,
+        playback_drops: state.stats.playback_drops.load(Ordering::Relaxed),
+        played_frames: state.stats.played_frames.load(Ordering::Relaxed),
+        last_played_ts: state.stats.last_played_ts.load(Ordering::Relaxed),
+        last_played_samples: state.stats.last_played_samples.load(Ordering::Relaxed),
+        last_playback_error_ts: state.stats.last_playback_error_ts.load(Ordering::Relaxed),
+        last_remote: state.stats.last_remote.lock().await.clone(),
+        last_playback_error: state.stats.last_playback_error(),
     }
 }
 
 async fn transmit_loop(
     state: AppState,
     cfg: PluginConfig,
-    remote_peer: SocketAddr,
+    remote_peer: AddressHash,
     cancel: CancellationToken,
 ) -> Result<(), String> {
     let mut codec = TxCodec::new(&cfg)?;
@@ -736,7 +1293,7 @@ async fn transmit_loop(
 async fn browser_transmit_loop(
     state: AppState,
     cfg: PluginConfig,
-    remote_peer: SocketAddr,
+    remote_peer: AddressHash,
     mut socket: WebSocket,
 ) -> Result<(), String> {
     let mut codec = TxCodec::new(&cfg)?;
@@ -760,53 +1317,29 @@ async fn browser_transmit_loop(
 async fn send_pcm_frame(
     state: &AppState,
     codec: &mut TxCodec,
-    remote_peer: SocketAddr,
+    remote_peer: AddressHash,
     frame: &[i16],
 ) -> Result<(), String> {
     let encoded = codec.encode(frame)?;
     let seq = state.stats.seq.fetch_add(1, Ordering::Relaxed) as u32;
     let packet = encode_packet(seq, &encoded);
-    state
-        .media_socket
-        .send_to(&packet, remote_peer)
+    let sent = state
+        .transport
+        .lock()
         .await
-        .map_err(|err| format!("send UDP packet: {err}"))?;
+        .send_to_out_links(&remote_peer, &packet)
+        .await;
+    if sent.is_empty() {
+        return Err(format!(
+            "selected peer {} does not have an active Reticulum link",
+            remote_peer.to_hex_string()
+        ));
+    }
     state.stats.tx_packets.fetch_add(1, Ordering::Relaxed);
     state
         .stats
         .tx_bytes
         .fetch_add(packet.len() as u64, Ordering::Relaxed);
-    Ok(())
-}
-
-async fn receiver_loop(state: AppState, cancel: CancellationToken) -> Result<(), String> {
-    let cfg = state.config.read().await.clone();
-    let mut codec = RxCodec::new(&cfg)?;
-    let frame_len = frame_samples(&cfg);
-    let mut buf = vec![0u8; 2048];
-
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            received = state.media_socket.recv_from(&mut buf) => {
-                let (len, remote) = received.map_err(|err| format!("receive UDP packet: {err}"))?;
-                if state.stats.transmitting.load(Ordering::Relaxed) {
-                    state.stats.dropped_rx_while_talking.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-                let payload = decode_packet(&buf[..len]).ok_or_else(|| "invalid packet header".to_string())?;
-                let pcm = codec.decode(payload, frame_len)?;
-                if state.playback_tx.try_send(pcm).is_err() {
-                    log::warn!("playback buffer full, dropping received frame");
-                    continue;
-                }
-                *state.stats.last_remote.lock().await = Some(remote);
-                state.stats.rx_packets.fetch_add(1, Ordering::Relaxed);
-                state.stats.rx_bytes.fetch_add(len as u64, Ordering::Relaxed);
-            }
-        }
-    }
-
     Ok(())
 }
 
@@ -840,6 +1373,241 @@ fn decode_browser_pcm(payload: &[u8], expected_samples: usize) -> Result<Vec<i16
         .chunks_exact(2)
         .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
         .collect())
+}
+
+fn parse_selected_peer(cfg: &PluginConfig) -> Option<AddressHash> {
+    cfg.selected_peer
+        .as_deref()
+        .and_then(|value| AddressHash::new_from_hex_string(value).ok())
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn should_reuse_existing_out_link(existing_status: Option<LinkStatus>) -> bool {
+    matches!(
+        existing_status,
+        Some(LinkStatus::Pending | LinkStatus::Handshake | LinkStatus::Active | LinkStatus::Stale)
+    )
+}
+
+async fn ensure_out_link(state: &AppState, hash: AddressHash) -> Result<(), String> {
+    let desc = {
+        let peers = state.peers.read().await;
+        peers
+            .get(&hash.to_hex_string())
+            .map(|peer| peer.desc.clone())
+            .ok_or_else(|| format!("selected peer {} has not announced audio-ptt yet", hash))?
+    };
+    let existing = state.transport.lock().await.find_out_link(&hash).await;
+    let existing_status = if let Some(link) = existing.as_ref() {
+        Some(link.lock().await.status())
+    } else {
+        None
+    };
+    if should_reuse_existing_out_link(existing_status) {
+        return Ok(());
+    }
+    {
+        let mut peers = state.peers.write().await;
+        if let Some(peer) = peers.get_mut(&hash.to_hex_string()) {
+            peer.status = "pending".into();
+        }
+    }
+    state.transport.lock().await.link(desc).await;
+    Ok(())
+}
+
+async fn register_announced_peer(state: &AppState, desc: DestinationDesc) -> Result<(), String> {
+    if desc.address_hash.to_hex_string() == state.local_destination {
+        return Ok(());
+    }
+    let hash = desc.address_hash.to_hex_string();
+    {
+        let mut peers = state.peers.write().await;
+        let entry = peers.entry(hash.clone()).or_insert(PeerState {
+            desc: desc.clone(),
+            status: "discovered".into(),
+            last_seen_ts: now_secs(),
+        });
+        entry.desc = desc.clone();
+        entry.last_seen_ts = now_secs();
+        if entry.status != "active" {
+            entry.status = "discovered".into();
+        }
+    }
+    ensure_out_link(state, desc.address_hash).await
+}
+
+async fn update_peer_status(state: &AppState, hash: AddressHash, status: &str) {
+    let key = hash.to_hex_string();
+    let mut peers = state.peers.write().await;
+    if let Some(peer) = peers.get_mut(&key) {
+        peer.status = status.into();
+        peer.last_seen_ts = now_secs();
+    }
+}
+
+async fn handle_received_audio(
+    state: &AppState,
+    cfg: &PluginConfig,
+    payload: &[u8],
+    remote: String,
+) -> Result<(), String> {
+    if state.stats.transmitting.load(Ordering::Relaxed) {
+        state
+            .stats
+            .dropped_rx_while_talking
+            .fetch_add(1, Ordering::Relaxed);
+        return Ok(());
+    }
+    let body = decode_packet(payload).ok_or_else(|| "invalid audio packet header".to_string())?;
+    let frame_len = frame_samples(cfg);
+    let mut codec = RxCodec::new(cfg)?;
+    let pcm = codec.decode(body, frame_len)?;
+    if state.playback_tx.try_send(pcm).is_err() {
+        log::warn!("playback buffer full, dropping received frame");
+        state.stats.playback_drops.fetch_add(1, Ordering::Relaxed);
+        state
+            .stats
+            .record_playback_error("playback buffer full, dropping received frame")
+            .await;
+        return Ok(());
+    }
+    *state.stats.last_remote.lock().await = Some(remote);
+    state.stats.rx_packets.fetch_add(1, Ordering::Relaxed);
+    state
+        .stats
+        .rx_bytes
+        .fetch_add(payload.len() as u64, Ordering::Relaxed);
+    Ok(())
+}
+
+fn spawn_announce_tx(state: AppState, cancel: CancellationToken) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    state.transport.lock().await.send_announce(&state.destination, Some(AUDIO_PTT_ANNOUNCE_MAGIC)).await;
+                }
+            }
+        }
+    });
+}
+
+fn spawn_announce_rx(state: AppState, cancel: CancellationToken) {
+    tokio::spawn(async move {
+        let mut announces = state.transport.lock().await.recv_announces().await;
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                recv = announces.recv() => match recv {
+                    Ok(ev) => {
+                        if ev.app_data.as_slice() != AUDIO_PTT_ANNOUNCE_MAGIC {
+                            continue;
+                        }
+                        let desc = ev.destination.lock().await.desc.clone();
+                        if let Err(err) = register_announced_peer(&state, desc).await {
+                            log::debug!("audio-ptt announce ignored: {err}");
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+}
+
+fn spawn_out_link_events(state: AppState, cancel: CancellationToken) {
+    tokio::spawn(async move {
+        let mut events = state.transport.lock().await.out_link_events();
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                recv = events.recv() => match recv {
+                    Ok(ev) => match ev.event {
+                        LinkEvent::Activated => {
+                            update_peer_status(&state, ev.address_hash, "active").await;
+                        }
+                        LinkEvent::Closed => {
+                            update_peer_status(&state, ev.address_hash, "closed").await;
+                        }
+                        LinkEvent::Data(payload) => {
+                            let cfg = state.config.read().await.clone();
+                            if let Err(err) = handle_received_audio(&state, &cfg, payload.as_slice(), ev.address_hash.to_hex_string()).await {
+                                state.stats
+                                    .record_playback_error(format!("receive audio over out-link: {err}"))
+                                    .await;
+                                log::warn!("receive audio over out-link: {err}");
+                            }
+                        }
+                        LinkEvent::Proof(_) => {
+                            update_peer_status(&state, ev.address_hash, "handshake").await;
+                        }
+                    },
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+}
+
+fn spawn_in_link_events(state: AppState, cancel: CancellationToken) {
+    let local = state.local_destination.clone();
+    tokio::spawn(async move {
+        let mut events = state.transport.lock().await.in_link_events();
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                recv = events.recv() => match recv {
+                    Ok(ev) => {
+                        if ev.address_hash.to_hex_string() != local {
+                            continue;
+                        }
+                        if let LinkEvent::Data(payload) = ev.event {
+                            let cfg = state.config.read().await.clone();
+                            if let Err(err) = handle_received_audio(&state, &cfg, payload.as_slice(), "incoming-link".into()).await {
+                                state.stats
+                                    .record_playback_error(format!("receive audio over in-link: {err}"))
+                                    .await;
+                                log::warn!("receive audio over in-link: {err}");
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+}
+
+fn spawn_keepalive(
+    radio_client: Arc<Mutex<kaonic_reticulum::RadioClient>>,
+    cancel: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(err) = radio_client.lock().await.ping().await {
+                        log::warn!("keepalive ping failed: {err:?}");
+                    }
+                }
+                _ = cancel.cancelled() => break,
+            }
+        }
+    });
 }
 
 async fn shutdown_signal() {

@@ -17,6 +17,7 @@ const PLUGINS_JS: &str = r#"
         modal: {
             open: false,
             pluginId: '',
+            kind: 'install',
             file: null,
             uploading: false,
             feedback: '',
@@ -62,6 +63,8 @@ const PLUGINS_JS: &str = r#"
         if (installBtn) { installBtn.disabled = state.loading; }
         var updateBtn = document.querySelector('[data-plugin-upload]');
         if (updateBtn) { updateBtn.disabled = state.loading; }
+        var installerUpgradeBtn = document.querySelector('[data-installer-upgrade]');
+        if (installerUpgradeBtn) { installerUpgradeBtn.disabled = state.loading; }
         var modalChooseBtn = document.querySelector('[data-plugin-modal-choose]');
         if (modalChooseBtn) { modalChooseBtn.disabled = state.modal.uploading; }
     }
@@ -98,12 +101,13 @@ const PLUGINS_JS: &str = r#"
         return '<a class=\"plugins-detail-link\" href=\"' + escaped(url) + '\" target=\"_blank\" rel=\"noreferrer\">' + escaped(url) + '</a>';
     }
 
-    function webviewLink(port) {
-        var url = webviewUrl(port);
+    function webviewLink(plugin) {
+        var url = webviewUrl(plugin);
         return url ? '<a class=\"plugins-detail-link\" href=\"' + escaped(url) + '\" target=\"_blank\" rel=\"noreferrer\">' + escaped(url) + '</a>' : '—';
     }
 
-    function webviewUrl(port) {
+    function webviewUrl(plugin) {
+        var port = plugin && plugin.webview;
         if (port == null || port === '') { return ''; }
         var numericPort = Number(port);
         if (!Number.isInteger(numericPort) || numericPort < 1 || numericPort > 65535) { return ''; }
@@ -112,7 +116,8 @@ const PLUGINS_JS: &str = r#"
         if (host.includes(':') && host.charAt(0) !== '[') {
             host = '[' + host + ']';
         }
-        return 'http://' + host + ':' + numericPort;
+        var scheme = plugin && plugin.tls ? 'https://' : 'http://';
+        return scheme + host + ':' + numericPort;
     }
 
     function ensureSelection() {
@@ -127,21 +132,45 @@ const PLUGINS_JS: &str = r#"
     }
 
     function modalActionLabel() {
+        if (state.modal.kind === 'installer-upgrade') { return 'Upgrade'; }
         return state.modal.pluginId ? 'Upload update' : 'Install plugin';
     }
 
     function modalProgressLabel() {
+        if (state.modal.kind === 'installer-upgrade') { return 'Upgrading installer…'; }
         return state.modal.pluginId ? 'Uploading update…' : 'Installing plugin…';
     }
 
     function modalHeading() {
+        if (state.modal.kind === 'installer-upgrade') { return 'Upgrade kaonic-installer'; }
         return state.modal.pluginId ? 'Upload plugin update' : 'Install plugin package';
     }
 
     function modalDescription() {
+        if (state.modal.kind === 'installer-upgrade') {
+            return 'Updating of kaonic-installer is not safe. Please make sure device is powered during update.';
+        }
         return state.modal.pluginId
             ? 'Drop an updated ZIP package here or choose one from your device.'
             : 'Drag and drop a plugin ZIP here or choose one from your device to install it.';
+    }
+
+    function modalDropzoneTitle() {
+        return state.modal.kind === 'installer-upgrade'
+            ? 'Choose replacement installer binary'
+            : 'Drag & drop plugin ZIP';
+    }
+
+    function modalDropzoneHint() {
+        return state.modal.kind === 'installer-upgrade'
+            ? 'or use the file picker below'
+            : 'or use the file picker below';
+    }
+
+    function modalEmptySelectionText() {
+        return state.modal.kind === 'installer-upgrade'
+            ? 'No replacement binary selected yet.'
+            : 'No ZIP package selected yet.';
     }
 
     function isBusyAction(pluginId, action) {
@@ -198,9 +227,10 @@ const PLUGINS_JS: &str = r#"
         renderModal();
     }
 
-    function openUploadModal(pluginId) {
+    function openUploadModal(pluginId, kind) {
         state.modal.open = true;
         state.modal.pluginId = pluginId || '';
+        state.modal.kind = kind || (pluginId ? 'update' : 'install');
         state.modal.file = null;
         state.modal.uploading = false;
         state.modal.dragActive = false;
@@ -212,6 +242,7 @@ const PLUGINS_JS: &str = r#"
         if (state.modal.uploading && !force) { return; }
         state.modal.open = false;
         state.modal.pluginId = '';
+        state.modal.kind = 'install';
         state.modal.file = null;
         state.modal.uploading = false;
         state.modal.dragActive = false;
@@ -247,13 +278,17 @@ const PLUGINS_JS: &str = r#"
         var backdrop = document.getElementById('plugins-upload-modal');
         var title = document.getElementById('plugins-upload-title');
         var description = document.getElementById('plugins-upload-description');
+        var warning = document.getElementById('plugins-upload-warning');
         var dropzone = document.getElementById('plugins-upload-dropzone');
+        var dropzoneTitle = document.getElementById('plugins-upload-dropzone-title');
+        var dropzoneHint = document.getElementById('plugins-upload-dropzone-hint');
         var selected = document.getElementById('plugins-upload-selected');
         var feedback = document.getElementById('plugins-upload-feedback');
         var submit = document.getElementById('plugins-upload-submit');
         var choose = document.getElementById('plugins-upload-choose');
+        var uploadInput = document.getElementById('plugin-package-input');
         var body = document.body;
-        if (!backdrop || !title || !description || !dropzone || !selected || !feedback || !submit || !choose || !body) { return; }
+        if (!backdrop || !title || !description || !warning || !dropzone || !dropzoneTitle || !dropzoneHint || !selected || !feedback || !submit || !choose || !uploadInput || !body) { return; }
 
         backdrop.hidden = !state.modal.open;
         if (state.modal.open || state.confirm.open) { body.classList.add('modal-open'); }
@@ -261,15 +296,19 @@ const PLUGINS_JS: &str = r#"
 
         title.textContent = modalHeading();
         description.textContent = modalDescription();
+        warning.hidden = state.modal.kind !== 'installer-upgrade';
         dropzone.className = 'plugins-upload-dropzone'
             + (state.modal.dragActive ? ' plugins-upload-dropzone--drag' : '')
             + (state.modal.file ? ' plugins-upload-dropzone--ready' : '');
+        dropzoneTitle.textContent = modalDropzoneTitle();
+        dropzoneHint.textContent = modalDropzoneHint();
+        uploadInput.accept = state.modal.kind === 'installer-upgrade' ? '' : '.zip,application/zip';
 
         if (state.modal.file) {
             selected.textContent = state.modal.file.name + ' • ' + formatFileSize(state.modal.file.size);
             selected.className = 'plugins-upload-selected plugins-upload-selected--ready';
         } else {
-            selected.textContent = 'No ZIP package selected yet.';
+            selected.textContent = modalEmptySelectionText();
             selected.className = 'plugins-upload-selected';
         }
 
@@ -369,7 +408,7 @@ const PLUGINS_JS: &str = r#"
         var restartBusy = isBusyAction(plugin.id, 'restart');
         var deleteBusy = isBusyAction(plugin.id, 'delete');
         var actionLocked = !!state.busyAction.pluginId;
-        var appUrl = webviewUrl(plugin.webview);
+        var appUrl = webviewUrl(plugin);
         var openAppAction = appUrl
             ? '<a class=\"btn-secondary\" href=\"' + escaped(appUrl) + '\" target=\"_blank\" rel=\"noreferrer\">Open app</a>'
             : '';
@@ -407,7 +446,8 @@ const PLUGINS_JS: &str = r#"
                  + '<div class=\"info-row\"><span class=\"info-label\">Service name</span><code class=\"info-value\">' + escaped(detailValue(plugin.service)) + '</code></div>'
                  + '<div class=\"info-row\"><span class=\"info-label\">SHA-256</span><code class=\"info-value\">' + escaped(detailValue(plugin.sha256)) + '</code></div>'
                  + '<div class=\"info-row\"><span class=\"info-label\">GitHub URL</span><span class=\"info-value\">' + githubLink(plugin.github_url) + '</span></div>'
-                 + '<div class=\"info-row\"><span class=\"info-label\">Webview</span><span class=\"info-value\">' + webviewLink(plugin.webview) + '</span></div>'
+                 + '<div class=\"info-row\"><span class=\"info-label\">Webview</span><span class=\"info-value\">' + webviewLink(plugin) + '</span></div>'
+                 + '<div class=\"info-row\"><span class=\"info-label\">TLS</span><span class=\"info-value\">' + (plugin.tls ? 'Enabled' : 'Disabled') + '</span></div>'
               + '</div>';
         if (plugin.systemd_status) {
             panel.innerHTML += ''
@@ -499,15 +539,28 @@ const PLUGINS_JS: &str = r#"
         if (!state.modal.file || state.modal.uploading) { return; }
         var pluginId = state.modal.pluginId;
         var form = new FormData();
-        form.append('file', state.modal.file);
+        var requestUrl = pluginId ? ('/api/plugins/' + encodeURIComponent(pluginId) + '/upload') : '/api/plugins/install';
+        var requestBody = form;
+        var requestHeaders = {};
+        if (state.modal.kind === 'installer-upgrade') {
+            requestUrl = '/api/plugins/kaonic-installer/upgrade';
+            requestBody = state.modal.file;
+            requestHeaders['Content-Type'] = 'application/octet-stream';
+            requestHeaders['X-Kaonic-Filename'] = state.modal.file.name || 'kaonic-installer';
+        } else {
+            form.append('file', state.modal.file);
+        }
         state.modal.uploading = true;
-        setModalFeedback((pluginId ? 'Uploading update ' : 'Installing ') + state.modal.file.name + '…', 'ok');
+        setModalFeedback((state.modal.kind === 'installer-upgrade'
+            ? 'Uploading replacement binary '
+            : ((pluginId ? 'Uploading update ' : 'Installing '))) + state.modal.file.name + '…', 'ok');
         setLoading(true);
         renderModal();
 
-        fetch(pluginId ? ('/api/plugins/' + encodeURIComponent(pluginId) + '/upload') : '/api/plugins/install', {
+        fetch(requestUrl, {
             method: 'POST',
-            body: form
+            headers: requestHeaders,
+            body: requestBody
         })
             .then(function(resp) {
                 return resp.json().catch(function() { return {}; }).then(function(data) {
@@ -518,7 +571,9 @@ const PLUGINS_JS: &str = r#"
                 });
             })
             .then(function(data) {
-                var detail = (data && data.detail) || (pluginId ? 'Plugin updated.' : 'Plugin installed.');
+                var detail = (data && data.detail) || (state.modal.kind === 'installer-upgrade'
+                    ? 'kaonic-installer upgraded.'
+                    : (pluginId ? 'Plugin updated.' : 'Plugin installed.'));
                 state.modal.uploading = false;
                 setModalFeedback(detail, 'ok');
                 renderModal();
@@ -546,7 +601,12 @@ const PLUGINS_JS: &str = r#"
         }
 
         if (target.closest('[data-plugin-install]')) {
-            openUploadModal('');
+            openUploadModal('', 'install');
+            return;
+        }
+
+        if (target.closest('[data-installer-upgrade]')) {
+            openUploadModal('', 'installer-upgrade');
             return;
         }
 
@@ -605,7 +665,7 @@ const PLUGINS_JS: &str = r#"
         }
 
         if (target.closest('[data-plugin-upload]')) {
-            openUploadModal(plugin.id);
+            openUploadModal(plugin.id, 'update');
             return;
         }
 
@@ -713,6 +773,7 @@ pub fn PluginsPage() -> impl IntoView {
                 <div class="plugins-shell-footer">
                     <span class="plugins-shell-footer-label">"Installer version"</span>
                     <span id="plugins-installer-version" class="badge">"Loading…"</span>
+                    <button type="button" class="btn-secondary" data-installer-upgrade>"Upgrade installer"</button>
                 </div>
             </div>
 
@@ -729,15 +790,20 @@ pub fn PluginsPage() -> impl IntoView {
                         <p class="card-body-text" id="plugins-upload-description">
                             "Drag and drop a plugin ZIP here or choose one from your device to install it."
                         </p>
+                        <div class="info-row" id="plugins-upload-warning" hidden>
+                            <span class="info-label">"Warning"</span>
+                            <span class="info-value">"Updating of kaonic-installer is not safe. Please make sure device is powered during update."</span>
+                        </div>
                     </div>
                     <button type="button" class="plugins-upload-dropzone" id="plugins-upload-dropzone">
                         <span class="plugins-upload-icon">"⬆"</span>
-                        <span class="plugins-upload-title">"Drag & drop plugin ZIP"</span>
-                        <span class="plugins-upload-hint">"or use the file picker below"</span>
+                        <span class="plugins-upload-title" id="plugins-upload-dropzone-title">"Drag & drop plugin ZIP"</span>
+                        <span class="plugins-upload-hint" id="plugins-upload-dropzone-hint">"or use the file picker below"</span>
                     </button>
                     <div class="plugins-upload-selected" id="plugins-upload-selected">"No ZIP package selected yet."</div>
                     <div class="plugins-upload-feedback" id="plugins-upload-feedback"></div>
                     <div class="modal-actions plugins-upload-actions">
+                        <button type="button" class="btn-secondary" data-plugin-modal-close>"Cancel"</button>
                         <button type="button" class="btn-secondary" id="plugins-upload-choose" data-plugin-modal-choose>"Choose file"</button>
                         <button type="button" class="btn-primary" id="plugins-upload-submit" data-plugin-modal-submit>"Install plugin"</button>
                     </div>

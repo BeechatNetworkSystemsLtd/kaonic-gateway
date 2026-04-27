@@ -22,6 +22,7 @@ log         = "0.4"
 env_logger  = "0.11"
 clap        = { version = "4", features = ["derive"] }
 tower-http  = { version = "0.5", features = ["limit", "cors"] }
+kaonic-gateway = { path = "../kaonic-gateway" }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
