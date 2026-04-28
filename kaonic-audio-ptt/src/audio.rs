@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -16,6 +18,10 @@ use tokio::process::Command;
 pub const CHANNELS: usize = 1;
 #[cfg(target_os = "linux")]
 const ALSA_STARTUP_PROBE_MS: u64 = 250;
+#[cfg(target_os = "linux")]
+const PLAYBACK_PREBUFFER_MS: u64 = 3_000;
+#[cfg(target_os = "linux")]
+const PLAYBACK_STALL_RESET_MS: u64 = 750;
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug)]
@@ -37,6 +43,12 @@ pub fn frame_samples(cfg: &PluginConfig) -> usize {
 #[cfg(target_os = "linux")]
 pub fn frame_bytes(cfg: &PluginConfig) -> usize {
     frame_samples(cfg) * CHANNELS * std::mem::size_of::<i16>()
+}
+
+#[cfg(target_os = "linux")]
+fn playback_prebuffer_frames(cfg: &PluginConfig) -> usize {
+    let frame_ms = (cfg.frame_ms as u64).max(1);
+    PLAYBACK_PREBUFFER_MS.div_ceil(frame_ms) as usize
 }
 
 pub async fn list_devices() -> AudioDevices {
@@ -146,24 +158,52 @@ pub async fn playback_loop(
     {
         let (mut child, mut stdin, stderr_task, _, playback_format) =
             spawn_validated_aplay(&cfg).await?;
+        let prebuffer_frames = playback_prebuffer_frames(&cfg);
+        let stall_wait = Duration::from_millis(std::cmp::max(
+            PLAYBACK_STALL_RESET_MS,
+            (cfg.frame_ms as u64) * 4,
+        ));
+        let mut pending_frames = VecDeque::with_capacity(prebuffer_frames.saturating_add(8));
+        let mut buffering = true;
+
+        log::info!(
+            "ALSA playback prebuffer enabled target_frames={} target_ms={}",
+            prebuffer_frames,
+            prebuffer_frames as u64 * cfg.frame_ms as u64
+        );
 
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
-                next = frames.recv() => {
-                    let Some(frame) = next else { break; };
-                    let sample_count = frame.len();
-                    let raw = convert_playback_frame(
-                        &frame,
-                        cfg.sample_rate_hz,
-                        playback_format.sample_rate_hz,
-                        playback_format.channels,
-                    );
-                    stdin
-                        .write_all(&raw)
-                        .await
-                        .map_err(|err| format!("write aplay frame: {err}"))?;
-                    stats.record_played_frame(sample_count);
+                next = tokio::time::timeout(stall_wait, frames.recv()) => {
+                    match next {
+                        Ok(Some(frame)) => {
+                            pending_frames.push_back(frame);
+                            if buffering && pending_frames.len() < prebuffer_frames {
+                                continue;
+                            }
+                            buffering = false;
+                            while let Some(frame) = pending_frames.pop_front() {
+                                let sample_count = frame.len();
+                                let raw = convert_playback_frame(
+                                    &frame,
+                                    cfg.sample_rate_hz,
+                                    playback_format.sample_rate_hz,
+                                    playback_format.channels,
+                                );
+                                stdin
+                                    .write_all(&raw)
+                                    .await
+                                    .map_err(|err| format!("write aplay frame: {err}"))?;
+                                stats.record_played_frame(sample_count);
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(_) => {
+                            buffering = true;
+                            pending_frames.clear();
+                        }
+                    }
                 }
             }
         }
@@ -450,6 +490,22 @@ fn playback_format_candidates(cfg: &PluginConfig) -> Vec<PlaybackFormat> {
         }
     }
     deduped
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn playback_prebuffer_uses_three_seconds() {
+        use super::{playback_prebuffer_frames, PluginConfig};
+
+        let mut cfg = PluginConfig::default();
+        cfg.frame_ms = 20;
+        assert_eq!(playback_prebuffer_frames(&cfg), 150);
+
+        cfg.frame_ms = 40;
+        assert_eq!(playback_prebuffer_frames(&cfg), 75);
+    }
 }
 
 #[cfg(target_os = "linux")]

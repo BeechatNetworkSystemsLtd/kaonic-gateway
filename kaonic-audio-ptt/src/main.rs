@@ -67,6 +67,8 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
       min-height: 100vh;
       display: flex;
       align-items: stretch;
+      padding-bottom: 15rem;
+      box-sizing: border-box;
     }
     .sidebar {
       width: min(25rem, 100%);
@@ -189,81 +191,53 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
       line-height: 1.5;
     }
     .ptt-shell {
-      width: min(100%, 40rem);
-      padding: 1.7rem;
-      background: #111827;
-      border: 1px solid #1f2937;
-      border-radius: 1.4rem;
-      box-shadow: 0 24px 48px rgba(0,0,0,0.35);
-      text-align: center;
-      display: grid;
-      gap: 1.2rem;
+      display: none;
     }
-    .ptt-body {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(18rem, 20rem);
-      gap: 1rem;
-      align-items: start;
-    }
-    .ptt-main {
-      min-height: 100%;
-      display: grid;
-      align-content: start;
-      gap: 1rem;
-    }
-    .ptt-stats {
-      display: grid;
-      gap: 0.85rem;
-      align-content: start;
-    }
-    .selection-card {
-      padding: 1rem 1.1rem;
-      border-radius: 1rem;
-      border: 1px solid #1f2937;
-      background: #0b1220;
-    }
-    .selection-label {
-      color: #94a3b8;
-      font-size: 0.86rem;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      margin-bottom: 0.35rem;
-    }
-    .selection-name {
-      font-size: 1.05rem;
-      font-weight: 700;
-      color: #f8fafc;
-      word-break: break-all;
-      margin-bottom: 0.5rem;
-    }
-    .selection-status {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.45rem;
-      color: #cbd5e1;
-      font-size: 0.92rem;
+    .ptt-overlay {
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      display: flex;
+      justify-content: center;
+      padding: 0 1rem calc(env(safe-area-inset-bottom, 0px) + 1rem);
+      pointer-events: none;
+      z-index: 20;
     }
     .mic-wrap {
       display: flex;
       justify-content: center;
-      min-height: min(21rem, 66vw);
       align-items: center;
+      width: min(100%, 22rem);
+      padding: 1.25rem;
+      border-radius: 1.4rem;
+      border: 1px solid #1f2937;
+      background: #111827;
+      box-shadow: 0 24px 48px rgba(0,0,0,0.35);
+      box-sizing: border-box;
+      pointer-events: auto;
     }
     .mic-btn {
       width: min(20rem, 62vw);
       height: min(20rem, 62vw);
       border: 0;
       border-radius: 999px;
-      background: linear-gradient(180deg, #ef4444, #b91c1c);
-      color: white;
-      font-size: 1.55rem;
+      background: linear-gradient(180deg, #fcd34d, #f59e0b);
+      color: #451a03;
+      font-size: 1.35rem;
       font-weight: 800;
-      box-shadow: 0 20px 40px rgba(239, 68, 68, 0.35);
+      box-shadow: 0 20px 40px rgba(245, 158, 11, 0.35);
       touch-action: none;
       user-select: none;
       -webkit-user-select: none;
       -webkit-touch-callout: none;
       transition: transform 0.16s ease, box-shadow 0.16s ease, opacity 0.16s ease;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 0.8rem;
+      text-align: center;
     }
     .mic-btn:focus {
       outline: none;
@@ -273,11 +247,21 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
     }
     .mic-btn.is-active {
       transform: scale(0.97);
-      background: linear-gradient(180deg, #fb7185, #e11d48);
-      box-shadow: 0 0 0 0.85rem rgba(251, 113, 133, 0.18);
+      background: linear-gradient(180deg, #fde68a, #fbbf24);
+      box-shadow: 0 0 0 0.85rem rgba(251, 191, 36, 0.2);
+    }
+    .mic-icon {
+      width: 3.9rem;
+      height: 3.9rem;
+      display: block;
+      color: currentColor;
+    }
+    .mic-label {
+      max-width: 10rem;
+      line-height: 1.15;
     }
     .status {
-      min-height: 6.5rem;
+      height: 7.4rem;
       padding: 0.95rem 1rem;
       border-radius: 1rem;
       border: 1px solid #1f2937;
@@ -287,13 +271,19 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
       white-space: pre-line;
       line-height: 1.45;
       text-align: left;
+      box-sizing: border-box;
+      overflow-y: auto;
     }
     .playback-status {
+      height: 9rem;
       padding: 0.95rem 1rem;
       border-radius: 1rem;
       border: 1px solid #1f2937;
       background: #0b1220;
       text-align: left;
+      box-sizing: border-box;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
     }
     .playback-status-title {
       color: #cbd5e1;
@@ -308,6 +298,8 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
       font-size: 0.92rem;
       white-space: pre-line;
       line-height: 1.45;
+      overflow-y: auto;
+      min-height: 0;
     }
     .hint {
       margin-top: 0.75rem;
@@ -327,17 +319,9 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
       .content {
         padding-top: 1rem;
       }
-      .ptt-shell {
-        width: 100%;
-      }
-      .ptt-body {
-        grid-template-columns: 1fr;
-      }
-      .ptt-main {
-        order: 1;
-      }
-      .ptt-stats {
-        order: 2;
+      .mic-btn {
+        width: min(18rem, 72vw);
+        height: min(18rem, 72vw);
       }
     }
   </style>
@@ -359,32 +343,25 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
     </aside>
     <section class="content">
       <div class="ptt-shell">
-        <div class="ptt-body">
-          <div class="ptt-main">
-            <div class="selection-card">
-              <div class="selection-label">Selected contact</div>
-              <div id="selected-peer-name" class="selection-name">No contact selected</div>
-              <div id="selected-peer-status" class="selection-status">
-                <span class="status-dot"></span>
-                <span>Choose a contact from the list</span>
-              </div>
-            </div>
-            <div class="mic-wrap">
-              <button id="mic-btn" class="mic-btn" type="button">Hold to Talk</button>
-            </div>
-          </div>
-          <div class="ptt-stats">
-            <div class="playback-status">
-              <div class="playback-status-title">Last received audio</div>
-              <div id="playback-status" class="playback-status-body">Waiting for audio…</div>
-            </div>
-            <div id="status" class="status">Loading…</div>
-            <div class="hint">Audio is sent over Reticulum links and played by the remote Kaonic audio-ptt plugin on ALSA output.</div>
-          </div>
+        <div class="playback-status">
+          <div class="playback-status-title">Last received audio</div>
+          <div id="playback-status" class="playback-status-body">Waiting for audio…</div>
         </div>
+        <div id="status" class="status">Loading…</div>
+        <div class="hint">Audio is sent over Reticulum links and played by the remote Kaonic audio-ptt plugin on ALSA output.</div>
       </div>
     </section>
   </main>
+  <div class="ptt-overlay">
+    <div class="mic-wrap">
+      <button id="mic-btn" class="mic-btn" type="button" aria-label="Push to Talk">
+        <svg class="mic-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <path fill="currentColor" d="M12 15.5a4 4 0 0 0 4-4v-5a4 4 0 1 0-8 0v5a4 4 0 0 0 4 4Zm-6-4a1 1 0 1 1 2 0a4 4 0 1 0 8 0a1 1 0 1 1 2 0a6 6 0 0 1-5 5.91V20h2a1 1 0 1 1 0 2H9a1 1 0 1 1 0-2h2v-2.59A6 6 0 0 1 6 11.5Z"/>
+        </svg>
+        <span class="mic-label">Push to Talk</span>
+      </button>
+    </div>
+  </div>
   <script>
     (function () {
       const SAMPLE_RATE = 16000;
@@ -395,8 +372,6 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
       const playbackStatusEl = document.getElementById('playback-status');
       const peerListEl = document.getElementById('peer-list');
       const contactsCountEl = document.getElementById('contacts-count');
-      const selectedPeerNameEl = document.getElementById('selected-peer-name');
-      const selectedPeerStatusEl = document.getElementById('selected-peer-status');
 
       let stream = null;
       let audioContext = null;
@@ -464,11 +439,6 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
         return peers;
       }
 
-      function syncTalkButton() {
-        const peer = selectedPeerSnapshot();
-        micBtn.disabled = !peer || peer.status !== 'active';
-      }
-
       function statusClass(status) {
         if (status === 'active') { return 'is-online'; }
         if (status === 'connecting' || status === 'pending' || status === 'waiting') { return 'is-waiting'; }
@@ -522,28 +492,11 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
         });
       }
 
-      function renderSelectedPeerCard() {
-        const selected = selectedPeer();
-        const peer = selectedPeerSnapshot();
-        if (!selected) {
-          selectedPeerNameEl.textContent = 'No contact selected';
-          selectedPeerStatusEl.innerHTML = '<span class="status-dot"></span><span>Choose a contact from the list</span>';
-          return;
-        }
-        selectedPeerNameEl.textContent = selected;
-        const status = peer ? peer.status : 'waiting';
-        selectedPeerStatusEl.innerHTML =
-          '<span class="status-dot ' + statusClass(status) + '"></span>' +
-          '<span>' + statusLabel(status) + '</span>';
-      }
-
       async function loadStatus() {
         const resp = await fetch('/api/status');
         const data = await resp.json();
         currentStatus = data;
         renderPeerList();
-        renderSelectedPeerCard();
-        syncTalkButton();
         const peer = selectedPeerSnapshot();
         const lines = [
           'My destination: ' + data.local_destination,
@@ -656,11 +609,6 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
           setStatus('Select a contact first.');
           return;
         }
-        const peer = selectedPeerSnapshot();
-        if (!peer || peer.status !== 'active') {
-          setStatus('Selected contact is not online yet.');
-          return;
-        }
         starting = true;
         try {
           await saveSelectedPeer(chosenPeer);
@@ -689,7 +637,7 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
           muteNode.connect(audioContext.destination);
           active = true;
           micBtn.classList.add('is-active');
-          setStatus('Talking to ' + peer.hash + '… release to stop');
+          setStatus('Talking to ' + chosenPeer + '… release to stop');
         } catch (err) {
           setStatus('Error: ' + (err && err.message ? err.message : err));
           await stopTalk();
@@ -789,7 +737,7 @@ struct AppState {
 
 enum ActiveTx {
     Alsa(TxControl),
-    Browser,
+    Browser(u64),
 }
 
 struct TxControl {
@@ -817,6 +765,7 @@ struct Stats {
     last_played_ts: AtomicU64,
     last_played_samples: AtomicU64,
     last_playback_error_ts: AtomicU64,
+    browser_session_seq: AtomicU64,
     seq: AtomicU64,
     last_remote: Mutex<Option<String>>,
     last_playback_error: StdMutex<Option<String>>,
@@ -843,6 +792,10 @@ impl Stats {
             .lock()
             .ok()
             .and_then(|guard| guard.clone())
+    }
+
+    fn next_browser_session_id(&self) -> u64 {
+        self.browser_session_seq.fetch_add(1, Ordering::Relaxed) + 1
     }
 }
 
@@ -1070,18 +1023,25 @@ async fn get_browser_ptt_ws(
         return (StatusCode::CONFLICT, Json(MessageResponse { detail: err })).into_response();
     }
 
+    let browser_session_id = state.stats.next_browser_session_id();
     {
         let mut guard = state.tx_session.lock().await;
-        if guard.is_some() {
-            return (
-                StatusCode::CONFLICT,
-                Json(MessageResponse {
-                    detail: "another transmit source is already active".into(),
-                }),
-            )
-                .into_response();
+        match guard.as_ref() {
+            Some(ActiveTx::Alsa(_)) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(MessageResponse {
+                        detail: "another transmit source is already active".into(),
+                    }),
+                )
+                    .into_response();
+            }
+            Some(ActiveTx::Browser(_)) => {
+                log::debug!("replacing previous browser PTT session");
+            }
+            None => {}
         }
-        *guard = Some(ActiveTx::Browser);
+        *guard = Some(ActiveTx::Browser(browser_session_id));
     }
     state.stats.transmitting.store(true, Ordering::Relaxed);
 
@@ -1089,7 +1049,7 @@ async fn get_browser_ptt_ws(
         if let Err(err) = browser_transmit_loop(state.clone(), cfg, remote_peer, socket).await {
             log::warn!("browser transmit session ended with error: {err}");
         }
-        finish_browser_tx_session(&state).await;
+        finish_browser_tx_session(&state, browser_session_id).await;
     })
 }
 
@@ -1219,8 +1179,8 @@ async fn stop_alsa_tx_task(state: &AppState) -> Result<String, String> {
         let mut guard = state.tx_session.lock().await;
         match guard.take() {
             Some(ActiveTx::Alsa(control)) => Some(control),
-            Some(ActiveTx::Browser) => {
-                *guard = Some(ActiveTx::Browser);
+            Some(ActiveTx::Browser(session_id)) => {
+                *guard = Some(ActiveTx::Browser(session_id));
                 return Err("browser PTT session is active; release the browser microphone button to stop transmit".into());
             }
             None => None,
@@ -1246,12 +1206,12 @@ async fn shutdown_tx_session(state: &AppState) {
     state.stats.transmitting.store(false, Ordering::Relaxed);
 }
 
-async fn finish_browser_tx_session(state: &AppState) {
+async fn finish_browser_tx_session(state: &AppState, browser_session_id: u64) {
     let mut guard = state.tx_session.lock().await;
-    if matches!(guard.as_ref(), Some(ActiveTx::Browser)) {
+    if matches!(guard.as_ref(), Some(ActiveTx::Browser(id)) if *id == browser_session_id) {
         *guard = None;
+        state.stats.transmitting.store(false, Ordering::Relaxed);
     }
-    state.stats.transmitting.store(false, Ordering::Relaxed);
 }
 
 async fn build_status(state: &AppState) -> StatusSnapshot {
@@ -1259,7 +1219,7 @@ async fn build_status(state: &AppState) -> StatusSnapshot {
         let guard = state.tx_session.lock().await;
         match guard.as_ref() {
             Some(ActiveTx::Alsa(_)) => Some("alsa"),
-            Some(ActiveTx::Browser) => Some("browser"),
+            Some(ActiveTx::Browser(_)) => Some("browser"),
             None => None,
         }
     };
@@ -1340,8 +1300,8 @@ async fn browser_transmit_loop(
     remote_peer: AddressHash,
     mut socket: WebSocket,
 ) -> Result<(), String> {
-    let mut codec = TxCodec::new(&cfg)?;
     let expected_samples = frame_samples(&cfg);
+    let mut codec = TxCodec::new(&cfg)?;
 
     while let Some(message) = socket.next().await {
         let message = message.map_err(|err| format!("read browser websocket frame: {err}"))?;
