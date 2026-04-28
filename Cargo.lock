@@ -569,6 +569,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2cefd04ca4a2f096acf5f44da5e5931436d030a620901f1fe8fa773e6b9de65b"
+
+[[package]]
 name = "codee"
 version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1831,11 +1837,12 @@ dependencies = [
 
 [[package]]
 name = "kaonic-audio-ptt"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "axum 0.7.9",
  "axum-server",
  "clap",
+ "codec2",
  "env_logger 0.11.10",
  "futures-util",
  "kaonic-gateway",

@@ -1,7 +1,7 @@
 [kaonic-plugin]
 name = "Kaonic Audio PTT"
 description = "Standalone ALSA-based push-to-talk service with PCM audio over Reticulum"
-version = "0.1.0"
+version = "0.1.2"
 service = "kaonic-audio-ptt.service"
 developer = "Beechat Network Systems Ltd"
 channel = "experimental"

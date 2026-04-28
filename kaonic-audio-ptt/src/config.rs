@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_HTTP_BIND: &str = "0.0.0.0:8780";
 pub const DEFAULT_CTRL_SERVER: &str = "192.168.10.1:9090";
 pub const DEFAULT_RNS_MODULE: usize = 0;
+pub const DEFAULT_PACKET_FRAMES: u32 = 4;
+pub const CODEC2_SAMPLE_RATE_HZ: u32 = 8_000;
+pub const CODEC2_FRAME_MS: u32 = 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginConfig {
@@ -17,7 +20,7 @@ pub struct PluginConfig {
     pub kaonic_ctrl_server: SocketAddr,
     #[serde(default = "default_rns_module")]
     pub rns_module: usize,
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub identity_seed: String,
     #[serde(default)]
     pub selected_peer: Option<String>,
@@ -25,6 +28,10 @@ pub struct PluginConfig {
     pub playback_device: String,
     pub frame_ms: u32,
     pub sample_rate_hz: u32,
+    #[serde(default = "default_packet_frames")]
+    pub packet_frames: u32,
+    #[serde(default = "default_audio_output")]
+    pub audio_output: String,
 }
 
 impl Default for PluginConfig {
@@ -37,8 +44,10 @@ impl Default for PluginConfig {
             selected_peer: None,
             capture_device: "default".into(),
             playback_device: "default".into(),
-            frame_ms: 20,
-            sample_rate_hz: 16_000,
+            frame_ms: CODEC2_FRAME_MS,
+            sample_rate_hz: CODEC2_SAMPLE_RATE_HZ,
+            packet_frames: DEFAULT_PACKET_FRAMES,
+            audio_output: default_audio_output(),
         }
     }
 }
@@ -48,11 +57,17 @@ impl PluginConfig {
         if self.rns_module > 1 {
             return Err("rns_module must be 0 or 1".into());
         }
-        if self.frame_ms != 20 {
-            return Err("only 20ms audio framing is currently supported".into());
+        if self.frame_ms != CODEC2_FRAME_MS {
+            return Err("only 20ms audio framing is currently supported (Codec2 native frame)".into());
         }
-        if self.sample_rate_hz != 16_000 {
-            return Err("only 16kHz audio is currently supported".into());
+        if self.sample_rate_hz != CODEC2_SAMPLE_RATE_HZ {
+            return Err("only 8kHz audio is currently supported (Codec2 native rate)".into());
+        }
+        if !(1..=8).contains(&self.packet_frames) {
+            return Err("packet_frames must be between 1 and 8".into());
+        }
+        if self.audio_output != "alsa" && self.audio_output != "browser" {
+            return Err("audio_output must be 'alsa' or 'browser'".into());
         }
         if self.identity_seed.len() != 64
             || !self.identity_seed.chars().all(|c| c.is_ascii_hexdigit())
@@ -74,6 +89,14 @@ fn default_ctrl_server() -> SocketAddr {
 
 fn default_rns_module() -> usize {
     DEFAULT_RNS_MODULE
+}
+
+fn default_packet_frames() -> u32 {
+    DEFAULT_PACKET_FRAMES
+}
+
+fn default_audio_output() -> String {
+    "alsa".to_string()
 }
 
 pub fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf, String> {
@@ -98,8 +121,30 @@ pub fn load_or_create_config(path: &Path) -> Result<PluginConfig, String> {
         let raw = fs::read_to_string(path).map_err(|err| format!("read config: {err}"))?;
         let mut cfg: PluginConfig = toml::from_str(&raw)
             .map_err(|err| format!("parse config {}: {err}", path.display()))?;
+        let mut dirty = false;
         if cfg.identity_seed.is_empty() {
             cfg.identity_seed = generate_identity_seed();
+            dirty = true;
+        }
+        if cfg.sample_rate_hz != CODEC2_SAMPLE_RATE_HZ {
+            log::warn!(
+                "config sample_rate_hz={} no longer supported; migrating to {} Hz for Codec2",
+                cfg.sample_rate_hz,
+                CODEC2_SAMPLE_RATE_HZ
+            );
+            cfg.sample_rate_hz = CODEC2_SAMPLE_RATE_HZ;
+            dirty = true;
+        }
+        if cfg.frame_ms != CODEC2_FRAME_MS {
+            log::warn!(
+                "config frame_ms={} no longer supported; migrating to {} ms for Codec2",
+                cfg.frame_ms,
+                CODEC2_FRAME_MS
+            );
+            cfg.frame_ms = CODEC2_FRAME_MS;
+            dirty = true;
+        }
+        if dirty {
             save_config(path, &cfg)?;
         }
         cfg.validate()?;

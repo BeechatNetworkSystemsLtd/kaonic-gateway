@@ -25,20 +25,23 @@ use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
 use reticulum::transport::{TimerConfig, Transport, TransportConfig};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::audio::{frame_samples, AudioDevices};
+use crate::audio::AudioDevices;
 use crate::codec::{RxCodec, TxCodec};
 use crate::config::{
     load_or_create_config, normalize_selected_peer, resolve_config_path, save_config, PluginConfig,
 };
 
-const PACKET_MAGIC: [u8; 4] = *b"KPT2";
-const PACKET_HEADER_LEN: usize = 8;
+const PACKET_MAGIC: [u8; 4] = *b"KPT3";
+const PACKET_HEADER_LEN: usize = 10;
+const PACKET_FLAG_BURST_START: u8 = 0x01;
+const PACKET_FLAG_BURST_END: u8 = 0x02;
 const PLAYBACK_BUFFER_FRAMES: usize = 64;
 const RECEIVE_PLAYBACK_BUFFER_FRAMES: usize = 128;
+const BROWSER_AUDIO_CHANNEL_CAPACITY: usize = 32;
 const AUDIO_PTT_ANNOUNCE_MAGIC: &[u8] = b"KAP1";
 const PLUGIN_TLS_CERT_FILE: &str = "plugin-tls.crt";
 const PLUGIN_TLS_KEY_FILE: &str = "plugin-tls.key";
@@ -67,7 +70,7 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
       min-height: 100vh;
       display: flex;
       align-items: stretch;
-      padding-bottom: 15rem;
+      padding-bottom: 11rem;
       box-sizing: border-box;
     }
     .sidebar {
@@ -218,15 +221,15 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
       pointer-events: auto;
     }
     .mic-btn {
-      width: min(20rem, 62vw);
-      height: min(20rem, 62vw);
+      width: min(11rem, 42vw);
+      height: min(11rem, 42vw);
       border: 0;
       border-radius: 999px;
       background: linear-gradient(180deg, #fcd34d, #f59e0b);
       color: #451a03;
-      font-size: 1.35rem;
+      font-size: 1.1rem;
       font-weight: 800;
-      box-shadow: 0 20px 40px rgba(245, 158, 11, 0.35);
+      box-shadow: 0 12px 28px rgba(245, 158, 11, 0.35);
       touch-action: none;
       user-select: none;
       -webkit-user-select: none;
@@ -236,7 +239,7 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
       flex-direction: column;
       align-items: center;
       justify-content: center;
-      gap: 0.8rem;
+      gap: 0.5rem;
       text-align: center;
     }
     .mic-btn:focus {
@@ -248,17 +251,18 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
     .mic-btn.is-active {
       transform: scale(0.97);
       background: linear-gradient(180deg, #fde68a, #fbbf24);
-      box-shadow: 0 0 0 0.85rem rgba(251, 191, 36, 0.2);
+      box-shadow: 0 0 0 0.7rem rgba(251, 191, 36, 0.2);
     }
     .mic-icon {
-      width: 3.9rem;
-      height: 3.9rem;
+      width: 2.8rem;
+      height: 2.8rem;
       display: block;
       color: currentColor;
     }
     .mic-label {
-      max-width: 10rem;
+      max-width: 8rem;
       line-height: 1.15;
+      font-size: 0.95rem;
     }
     .status {
       height: 7.4rem;
@@ -292,6 +296,9 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
       text-transform: uppercase;
       letter-spacing: 0.08em;
       margin-bottom: 0.55rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
     }
     .playback-status-body {
       color: #cbd5e1;
@@ -306,6 +313,53 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
       color: #94a3b8;
       font-size: 0.9rem;
       line-height: 1.5;
+    }
+    .audio-toggle {
+      display: flex;
+      gap: 0.4rem;
+      margin-top: 0.6rem;
+      margin-bottom: 0.55rem;
+    }
+    .audio-toggle-btn {
+      flex: 1;
+      padding: 0.55rem 0.5rem;
+      border-radius: 0.65rem;
+      border: 1px solid #334155;
+      background: transparent;
+      color: #94a3b8;
+      font-size: 0.82rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .audio-toggle-btn.is-active {
+      background: #1e3a5f;
+      border-color: #3b82f6;
+      color: #93c5fd;
+    }
+    .rx-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      font-size: 0.75rem;
+      color: #22c55e;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      opacity: 0;
+      transition: opacity 0.2s ease;
+      pointer-events: none;
+    }
+    .rx-badge.is-active { opacity: 1; }
+    .rx-dot {
+      width: 0.45rem;
+      height: 0.45rem;
+      border-radius: 999px;
+      background: #22c55e;
+      animation: rx-pulse 1.1s ease-in-out infinite;
+    }
+    @keyframes rx-pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.3; }
     }
     @media (max-width: 880px) {
       .app {
@@ -331,6 +385,10 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
     <aside class="sidebar">
       <div class="sidebar-header">
         <h1>Kaonic Audio PTT</h1>
+        <div class="audio-toggle">
+          <button id="audio-btn-browser" class="audio-toggle-btn" type="button">Browser Speaker</button>
+          <button id="audio-btn-alsa" class="audio-toggle-btn" type="button">ALSA Card</button>
+        </div>
         <p>Select a contact on the left. Online contacts can be called immediately; offline ones stay saved until their Reticulum link appears.</p>
       </div>
       <div class="contacts-title">
@@ -344,11 +402,13 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
     <section class="content">
       <div class="ptt-shell">
         <div class="playback-status">
-          <div class="playback-status-title">Last received audio</div>
+          <div class="playback-status-title">
+            Last received audio
+            <span id="rx-badge" class="rx-badge"><span class="rx-dot"></span>RECEIVING</span>
+          </div>
           <div id="playback-status" class="playback-status-body">Waiting for audio…</div>
         </div>
         <div id="status" class="status">Loading…</div>
-        <div class="hint">Audio is sent over Reticulum links and played by the remote Kaonic audio-ptt plugin on ALSA output.</div>
       </div>
     </section>
   </main>
@@ -364,8 +424,8 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
   </div>
   <script>
     (function () {
-      const SAMPLE_RATE = 16000;
-      const FRAME_SAMPLES = 320;
+      const SAMPLE_RATE = 8000;
+      const FRAME_SAMPLES = 160;
       const STATUS_POLL_MS = 3000;
       const micBtn = document.getElementById('mic-btn');
       const statusEl = document.getElementById('status');
@@ -385,6 +445,99 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
       let currentStatus = null;
       let pollHandle = null;
       let streamPromise = null;
+
+      // --- Browser RX audio ---
+      const rxBadgeEl = document.getElementById('rx-badge');
+      let audioOutput = localStorage.getItem('kptt-audio-output') || 'alsa';
+      let audioOutputSynced = false;
+      let rxWs = null;
+      let rxCtx = null;
+      let rxNextPlayAt = 0;
+      let rxBadgeTimer = null;
+
+      function pcmBytesToFloat32(buf) {
+        const i16 = new Int16Array(buf);
+        const f32 = new Float32Array(i16.length);
+        for (let i = 0; i < i16.length; i++) { f32[i] = i16[i] / 32768.0; }
+        return f32;
+      }
+
+      function scheduleRxFrame(f32) {
+        if (active) { return; }
+        if (!rxCtx || rxCtx.state === 'suspended') { return; }
+        const now = rxCtx.currentTime;
+        if (rxNextPlayAt < now + 0.01) { rxNextPlayAt = now + 0.12; }
+        const ab = rxCtx.createBuffer(1, f32.length, SAMPLE_RATE);
+        ab.copyToChannel(f32, 0);
+        const src = rxCtx.createBufferSource();
+        src.buffer = ab;
+        src.connect(rxCtx.destination);
+        src.start(rxNextPlayAt);
+        rxNextPlayAt += ab.duration;
+        if (rxBadgeEl) { rxBadgeEl.classList.add('is-active'); }
+        if (rxBadgeTimer) { clearTimeout(rxBadgeTimer); }
+        rxBadgeTimer = setTimeout(function() {
+          if (rxBadgeEl) { rxBadgeEl.classList.remove('is-active'); }
+        }, 500);
+      }
+
+      function startRxAudio() {
+        if (audioOutput !== 'browser') { return; }
+        if (rxWs && (rxWs.readyState === WebSocket.CONNECTING || rxWs.readyState === WebSocket.OPEN)) { return; }
+        if (!rxCtx) { rxCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+        const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/browser-rx';
+        rxWs = new WebSocket(wsUrl);
+        rxWs.binaryType = 'arraybuffer';
+        rxWs.onmessage = function(event) {
+          if (audioOutput === 'browser') { scheduleRxFrame(pcmBytesToFloat32(event.data)); }
+        };
+        rxWs.onclose = function() {
+          rxWs = null;
+          if (audioOutput === 'browser') { setTimeout(startRxAudio, 2000); }
+        };
+        rxWs.onerror = function() { rxWs = null; };
+      }
+
+      function stopRxAudio() {
+        rxNextPlayAt = 0;
+        if (rxBadgeEl) { rxBadgeEl.classList.remove('is-active'); }
+        if (rxBadgeTimer) { clearTimeout(rxBadgeTimer); rxBadgeTimer = null; }
+        if (rxWs) {
+          var closingWs = rxWs; rxWs = null;
+          closingWs.onclose = null; closingWs.close();
+        }
+      }
+
+      function renderAudioToggle() {
+        var btnB = document.getElementById('audio-btn-browser');
+        var btnA = document.getElementById('audio-btn-alsa');
+        if (btnB) { btnB.classList.toggle('is-active', audioOutput === 'browser'); }
+        if (btnA) { btnA.classList.toggle('is-active', audioOutput === 'alsa'); }
+      }
+
+      function setAudioOutput(mode) {
+        audioOutput = mode;
+        localStorage.setItem('kptt-audio-output', mode);
+        renderAudioToggle();
+        if (mode === 'browser') { startRxAudio(); } else { stopRxAudio(); }
+        // Persist to server so ALSA is gated server-side immediately
+        if (currentStatus && currentStatus.config) {
+          fetch('/api/config', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              selected_peer: currentStatus.config.selected_peer || null,
+              capture_device: currentStatus.config.capture_device,
+              playback_device: currentStatus.config.playback_device,
+              audio_output: mode
+            })
+          }).then(function() { return loadStatus(); }).catch(function() {});
+        }
+      }
+
+      document.getElementById('audio-btn-browser').addEventListener('click', function() { setAudioOutput('browser'); });
+      document.getElementById('audio-btn-alsa').addEventListener('click', function() { setAudioOutput('alsa'); });
+      // --- end browser RX audio ---
 
       function setStatus(text) {
         statusEl.textContent = text;
@@ -496,6 +649,17 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
         const resp = await fetch('/api/status');
         const data = await resp.json();
         currentStatus = data;
+        // Sync audio output toggle from server config on first load
+        if (!audioOutputSynced && data.config && data.config.audio_output) {
+          audioOutputSynced = true;
+          const serverMode = data.config.audio_output;
+          if (serverMode !== audioOutput) {
+            audioOutput = serverMode;
+            localStorage.setItem('kptt-audio-output', audioOutput);
+            renderAudioToggle();
+            if (audioOutput === 'browser') { startRxAudio(); } else { stopRxAudio(); }
+          }
+        }
         renderPeerList();
         const peer = selectedPeerSnapshot();
         const lines = [
@@ -540,7 +704,8 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
         const payload = {
           selected_peer: peerHash || null,
           capture_device: currentStatus.config.capture_device,
-          playback_device: currentStatus.config.playback_device
+          playback_device: currentStatus.config.playback_device,
+          audio_output: audioOutput
         };
         const resp = await fetch('/api/config', {
           method: 'PUT',
@@ -649,6 +814,7 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
       async function stopTalk() {
         queue = [];
         active = false;
+        rxNextPlayAt = 0; // flush scheduler so stale in-flight frames don't replay
         micBtn.classList.remove('is-active');
         if (processor) {
           processor.onaudioprocess = null;
@@ -680,6 +846,8 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
           document.activeElement.blur();
         }
         micBtn.setPointerCapture(event.pointerId);
+        // Resume browser RX audio context on first user gesture (autoplay policy)
+        if (rxCtx && rxCtx.state === 'suspended') { rxCtx.resume(); }
         startTalk();
       });
       micBtn.addEventListener('pointerup', function () { stopTalk(); });
@@ -689,12 +857,16 @@ const BROWSER_PAGE: &str = r#"<!doctype html>
 
       window.addEventListener('beforeunload', function () {
         stopTalk();
+        stopRxAudio();
         if (stream) {
           stream.getTracks().forEach(function (track) { track.stop(); });
           stream = null;
         }
         if (pollHandle) { clearInterval(pollHandle); }
       });
+
+      renderAudioToggle();
+      startRxAudio();
 
       loadStatus().catch(function (err) {
         setStatus('Error: ' + (err && err.message ? err.message : err));
@@ -733,6 +905,8 @@ struct AppState {
     tx_session: Arc<Mutex<Option<ActiveTx>>>,
     stats: Arc<Stats>,
     playback_tx: mpsc::Sender<Vec<i16>>,
+    rx_codec: Arc<Mutex<RxCodec>>,
+    browser_audio_tx: Arc<broadcast::Sender<Vec<u8>>>,
 }
 
 enum ActiveTx {
@@ -832,6 +1006,12 @@ struct ConfigUpdate {
     selected_peer: Option<String>,
     capture_device: String,
     playback_device: String,
+    #[serde(default = "default_audio_output_update")]
+    audio_output: String,
+}
+
+fn default_audio_output_update() -> String {
+    "alsa".to_string()
 }
 
 #[derive(Debug, Serialize)]
@@ -923,6 +1103,14 @@ async fn main() -> Result<(), std::process::ExitCode> {
     let (playback_tx, playback_rx) = mpsc::channel(RECEIVE_PLAYBACK_BUFFER_FRAMES);
     let playback_cancel = CancellationToken::new();
 
+    let rx_codec = RxCodec::new(&cfg).unwrap_or_else(|err| {
+        log::error!("init codec2 receiver: {err}");
+        std::process::exit(1);
+    });
+
+    let (browser_audio_tx, _) =
+        broadcast::channel::<Vec<u8>>(BROWSER_AUDIO_CHANNEL_CAPACITY);
+
     let state = AppState {
         config_path: Arc::new(config_path),
         config: Arc::new(RwLock::new(cfg.clone())),
@@ -933,6 +1121,8 @@ async fn main() -> Result<(), std::process::ExitCode> {
         tx_session: Arc::new(Mutex::new(None)),
         stats: Arc::new(Stats::default()),
         playback_tx,
+        rx_codec: Arc::new(Mutex::new(rx_codec)),
+        browser_audio_tx: Arc::new(browser_audio_tx),
     };
 
     let playback_cfg = cfg.clone();
@@ -961,6 +1151,7 @@ async fn main() -> Result<(), std::process::ExitCode> {
     let app = Router::new()
         .route("/", get(get_browser_page))
         .route("/ws/browser-ptt", get(get_browser_ptt_ws))
+        .route("/ws/browser-rx", get(get_browser_rx_ws))
         .route("/api/status", get(get_status))
         .route("/api/config", get(get_config).put(put_config))
         .route("/api/audio/devices", get(get_audio_devices))
@@ -1080,6 +1271,7 @@ async fn put_config(
     cfg.selected_peer = selected_peer.clone();
     cfg.capture_device = update.capture_device.trim().to_string();
     cfg.playback_device = update.playback_device.trim().to_string();
+    cfg.audio_output = update.audio_output.trim().to_string();
     if cfg.capture_device.is_empty() || cfg.playback_device.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -1271,7 +1463,8 @@ async fn transmit_loop(
     remote_peer: AddressHash,
     cancel: CancellationToken,
 ) -> Result<(), String> {
-    let mut codec = TxCodec::new(&cfg)?;
+    let mut burst = BurstTx::new(&cfg)?;
+    let samples_per_frame = burst.samples_per_frame();
     let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<i16>>(PLAYBACK_BUFFER_FRAMES);
     let capture_cancel = cancel.child_token();
     let capture_cfg = cfg.clone();
@@ -1285,11 +1478,21 @@ async fn transmit_loop(
             _ = cancel.cancelled() => break,
             next = frame_rx.recv() => {
                 let Some(frame) = next else { break; };
-                send_pcm_frame(&state, &mut codec, remote_peer, &frame).await?;
+                if frame.len() != samples_per_frame {
+                    return Err(format!(
+                        "capture frame size {} does not match codec frame size {}",
+                        frame.len(),
+                        samples_per_frame
+                    ));
+                }
+                burst.push_pcm(&state, remote_peer, &frame).await?;
             }
         }
     }
 
+    if let Err(err) = burst.flush(&state, remote_peer, true).await {
+        log::debug!("flush trailing burst packet: {err}");
+    }
     let _ = capture_task.await;
     Ok(())
 }
@@ -1300,83 +1503,167 @@ async fn browser_transmit_loop(
     remote_peer: AddressHash,
     mut socket: WebSocket,
 ) -> Result<(), String> {
-    let expected_samples = frame_samples(&cfg);
-    let mut codec = TxCodec::new(&cfg)?;
+    let mut burst = BurstTx::new(&cfg)?;
+    let expected_samples = burst.samples_per_frame();
+    let mut pcm_scratch = vec![0i16; expected_samples];
 
     while let Some(message) = socket.next().await {
         let message = message.map_err(|err| format!("read browser websocket frame: {err}"))?;
         match message {
             Message::Binary(payload) => {
-                let frame = decode_browser_pcm(&payload, expected_samples)?;
-                send_pcm_frame(&state, &mut codec, remote_peer, &frame).await?;
+                decode_browser_pcm_into(&payload, &mut pcm_scratch)?;
+                burst.push_pcm(&state, remote_peer, &pcm_scratch).await?;
             }
             Message::Close(_) => break,
             Message::Ping(_) | Message::Pong(_) | Message::Text(_) => {}
         }
     }
 
-    Ok(())
-}
-
-async fn send_pcm_frame(
-    state: &AppState,
-    codec: &mut TxCodec,
-    remote_peer: AddressHash,
-    frame: &[i16],
-) -> Result<(), String> {
-    let encoded = codec.encode(frame)?;
-    let seq = state.stats.seq.fetch_add(1, Ordering::Relaxed) as u32;
-    let packet = encode_packet(seq, &encoded);
-    let sent = state
-        .transport
-        .lock()
-        .await
-        .send_to_out_links(&remote_peer, &packet)
-        .await;
-    if sent.is_empty() {
-        return Err(format!(
-            "selected peer {} does not have an active Reticulum link",
-            remote_peer.to_hex_string()
-        ));
+    if let Err(err) = burst.flush(&state, remote_peer, true).await {
+        log::debug!("flush trailing browser burst packet: {err}");
     }
-    state.stats.tx_packets.fetch_add(1, Ordering::Relaxed);
-    state
-        .stats
-        .tx_bytes
-        .fetch_add(packet.len() as u64, Ordering::Relaxed);
     Ok(())
 }
 
-fn encode_packet(seq: u32, payload: &[u8]) -> Vec<u8> {
-    let mut packet = Vec::with_capacity(PACKET_HEADER_LEN + payload.len());
-    packet.extend_from_slice(&PACKET_MAGIC);
-    packet.extend_from_slice(&seq.to_be_bytes());
-    packet.extend_from_slice(payload);
-    packet
+/// Accumulates Codec2 frames into a single Reticulum packet to amortise per-packet
+/// overhead, then ships it on the audio out-link. All buffers are reused across
+/// frames so the steady-state hot path does no allocations.
+struct BurstTx {
+    codec: TxCodec,
+    target_frames: u8,
+    pending_frames: u8,
+    sent_packets: u64,
+    encoded_buf: Vec<u8>,
+    packet_buf: Vec<u8>,
 }
 
-fn decode_packet(packet: &[u8]) -> Option<&[u8]> {
+impl BurstTx {
+    fn new(cfg: &PluginConfig) -> Result<Self, String> {
+        let codec = TxCodec::new(cfg)?;
+        let target_frames = cfg.packet_frames.clamp(1, u8::MAX as u32) as u8;
+        let max_payload = codec.bytes_per_frame() * target_frames as usize;
+        Ok(Self {
+            codec,
+            target_frames,
+            pending_frames: 0,
+            sent_packets: 0,
+            encoded_buf: Vec::with_capacity(max_payload),
+            packet_buf: Vec::with_capacity(PACKET_HEADER_LEN + max_payload),
+        })
+    }
+
+    fn samples_per_frame(&self) -> usize {
+        self.codec.samples_per_frame()
+    }
+
+    async fn push_pcm(
+        &mut self,
+        state: &AppState,
+        remote_peer: AddressHash,
+        pcm: &[i16],
+    ) -> Result<(), String> {
+        self.codec.encode_into(pcm, &mut self.encoded_buf)?;
+        self.pending_frames += 1;
+        if self.pending_frames >= self.target_frames {
+            self.flush(state, remote_peer, false).await?;
+        }
+        Ok(())
+    }
+
+    async fn flush(
+        &mut self,
+        state: &AppState,
+        remote_peer: AddressHash,
+        burst_end: bool,
+    ) -> Result<(), String> {
+        if self.pending_frames == 0 {
+            return Ok(());
+        }
+        let n_frames = self.pending_frames;
+        let base_seq =
+            state.stats.seq.fetch_add(n_frames as u64, Ordering::Relaxed) as u32;
+        let mut flags = 0u8;
+        if self.sent_packets == 0 {
+            flags |= PACKET_FLAG_BURST_START;
+        }
+        if burst_end {
+            flags |= PACKET_FLAG_BURST_END;
+        }
+        encode_packet(
+            base_seq,
+            flags,
+            n_frames,
+            &self.encoded_buf,
+            &mut self.packet_buf,
+        );
+        let sent = state
+            .transport
+            .lock()
+            .await
+            .send_to_out_links(&remote_peer, &self.packet_buf)
+            .await;
+        let packet_len = self.packet_buf.len() as u64;
+        self.pending_frames = 0;
+        self.encoded_buf.clear();
+        if sent.is_empty() {
+            return Err(format!(
+                "selected peer {} does not have an active Reticulum link",
+                remote_peer.to_hex_string()
+            ));
+        }
+        self.sent_packets += 1;
+        state.stats.tx_packets.fetch_add(1, Ordering::Relaxed);
+        state.stats.tx_bytes.fetch_add(packet_len, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+fn encode_packet(base_seq: u32, flags: u8, n_frames: u8, payload: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(PACKET_HEADER_LEN + payload.len());
+    out.extend_from_slice(&PACKET_MAGIC);
+    out.extend_from_slice(&base_seq.to_be_bytes());
+    out.push(flags);
+    out.push(n_frames);
+    out.extend_from_slice(payload);
+}
+
+struct PacketHeader {
+    base_seq: u32,
+    flags: u8,
+    n_frames: u8,
+}
+
+fn decode_packet(packet: &[u8]) -> Option<(PacketHeader, &[u8])> {
     if packet.len() < PACKET_HEADER_LEN {
         return None;
     }
     if packet[..4] != PACKET_MAGIC {
         return None;
     }
-    Some(&packet[PACKET_HEADER_LEN..])
+    let base_seq = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+    Some((
+        PacketHeader {
+            base_seq,
+            flags: packet[8],
+            n_frames: packet[9],
+        },
+        &packet[PACKET_HEADER_LEN..],
+    ))
 }
 
-fn decode_browser_pcm(payload: &[u8], expected_samples: usize) -> Result<Vec<i16>, String> {
-    if payload.len() != expected_samples * 2 {
+fn decode_browser_pcm_into(payload: &[u8], out: &mut [i16]) -> Result<(), String> {
+    if payload.len() != out.len() * 2 {
         return Err(format!(
             "browser audio frame must be exactly {} bytes, got {}",
-            expected_samples * 2,
+            out.len() * 2,
             payload.len()
         ));
     }
-    Ok(payload
-        .chunks_exact(2)
-        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
-        .collect())
+    for (chunk, slot) in payload.chunks_exact(2).zip(out.iter_mut()) {
+        *slot = i16::from_le_bytes([chunk[0], chunk[1]]);
+    }
+    Ok(())
 }
 
 fn parse_selected_peer(cfg: &PluginConfig) -> Option<AddressHash> {
@@ -1469,39 +1756,105 @@ async fn handle_received_audio(
             .fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
-    let body = decode_packet(payload).ok_or_else(|| "invalid audio packet header".to_string())?;
-    let frame_len = frame_samples(cfg);
-    let mut codec = RxCodec::new(cfg)?;
-    let pcm = codec.decode(body, frame_len)?;
+    let (header, body) =
+        decode_packet(payload).ok_or_else(|| "invalid audio packet header".to_string())?;
+    if header.n_frames == 0 {
+        return Err("audio packet contains no frames".into());
+    }
+    let _ = (header.base_seq, header.flags); // reserved for jitter buffer / burst markers
+    let mut codec = state.rx_codec.lock().await;
+    let bytes_per_frame = codec.bytes_per_frame();
+    let samples_per_frame = codec.samples_per_frame();
+    let expected_len = bytes_per_frame * header.n_frames as usize;
+    if body.len() != expected_len {
+        return Err(format!(
+            "codec2 payload mismatch: {} bytes for {} frames (expected {})",
+            body.len(),
+            header.n_frames,
+            expected_len
+        ));
+    }
     let playback_wait = Duration::from_millis(std::cmp::max((cfg.frame_ms as u64) * 6, 120));
-    match tokio::time::timeout(playback_wait, state.playback_tx.send(pcm)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(_)) => {
-            return Err("playback loop is unavailable".into());
-        }
-        Err(_) => {
-            log::warn!(
-                "playback buffer stayed full for {} ms, dropping received frame",
-                playback_wait.as_millis()
-            );
-            state.stats.playback_drops.fetch_add(1, Ordering::Relaxed);
-            state
-                .stats
-                .record_playback_error(format!(
-                    "playback buffer stayed full for {} ms, dropping received frame",
-                    playback_wait.as_millis()
-                ))
-                .await;
-            return Ok(());
+    let mut delivered = false;
+    for i in 0..header.n_frames as usize {
+        let start = i * bytes_per_frame;
+        let chunk = &body[start..start + bytes_per_frame];
+        let mut pcm = vec![0i16; samples_per_frame];
+        codec.decode_into(chunk, &mut pcm)?;
+        // Broadcast raw i16-LE bytes to any connected browser listeners.
+        // Fire-and-forget: lagged or absent subscribers are silently skipped.
+        let pcm_bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let _ = state.browser_audio_tx.send(pcm_bytes);
+        delivered = true;
+
+        // Only feed ALSA when the user has not selected browser output.
+        if cfg.audio_output != "browser" {
+            match tokio::time::timeout(playback_wait, state.playback_tx.send(pcm)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Err("playback loop is unavailable".into()),
+                Err(_) => {
+                    let dropped = header.n_frames as usize - i;
+                    log::warn!(
+                        "playback buffer stayed full for {} ms, dropping {} remaining frame(s)",
+                        playback_wait.as_millis(),
+                        dropped
+                    );
+                    state
+                        .stats
+                        .playback_drops
+                        .fetch_add(dropped as u64, Ordering::Relaxed);
+                    state
+                        .stats
+                        .record_playback_error(format!(
+                            "playback buffer stayed full for {} ms, dropping {} frame(s)",
+                            playback_wait.as_millis(),
+                            dropped
+                        ))
+                        .await;
+                    break;
+                }
+            }
         }
     }
-    *state.stats.last_remote.lock().await = Some(remote);
+    drop(codec);
+    if delivered {
+        *state.stats.last_remote.lock().await = Some(remote);
+    }
     state.stats.rx_packets.fetch_add(1, Ordering::Relaxed);
     state
         .stats
         .rx_bytes
         .fetch_add(payload.len() as u64, Ordering::Relaxed);
     Ok(())
+}
+
+async fn get_browser_rx_ws(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> axum::response::Response {
+    ws.on_upgrade(move |socket| browser_rx_loop(state, socket))
+}
+
+async fn browser_rx_loop(state: AppState, mut socket: WebSocket) {
+    let mut rx = state.browser_audio_tx.subscribe();
+    loop {
+        match rx.recv().await {
+            Ok(pcm_bytes) => {
+                if socket
+                    .send(Message::Binary(pcm_bytes.into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                log::debug!("browser-rx ws lagged {n} frames; skipping stale audio");
+                continue;
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
 }
 
 fn spawn_announce_tx(state: AppState, cancel: CancellationToken) {
@@ -1511,6 +1864,11 @@ fn spawn_announce_tx(state: AppState, cancel: CancellationToken) {
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 _ = interval.tick() => {
+                    // Skip announces during transmit so the radio's outbound queue is
+                    // dedicated to audio frames and we don't fight for transport lock.
+                    if state.stats.transmitting.load(Ordering::Relaxed) {
+                        continue;
+                    }
                     state.transport.lock().await.send_announce(&state.destination, Some(AUDIO_PTT_ANNOUNCE_MAGIC)).await;
                 }
             }
@@ -1650,25 +2008,39 @@ mod tests {
 
     #[test]
     fn packet_round_trip_preserves_payload() {
-        let packet = encode_packet(42, b"hello");
-        assert_eq!(decode_packet(&packet), Some(b"hello".as_slice()));
+        let mut packet = Vec::new();
+        encode_packet(42, PACKET_FLAG_BURST_START, 3, b"hello-payload", &mut packet);
+        let (header, body) = decode_packet(&packet).expect("decoded header");
+        assert_eq!(header.base_seq, 42);
+        assert_eq!(header.flags, PACKET_FLAG_BURST_START);
+        assert_eq!(header.n_frames, 3);
+        assert_eq!(body, b"hello-payload");
     }
 
     #[test]
     fn packet_decoder_rejects_invalid_magic() {
-        assert!(decode_packet(b"nopepayload").is_none());
+        let mut bad = b"nope".to_vec();
+        bad.extend_from_slice(&[0u8; PACKET_HEADER_LEN]);
+        assert!(decode_packet(&bad).is_none());
+    }
+
+    #[test]
+    fn packet_decoder_rejects_short_buffer() {
+        assert!(decode_packet(b"KPT3").is_none());
     }
 
     #[test]
     fn browser_pcm_decoder_accepts_expected_frame() {
-        let frame = vec![0u8; 640];
-        let pcm = decode_browser_pcm(&frame, 320).expect("valid browser PCM frame");
-        assert_eq!(pcm.len(), 320);
+        let mut out = vec![0i16; 160];
+        let payload = vec![0u8; 320];
+        decode_browser_pcm_into(&payload, &mut out).expect("valid browser PCM frame");
     }
 
     #[test]
     fn browser_pcm_decoder_rejects_wrong_size() {
-        let err = decode_browser_pcm(&[0u8; 12], 320).expect_err("wrong browser PCM frame size");
-        assert!(err.contains("exactly 640 bytes"));
+        let mut out = vec![0i16; 160];
+        let err = decode_browser_pcm_into(&[0u8; 12], &mut out)
+            .expect_err("wrong browser PCM frame size");
+        assert!(err.contains("exactly 320 bytes"));
     }
 }
