@@ -7,7 +7,8 @@ use crate::app_types::{
     GatewayStatusDto, NetworkPortStatusDto, RadioModuleConfigDto, ServiceStatusDto, SystemStatusDto,
 };
 use crate::system_metrics::{
-    read_cpu_percent_async, read_fs_mb, read_gateway_services, read_mem_mb, read_os_details,
+    read_cpu_freq_mhz, read_cpu_percent_async, read_fs_mb, read_gateway_services, read_mem_mb,
+    read_os_details,
 };
 
 fn radio_label(index: usize) -> &'static str {
@@ -40,7 +41,7 @@ pub async fn get_gateway_status() -> Result<GatewayStatusDto, ServerFnError> {
         .collect();
 
     let system = read_system_status_async().await;
-    let services = read_gateway_services();
+    let services = read_gateway_services().await;
     let network_ports = state.network_ports(&services);
 
     Ok(GatewayStatusDto {
@@ -65,6 +66,7 @@ async fn read_system_status_async() -> SystemStatusDto {
     let os_details = read_os_details();
     SystemStatusDto {
         cpu_percent: cpu,
+        cpu_freq_mhz: read_cpu_freq_mhz(),
         ram_used_mb,
         ram_total_mb,
         fs_free_mb,
@@ -135,6 +137,7 @@ const WS_SCRIPT: &str = r#"
           var fsPct = fsTotal > 0 ? Math.round((fsTotal - fsFree) * 100 / fsTotal) : 0;
           set('os-val', sys.os_details || 'Unknown');
           set('cpu-pct', cpu.toFixed(1) + '%');
+          set('cpu-freq-val', sys.cpu_freq_mhz ? sys.cpu_freq_mhz + ' MHz' : '—');
           bar('cpu-bar', cpu.toFixed(0));
           set('ram-val', ramUsed + ' / ' + ramTotal + ' MB');
           bar('ram-bar', ramPct);
@@ -357,6 +360,12 @@ fn StatusView(status: GatewayStatusDto) -> impl IntoView {
 #[component]
 fn SystemCard(system: SystemStatusDto) -> impl IntoView {
     let cpu = system.cpu_percent;
+    let cpu_freq = system.cpu_freq_mhz;
+    let cpu_freq_text = if cpu_freq > 0 {
+        format!("{cpu_freq} MHz")
+    } else {
+        "—".to_string()
+    };
     let ram_used = system.ram_used_mb;
     let ram_total = system.ram_total_mb;
     let fs_free = system.fs_free_mb;
@@ -387,6 +396,10 @@ fn SystemCard(system: SystemStatusDto) -> impl IntoView {
                     <div class="progress-fill" id="cpu-bar" style=format!("width:{cpu:.0}%")></div>
                 </div>
                 <span class="metric-value" id="cpu-pct">{format!("{cpu:.1}%")}</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">"CPU Clock"</span>
+                <span class="info-value" id="cpu-freq-val">{cpu_freq_text}</span>
             </div>
             <div class="metric-row">
                 <span class="metric-label">"RAM"</span>
@@ -612,6 +625,10 @@ fn RadioModuleCard(index: usize, module: RadioModuleConfigDto) -> impl IntoView 
     use radio_common::modulation::{Modulation, OfdmBandwidthOption, OfdmMcs};
     let freq_mhz = module.radio_config.freq.as_mhz();
     let spacing_khz = module.radio_config.channel_spacing.as_khz();
+    let accel_label = match module.accelerator {
+        radio_common::Accelerator::Native => "Native",
+        radio_common::Accelerator::Hardware => "Hardware (FPGA)",
+    };
     let channel = module.radio_config.channel;
     let bw = format!("{:?}", module.radio_config.bandwidth_filter);
 
@@ -639,7 +656,6 @@ fn RadioModuleCard(index: usize, module: RadioModuleConfigDto) -> impl IntoView 
                 vec![
                     ("MCS", mcs.to_string()),
                     ("Bandwidth", opt.to_string()),
-                    ("PDT", o.pdt.to_string()),
                     ("TX Power", format!("{} dBm", o.tx_power)),
                 ],
             )
@@ -691,6 +707,10 @@ fn RadioModuleCard(index: usize, module: RadioModuleConfigDto) -> impl IntoView 
             <div class="info-row">
                 <span class="info-label">"Bandwidth"</span>
                 <span class="info-value">{bw}</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">"Acceleration"</span>
+                <span class="info-value">{accel_label}</span>
             </div>
             {mod_details.into_iter().map(|(label, val)| view! {
                 <div class="info-row mod-detail">

@@ -14,8 +14,8 @@ use kaonic_gateway::network::{read_interface_ipv4, NetworkError, WifiAntenna, Wi
 use kaonic_gateway::radio::{transmit_test_frame, RadioModuleConfig};
 use kaonic_gateway::settings::normalize_codename;
 use kaonic_gateway::system_metrics::{
-    is_gateway_service_unit, read_cpu_percent_async, read_fs_mb, read_gateway_services,
-    read_mem_mb, read_os_details,
+    is_gateway_service_unit, read_cpu_freq_mhz, read_cpu_percent_async, read_fs_mb,
+    read_gateway_services, read_mem_mb, read_os_details,
 };
 use kaonic_vpn::VpnSnapshot;
 use reticulum::hash::AddressHash;
@@ -185,6 +185,10 @@ pub async fn put_radio(
         match client.set_modulation(module, cfg.modulation).await {
             Ok(_) => log::info!("put_radio: modulation applied to module {module}"),
             Err(e) => log::error!("put_radio: set_modulation failed for module {module}: {e:?}"),
+        }
+        match client.set_accelerator(module, cfg.accelerator).await {
+            Ok(_) => log::info!("put_radio: accelerator applied to module {module}"),
+            Err(e) => log::error!("put_radio: set_accelerator failed for module {module}: {e:?}"),
         }
     } else {
         log::info!("put_radio: running without radio backend, saved config only");
@@ -1012,7 +1016,7 @@ pub async fn build_status(state: &AppState) -> StatusResponse {
         .and_then(|s| s.load_config().ok())
         .map(|c| c.radio.module_configs.to_vec())
         .unwrap_or_default();
-    let services = build_services();
+    let services = build_services().await;
     let network_ports = build_network_ports(state, &services);
     let interfaces = build_ws_interfaces();
     let system = build_system_status().await;
@@ -1043,8 +1047,8 @@ pub fn build_ws_interfaces() -> WsInterfacesDto {
     }
 }
 
-pub fn build_services() -> Vec<ServiceStatusDto> {
-    read_gateway_services()
+pub async fn build_services() -> Vec<ServiceStatusDto> {
+    read_gateway_services().await
 }
 
 pub fn build_network_ports(
@@ -1059,6 +1063,7 @@ pub async fn build_system_status() -> SystemStatusDto {
     let (fs_free_mb, fs_total_mb) = read_fs_mb();
     SystemStatusDto {
         cpu_percent: read_cpu_percent_async().await,
+        cpu_freq_mhz: read_cpu_freq_mhz(),
         ram_used_mb,
         ram_total_mb,
         fs_free_mb,

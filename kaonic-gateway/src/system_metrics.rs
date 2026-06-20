@@ -143,85 +143,195 @@ pub fn read_cpu_cores() -> usize {
         .unwrap_or(1)
 }
 
-pub fn read_gateway_services() -> Vec<ServiceStatusDto> {
-    GATEWAY_SERVICE_UNITS
-        .iter()
-        .copied()
-        .map(read_service_status)
-        .collect()
+/// Current CPU clock in MHz. Prefers the busiest core's live `scaling_cur_freq`
+/// (reflects DVFS/throttling), falling back to `/proc/cpuinfo` "cpu MHz".
+/// Returns 0 when no frequency source is available.
+pub fn read_cpu_freq_mhz() -> u32 {
+    // cpufreq exposes the live per-core frequency in kHz under sysfs.
+    let mut max_khz: u64 = 0;
+    if let Ok(entries) = std::fs::read_dir("/sys/devices/system/cpu") {
+        for entry in entries.flatten() {
+            let path = entry.path().join("cpufreq/scaling_cur_freq");
+            if let Ok(data) = std::fs::read_to_string(&path) {
+                if let Ok(khz) = data.trim().parse::<u64>() {
+                    max_khz = max_khz.max(khz);
+                }
+            }
+        }
+    }
+    if max_khz > 0 {
+        return (max_khz / 1000) as u32;
+    }
+
+    // Fallback for platforms without cpufreq sysfs (e.g. some x86 kernels).
+    if let Ok(data) = std::fs::read_to_string("/proc/cpuinfo") {
+        let mut max_mhz: f64 = 0.0;
+        for line in data.lines() {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            if name.trim() == "cpu MHz" {
+                if let Ok(mhz) = value.trim().parse::<f64>() {
+                    max_mhz = max_mhz.max(mhz);
+                }
+            }
+        }
+        if max_mhz > 0.0 {
+            return max_mhz.round() as u32;
+        }
+    }
+
+    0
+}
+
+/// Service state changes rarely, so cache the result for a short window to avoid
+/// forking `systemctl` on every 1 s status tick and on every new WebSocket
+/// connection — the fork/exec storm was the source of periodic CPU spikes.
+const SERVICE_STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn service_cache(
+) -> &'static std::sync::Mutex<Option<(std::time::Instant, Vec<ServiceStatusDto>)>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<Option<(std::time::Instant, Vec<ServiceStatusDto>)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+pub async fn read_gateway_services() -> Vec<ServiceStatusDto> {
+    // Serve from cache while fresh (lock is released before any await).
+    {
+        let guard = service_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((fetched_at, services)) = guard.as_ref() {
+            if fetched_at.elapsed() < SERVICE_STATUS_TTL {
+                return services.clone();
+            }
+        }
+    }
+
+    let services = query_gateway_services().await;
+
+    let mut guard = service_cache().lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some((std::time::Instant::now(), services.clone()));
+    services
 }
 
 pub fn is_gateway_service_unit(unit: &str) -> bool {
     GATEWAY_SERVICE_UNITS.contains(&unit)
 }
 
+/// Query all gateway units with a single `systemctl show` invocation (one fork
+/// instead of one per unit) and without blocking the async runtime.
 #[cfg(target_os = "linux")]
-fn read_service_status(unit: &str) -> ServiceStatusDto {
-    let output = std::process::Command::new("systemctl")
+async fn query_gateway_services() -> Vec<ServiceStatusDto> {
+    let output = tokio::process::Command::new("systemctl")
         .args([
             "show",
+            "--property=Id",
             "--property=LoadState",
             "--property=ActiveState",
             "--property=SubState",
-            "--value",
-            unit,
         ])
-        .output();
+        .args(GATEWAY_SERVICE_UNITS)
+        .output()
+        .await;
 
     match output {
         Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-            let mut lines = stdout.lines();
-            let load_state = lines.next().unwrap_or("unknown").trim().to_string();
-            let active_state = lines.next().unwrap_or("unknown").trim().to_string();
-            let sub_state = lines.next().unwrap_or_default().trim().to_string();
-            ServiceStatusDto {
-                unit: unit.into(),
-                brief_name: service_brief_name(unit).into(),
-                status: format_service_status(&load_state, &active_state, &sub_state),
-                load_state,
-                active_state,
-                sub_state,
-            }
+            parse_show_output(&String::from_utf8_lossy(&output.stdout))
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
             let message = if stderr.is_empty() { stdout } else { stderr };
-            ServiceStatusDto {
-                unit: unit.into(),
-                brief_name: service_brief_name(unit).into(),
-                load_state: "unknown".into(),
-                active_state: "error".into(),
-                sub_state: String::new(),
-                status: if message.is_empty() {
-                    "systemctl error".into()
-                } else {
-                    message
-                },
+            GATEWAY_SERVICE_UNITS
+                .iter()
+                .map(|unit| service_error_dto(unit, &message))
+                .collect()
+        }
+        Err(err) => {
+            let message = format!("systemctl unavailable: {err}");
+            GATEWAY_SERVICE_UNITS
+                .iter()
+                .map(|unit| service_error_dto(unit, &message))
+                .collect()
+        }
+    }
+}
+
+/// Parse the property blocks emitted by `systemctl show` for multiple units.
+/// Each unit's properties form a block; blocks are separated by a blank line.
+/// We match blocks back to units by their `Id` so ordering is irrelevant.
+#[cfg(target_os = "linux")]
+fn parse_show_output(stdout: &str) -> Vec<ServiceStatusDto> {
+    use std::collections::HashMap;
+
+    let mut by_id: HashMap<String, (String, String, String)> = HashMap::new();
+    for block in stdout.split("\n\n") {
+        let (mut id, mut load_state, mut active_state, mut sub_state) =
+            (String::new(), String::new(), String::new(), String::new());
+        for line in block.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let value = value.trim().to_string();
+            match key.trim() {
+                "Id" => id = value,
+                "LoadState" => load_state = value,
+                "ActiveState" => active_state = value,
+                "SubState" => sub_state = value,
+                _ => {}
             }
         }
-        Err(err) => ServiceStatusDto {
-            unit: unit.into(),
-            brief_name: service_brief_name(unit).into(),
-            load_state: "unknown".into(),
-            active_state: "error".into(),
-            sub_state: String::new(),
-            status: format!("systemctl unavailable: {err}"),
+        if !id.is_empty() {
+            by_id.insert(id, (load_state, active_state, sub_state));
+        }
+    }
+
+    GATEWAY_SERVICE_UNITS
+        .iter()
+        .map(|&unit| match by_id.get(unit) {
+            Some((load_state, active_state, sub_state)) => ServiceStatusDto {
+                unit: unit.into(),
+                brief_name: service_brief_name(unit).into(),
+                status: format_service_status(load_state, active_state, sub_state),
+                load_state: load_state.clone(),
+                active_state: active_state.clone(),
+                sub_state: sub_state.clone(),
+            },
+            None => service_error_dto(unit, "not reported by systemctl"),
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn service_error_dto(unit: &str, message: &str) -> ServiceStatusDto {
+    ServiceStatusDto {
+        unit: unit.into(),
+        brief_name: service_brief_name(unit).into(),
+        load_state: "unknown".into(),
+        active_state: "error".into(),
+        sub_state: String::new(),
+        status: if message.is_empty() {
+            "systemctl error".into()
+        } else {
+            message.into()
         },
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn read_service_status(unit: &str) -> ServiceStatusDto {
-    ServiceStatusDto {
-        unit: unit.into(),
-        brief_name: service_brief_name(unit).into(),
-        load_state: "mock".into(),
-        active_state: "unknown".into(),
-        sub_state: String::new(),
-        status: "Unavailable on this host".into(),
-    }
+async fn query_gateway_services() -> Vec<ServiceStatusDto> {
+    GATEWAY_SERVICE_UNITS
+        .iter()
+        .map(|&unit| ServiceStatusDto {
+            unit: unit.into(),
+            brief_name: service_brief_name(unit).into(),
+            load_state: "mock".into(),
+            active_state: "unknown".into(),
+            sub_state: String::new(),
+            status: "Unavailable on this host".into(),
+        })
+        .collect()
 }
 
 fn service_brief_name(unit: &str) -> &'static str {

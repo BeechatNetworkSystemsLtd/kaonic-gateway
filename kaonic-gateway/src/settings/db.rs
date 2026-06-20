@@ -148,9 +148,16 @@ impl Database {
                 })
                 .and_then(|v| serde_json::from_str(&v).ok())
                 .unwrap_or_else(|| defaults.module_configs[i].modulation.clone());
+            let accelerator = self
+                .get(&format!("kaonic_ctrl_accelerator{suffix}"))
+                .ok()
+                .flatten()
+                .and_then(|v| serde_json::from_str(&v).ok())
+                .unwrap_or_else(|| defaults.module_configs[i].accelerator);
             RadioModuleConfig {
                 radio_config,
                 modulation,
+                accelerator,
             }
         });
 
@@ -198,6 +205,10 @@ impl Database {
         self.set(
             &format!("kaonic_ctrl_modulation{suffix}"),
             &serde_json::to_string(&cfg.modulation).unwrap(),
+        )?;
+        self.set(
+            &format!("kaonic_ctrl_accelerator{suffix}"),
+            &serde_json::to_string(&cfg.accelerator).unwrap(),
         )?;
         Ok(())
     }

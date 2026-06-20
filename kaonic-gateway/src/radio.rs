@@ -4,7 +4,7 @@ use kaonic_ctrl::protocol::RADIO_FRAME_SIZE;
 use kaonic_ctrl::radio::RadioClient;
 use kaonic_frame::frame::Frame;
 use kaonic_reticulum::{ErrorObserver, KaonicCtrlInterface, TxObserver};
-use radio_common::{Hertz, Modulation, RadioConfig, RadioConfigBuilder};
+use radio_common::{Accelerator, Hertz, Modulation, RadioConfig, RadioConfigBuilder};
 use reticulum::transport::Transport;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -14,10 +14,18 @@ pub type SharedRadioClient = Arc<Mutex<RadioClient>>;
 pub type SharedTxObserver = TxObserver;
 pub type SharedErrorObserver = ErrorObserver;
 
+/// Default baseband acceleration mode for a radio module.
+pub fn default_accelerator() -> Accelerator {
+    Accelerator::Native
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RadioModuleConfig {
     pub radio_config: RadioConfig,
     pub modulation: Modulation,
+    /// Baseband acceleration: on-chip (`Native`) or external FPGA (`Hardware`).
+    #[serde(default = "default_accelerator")]
+    pub accelerator: Accelerator,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -38,6 +46,7 @@ impl Default for HardwareRadioConfig {
                     modulation: Modulation::Ofdm(
                         radio_common::modulation::OfdmModulation::default(),
                     ),
+                    accelerator: default_accelerator(),
                 },
                 RadioModuleConfig {
                     radio_config: RadioConfigBuilder::new()
@@ -48,6 +57,7 @@ impl Default for HardwareRadioConfig {
                     modulation: Modulation::Ofdm(
                         radio_common::modulation::OfdmModulation::default(),
                     ),
+                    accelerator: default_accelerator(),
                 },
             ],
         }
@@ -93,6 +103,14 @@ pub async fn attach_radio_interface(
             .await
         {
             log::warn!("boot modulation error for module {module}: {e:?}");
+        }
+        if let Err(e) = radio_client
+            .lock()
+            .await
+            .set_accelerator(module, cfg.accelerator)
+            .await
+        {
+            log::warn!("boot accelerator error for module {module}: {e:?}");
         }
     }
 

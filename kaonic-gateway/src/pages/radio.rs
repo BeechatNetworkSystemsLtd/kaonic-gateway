@@ -78,6 +78,11 @@ pub async fn save_radio_module(
         .await
         .map_err(|e| ServerFnError::new(format!("set_modulation: {e:?}")))?;
 
+    client
+        .set_accelerator(module, radio_cfg.accelerator)
+        .await
+        .map_err(|e| ServerFnError::new(format!("set_accelerator: {e:?}")))?;
+
     Ok(())
 }
 
@@ -304,12 +309,6 @@ fn OfdmFields(div_id: String, ofdm: radio_common::modulation::OfdmModulation) ->
                 </select>
             </div>
             <div class="field-row">
-                <label class="field-label">"PDT"</label>
-                <input id=format!("ofdm-pdt-{div_id}") type="number" class="field-input" min="0" max="255" step="1" required
-                    value=ofdm.pdt.to_string()
-                />
-            </div>
-            <div class="field-row">
                 <label class="field-label">"TX Power"</label>
                 <div class="tx-slider-wrap">
                     <input id=format!("otx-{div_id}") type="range" class="tx-slider" min="0" max="31" step="1"
@@ -397,6 +396,11 @@ fn RadioModuleForm(index: usize, module: RadioModuleConfigDto) -> impl IntoView 
         Modulation::Fsk => "FSK",
     };
 
+    let init_accel = match module.accelerator {
+        radio_common::Accelerator::Native => "Native",
+        radio_common::Accelerator::Hardware => "Hardware",
+    };
+
     let ofdm = match &module.modulation {
         Modulation::Ofdm(o) => o.clone(),
         _ => OfdmModulation::default(),
@@ -420,12 +424,17 @@ fn RadioModuleForm(index: usize, module: RadioModuleConfigDto) -> impl IntoView 
         _ => OfdmModulation::default(),
     };
     let default_qpsk = QpskModulation::default();
+    let default_accel = match default_module.accelerator {
+        radio_common::Accelerator::Native => "Native",
+        radio_common::Accelerator::Hardware => "Hardware",
+    };
 
     let js = format!(
         r#"(function(){{
         var fi=document.getElementById('freq-{index}'),si=document.getElementById('spacing-{index}'),ci=document.getElementById('channel-{index}');
         var bs=document.getElementById('band-sub-{index}'),b2=document.getElementById('band-24-{index}');
         var ms=document.getElementById('ms{index}'),mo=document.getElementById('mo{index}'),mq=document.getElementById('mq{index}');
+        var accel=document.getElementById('accel-{index}');
         var applyBtn=document.getElementById('apply-btn-{index}'),resetBtn=document.getElementById('reset-btn-{index}');
         var testBtn=document.getElementById('test-btn-{index}');
         var status=document.getElementById('apply-status-{index}');
@@ -445,7 +454,8 @@ fn RadioModuleForm(index: usize, module: RadioModuleConfigDto) -> impl IntoView 
             spacing:'{default_spacing_khz}',
             channel:'{default_channel}',
             modulation:'OFDM',
-            ofdm:{{mcs:{},opt:{},pdt:{},tx:{}}},
+            accel:'{default_accel}',
+            ofdm:{{mcs:{},opt:{},tx:{}}},
             qpsk:{{fchip:{},mode:{},tx:{}}}
         }};
         function formatFixed(input, digits){{
@@ -622,7 +632,6 @@ fn RadioModuleForm(index: usize, module: RadioModuleConfigDto) -> impl IntoView 
                 modulation={{Ofdm:{{
                     mcs:MCS[parseInt(document.getElementById('ofdm-mcs-mo{index}').value)||0],
                     opt:BWOPT[parseInt(document.getElementById('ofdm-opt-mo{index}').value)||0],
-                    pdt:parseInt(document.getElementById('ofdm-pdt-mo{index}').value)||3,
                     tx_power:parseInt(document.getElementById('otx-mo{index}').value)||10
                 }}}};
             }}else if(modVal==='QPSK'){{
@@ -645,7 +654,8 @@ fn RadioModuleForm(index: usize, module: RadioModuleConfigDto) -> impl IntoView 
                     channel:parseInt(ci.value)||0,
                     bandwidth_filter:'Narrow'
                 }},
-                modulation:modulation
+                modulation:modulation,
+                accelerator:accel?accel.value:'Native'
             }};
             validateFreq();
             validateChannel();
@@ -682,9 +692,9 @@ fn RadioModuleForm(index: usize, module: RadioModuleConfigDto) -> impl IntoView 
                 si.value=defaults.spacing;
                 ci.value=defaults.channel;
                 ms.value=defaults.modulation;
+                if(accel){{accel.value=defaults.accel;}}
                 document.getElementById('ofdm-mcs-mo{index}').value=String(defaults.ofdm.mcs);
                 document.getElementById('ofdm-opt-mo{index}').value=String(defaults.ofdm.opt);
-                document.getElementById('ofdm-pdt-mo{index}').value=String(defaults.ofdm.pdt);
                 if(otx){{otx.value=String(defaults.ofdm.tx);syncTxValue(otx,otxv);}}
                 document.getElementById('qpsk-fchip-mq{index}').value=String(defaults.qpsk.fchip);
                 document.getElementById('qpsk-mode-mq{index}').value=String(defaults.qpsk.mode);
@@ -702,7 +712,6 @@ fn RadioModuleForm(index: usize, module: RadioModuleConfigDto) -> impl IntoView 
     }})();"#,
         default_ofdm.mcs as u8,
         default_ofdm.opt as u8,
-        default_ofdm.pdt,
         default_ofdm.tx_power,
         default_qpsk.fchip as u8,
         default_qpsk.mode as u8,
@@ -747,6 +756,13 @@ fn RadioModuleForm(index: usize, module: RadioModuleConfigDto) -> impl IntoView 
                             <option value="OFDM" selected=init_mod=="OFDM">"OFDM"</option>
                             <option value="QPSK" selected=init_mod=="QPSK">"QPSK"</option>
                             <option value="FSK"  selected=init_mod=="FSK">"FSK"</option>
+                        </select>
+                    </div>
+                    <div class="field-row">
+                        <label class="field-label">"Acceleration"</label>
+                        <select class="field-input" id=format!("accel-{index}")>
+                            <option value="Native" selected=init_accel=="Native">"Native (on-chip)"</option>
+                            <option value="Hardware" selected=init_accel=="Hardware">"Hardware (FPGA)"</option>
                         </select>
                     </div>
                 </div>

@@ -41,9 +41,14 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
 
 pub fn spawn_status_publishers(state: AppState) {
     tokio::spawn(async move {
-        let mut tick = interval(Duration::from_secs(1));
+        let mut tick = interval(Duration::from_secs(10));
         loop {
             tick.tick().await;
+            // Nobody is watching: skip the whole snapshot (systemctl, /proc, VPN,
+            // reticulum) so an idle gateway stays idle.
+            if state.ws_events.receiver_count() == 0 {
+                continue;
+            }
             publish_periodic_events(&state).await;
         }
     });
@@ -65,7 +70,7 @@ pub fn publish_radio_frames(
 }
 
 async fn publish_periodic_events(state: &AppState) {
-    let services = build_services();
+    let services = build_services().await;
     let network_ports = build_network_ports(state, &services);
     let _ = state
         .ws_events
@@ -86,7 +91,7 @@ async fn publish_periodic_events(state: &AppState) {
 }
 
 async fn initial_events(state: &AppState) -> Vec<WsStatusEvent> {
-    let services = build_services();
+    let services = build_services().await;
     let network_ports = build_network_ports(state, &services);
     vec![
         WsStatusEvent::Interfaces(build_ws_interfaces()),
