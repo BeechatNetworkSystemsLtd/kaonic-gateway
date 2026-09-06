@@ -343,7 +343,6 @@ async fn async_main() -> Result<(), process::ExitCode> {
 
     // Spawn frame listener — fills per-module ring buffers used by the WS feed.
     {
-        use http::ws::publish_radio_frames;
         use kaonic_gateway::app_types::RxFrameDto;
         use kaonic_gateway::state::RX_BUF_SIZE;
         use std::sync::atomic::Ordering;
@@ -353,6 +352,48 @@ async fn async_main() -> Result<(), process::ExitCode> {
         let rx_bufs = app_state.rx_buffers.clone();
         let frame_stats = app_state.frame_stats.clone();
         let mut rx = radio_client.lock().await.module_receive();
+
+        // Publishing the 256-entry frame ring on every radio frame means a
+        // clone plus a JSON encode per dashboard client per frame — a real
+        // CPU cost on the A7 during transfers. Frames only mark a module
+        // dirty; a 4 Hz publisher ships the ring while somebody is watching.
+        let dirty: Arc<[std::sync::atomic::AtomicBool; 2]> = Arc::new([
+            std::sync::atomic::AtomicBool::new(false),
+            std::sync::atomic::AtomicBool::new(false),
+        ]);
+        {
+            use http::ws::publish_radio_frames;
+            let dirty = dirty.clone();
+            let ws_state = ws_state.clone();
+            let rx_bufs = rx_bufs.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_millis(250));
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = interval.tick() => {
+                            for module in 0..2 {
+                                if !dirty[module].swap(false, Ordering::Relaxed) {
+                                    continue;
+                                }
+                                if ws_state.ws_events.receiver_count() == 0 {
+                                    continue;
+                                }
+                                let frames = rx_bufs[module].lock().await.iter().cloned().collect();
+                                publish_radio_frames(
+                                    &ws_state,
+                                    module,
+                                    frames,
+                                    http::handlers::build_frame_stats(&ws_state, module),
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -381,14 +422,8 @@ async fn async_main() -> Result<(), process::ExitCode> {
                             let mut buf = rx_bufs[module].lock().await;
                             buf.push_front(entry);
                             buf.truncate(RX_BUF_SIZE);
-                            let frames = buf.iter().cloned().collect();
                             drop(buf);
-                            publish_radio_frames(
-                                &ws_state,
-                                module,
-                                frames,
-                                http::handlers::build_frame_stats(&ws_state, module),
-                            );
+                            dirty[module].store(true, Ordering::Relaxed);
                         }
                         Err(RecvError::Lagged(_)) => continue,
                         Err(_) => break,
@@ -415,14 +450,8 @@ async fn async_main() -> Result<(), process::ExitCode> {
                             let mut buf = rx_bufs[module].lock().await;
                             buf.push_front(entry);
                             buf.truncate(RX_BUF_SIZE);
-                            let frames = buf.iter().cloned().collect();
                             drop(buf);
-                            publish_radio_frames(
-                                &ws_state,
-                                module,
-                                frames,
-                                http::handlers::build_frame_stats(&ws_state, module),
-                            );
+                            dirty[module].store(true, Ordering::Relaxed);
                         }
                         None => break,
                     }

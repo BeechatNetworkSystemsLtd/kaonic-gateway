@@ -175,9 +175,24 @@ impl GatewayReticulum {
         let packet_len = link_event_packet_len(&event.event);
         let status = link_event_status(&event.event);
 
-        let mut snapshot = self
-            .resolve_link_snapshot(transport, incoming, &event, &kind, ts)
-            .await;
+        // Data events fire for every VPN/remote packet; resolving the link
+        // through the transport mutex on each one contends with the packet
+        // hot path, so only state transitions consult the transport.
+        let mut snapshot = if matches!(event.event, LinkEvent::Data(_)) {
+            ReticulumLinkDto {
+                id: event.id.to_hex_string(),
+                destination: event.address_hash.to_hex_string(),
+                status: status.into(),
+                last_event: kind.clone(),
+                packets: 0,
+                bytes: 0,
+                rtt_ms: None,
+                last_seen_ts: ts,
+            }
+        } else {
+            self.resolve_link_snapshot(transport, incoming, &event, &kind, ts)
+                .await
+        };
         snapshot.status = status.into();
         snapshot.last_event = kind.clone();
         snapshot.last_seen_ts = ts;
@@ -194,7 +209,9 @@ impl GatewayReticulum {
             .or_insert_with(|| snapshot.clone());
         entry.destination = snapshot.destination;
         entry.status = snapshot.status;
-        entry.rtt_ms = snapshot.rtt_ms;
+        if snapshot.rtt_ms.is_some() {
+            entry.rtt_ms = snapshot.rtt_ms;
+        }
         entry.last_event = snapshot.last_event;
         entry.last_seen_ts = snapshot.last_seen_ts;
         if let Some(packet_len) = packet_len {
