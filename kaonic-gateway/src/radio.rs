@@ -110,6 +110,47 @@ pub async fn connect_radio_client(
     .await
 }
 
+/// Push one module's full configuration to the hardware. Each step is applied
+/// independently; the first failure is returned after the rest were attempted.
+pub async fn apply_module_config(
+    radio_client: &SharedRadioClient,
+    module: usize,
+    cfg: &RadioModuleConfig,
+) -> Result<(), String> {
+    let mut first_error = None;
+    let mut client = radio_client.lock().await;
+    if let Err(e) = client
+        .set_radio_config(module, cfg.radio_config.clone())
+        .await
+    {
+        log::error!("radio config error for module {module}: {e:?}");
+        first_error.get_or_insert(format!("radio config: {e:?}"));
+    }
+    if let Err(e) = client.set_modulation(module, cfg.modulation.clone()).await {
+        log::error!("modulation error for module {module}: {e:?}");
+        first_error.get_or_insert(format!("modulation: {e:?}"));
+    }
+    if let Err(e) = client.set_accelerator(module, cfg.accelerator).await {
+        log::error!("accelerator error for module {module}: {e:?}");
+        first_error.get_or_insert(format!("accelerator: {e:?}"));
+    }
+    // Only the 2.4 GHz front-end has an antenna switch; sub-GHz is hard-wired
+    // to the external connector, so there is nothing to select for Band09.
+    if cfg.band() == RadioBand::Band24 {
+        if let Err(e) = client
+            .set_antenna(module, RadioBand::Band24, cfg.antenna)
+            .await
+        {
+            log::error!("antenna error for module {module}: {e:?}");
+            first_error.get_or_insert(format!("antenna: {e:?}"));
+        }
+    }
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
 /// Apply saved per-module hardware settings and wire `rns_module` into the transport.
 pub async fn attach_radio_interface(
     transport: &Arc<Mutex<Transport>>,

@@ -11,7 +11,7 @@ use kaonic_gateway::audio::{
 use kaonic_gateway::config::GatewayConfig;
 use kaonic_gateway::local_https;
 use kaonic_gateway::network::{read_interface_ipv4, NetworkError, WifiAntenna, WifiMode};
-use kaonic_gateway::radio::{transmit_test_frame, RadioModuleConfig};
+use kaonic_gateway::radio::{apply_module_config, transmit_test_frame, RadioModuleConfig};
 use kaonic_gateway::settings::normalize_codename;
 use kaonic_gateway::system_metrics::{
     is_gateway_service_unit, read_cpu_freq_mhz, read_cpu_percent_async, read_fs_mb,
@@ -164,9 +164,6 @@ pub async fn put_radio(
         cfg.modulation
     );
 
-    // Captured before `cfg.radio_config` is moved into the apply calls below.
-    let band = cfg.band();
-
     let save_result = {
         let s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
         s.save_module_config(module, &cfg)
@@ -177,31 +174,10 @@ pub async fn put_radio(
     }
     log::info!("put_radio: module={module} saved to DB");
 
-    if let Some(client) = state.radio_client.clone() {
-        let mut client = client.lock().await;
-        match client.set_radio_config(module, cfg.radio_config).await {
-            Ok(_) => log::info!("put_radio: radio_config applied to module {module}"),
-            Err(e) => {
-                log::error!("put_radio: set_radio_config failed for module {module}: {e:?}")
-            }
-        }
-        match client.set_modulation(module, cfg.modulation).await {
-            Ok(_) => log::info!("put_radio: modulation applied to module {module}"),
-            Err(e) => log::error!("put_radio: set_modulation failed for module {module}: {e:?}"),
-        }
-        match client.set_accelerator(module, cfg.accelerator).await {
-            Ok(_) => log::info!("put_radio: accelerator applied to module {module}"),
-            Err(e) => log::error!("put_radio: set_accelerator failed for module {module}: {e:?}"),
-        }
-        // Sub-GHz has no antenna switch on this board — it is always external.
-        if band == radio_common::RadioBand::Band24 {
-            match client
-                .set_antenna(module, radio_common::RadioBand::Band24, cfg.antenna)
-                .await
-            {
-                Ok(_) => log::info!("put_radio: antenna applied to module {module}"),
-                Err(e) => log::error!("put_radio: set_antenna failed for module {module}: {e:?}"),
-            }
+    if let Some(client) = state.radio_client.as_ref() {
+        match apply_module_config(client, module, &cfg).await {
+            Ok(()) => log::info!("put_radio: config applied to module {module}"),
+            Err(err) => log::error!("put_radio: apply failed for module {module}: {err}"),
         }
     } else {
         log::info!("put_radio: running without radio backend, saved config only");
