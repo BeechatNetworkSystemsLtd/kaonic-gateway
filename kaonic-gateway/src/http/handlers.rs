@@ -1061,6 +1061,7 @@ pub async fn build_system_status() -> SystemStatusDto {
         fs_free_mb,
         fs_total_mb,
         os_details: read_os_details(),
+        uptime_secs: kaonic_gateway::system_metrics::read_uptime_secs(),
     }
 }
 

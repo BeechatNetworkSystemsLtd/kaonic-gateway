@@ -89,6 +89,15 @@ pub fn read_os_details() -> String {
     }
 }
 
+/// Seconds since boot from /proc/uptime (0 where unavailable).
+pub fn read_uptime_secs() -> u64 {
+    std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|text| text.split_whitespace().next()?.parse::<f64>().ok())
+        .map(|secs| secs as u64)
+        .unwrap_or(0)
+}
+
 pub fn read_hostname() -> String {
     std::fs::read_to_string("/etc/hostname")
         .ok()

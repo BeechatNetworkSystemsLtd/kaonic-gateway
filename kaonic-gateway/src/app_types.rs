@@ -64,6 +64,9 @@ pub struct SystemStatusDto {
     pub fs_free_mb: u64,
     pub fs_total_mb: u64,
     pub os_details: String,
+    /// Seconds since boot (0 if unavailable).
+    #[serde(default)]
+    pub uptime_secs: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
