@@ -1,3 +1,12 @@
 [workspace]
 resolver = "2"
 members = ["kaonic-gateway", "kaonic-vpn", "kaonic-reticulum", "kaonic-installer", "kaonic-plugin-sample", "kaonic-remote"]
+
+# Local development override: use the sibling kaonic-radio working tree
+# (batch transmit API) instead of the published git revision.
+[patch."https://github.com/BeechatNetworkSystemsLtd/kaonic-radio"]
+kaonic-ctrl = { path = "../kaonic-radio/kaonic-ctrl" }
+kaonic-frame = { path = "../kaonic-radio/kaonic-frame" }
+kaonic-net = { path = "../kaonic-radio/kaonic-net" }
+kaonic-crc = { path = "../kaonic-radio/kaonic-crc" }
+radio-common = { path = "../kaonic-radio/radio-common" }

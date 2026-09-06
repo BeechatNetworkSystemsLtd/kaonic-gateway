@@ -19,8 +19,15 @@ use tokio_util::sync::CancellationToken;
 
 pub use kaonic_ctrl::radio::RadioClient;
 
+pub mod fec;
+pub use fec::{FecCode, FecSelector, TrafficClass};
+
 pub type TxObserver = Arc<dyn Fn(usize, &[u8]) + Send + Sync>;
 pub type ErrorObserver = Arc<dyn Fn(usize, InterfaceErrorKind) + Send + Sync>;
+/// Observes every successfully reassembled and deserialized Reticulum packet
+/// together with the RSSI of the radio frame that completed it:
+/// `(module, rssi_dbm, packet)`.
+pub type RxObserver = Arc<dyn Fn(usize, i8, &Packet) + Send + Sync>;
 const LDPC_SEGMENTS_PER_PACKET: usize = 3;
 const LDPC_REASSEMBLY_QUEUE: usize = 32;
 
@@ -44,6 +51,8 @@ pub struct KaonicCtrlInterface {
     module: usize,
     tx_observer: Option<TxObserver>,
     error_observer: Option<ErrorObserver>,
+    rx_observer: Option<RxObserver>,
+    fec: Arc<FecSelector>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -88,18 +97,35 @@ impl KaonicCtrlInterface {
             module,
             tx_observer,
             error_observer,
+            rx_observer: None,
+            fec: Arc::new(FecSelector::default()),
         }
+    }
+
+    /// Share a [`FecSelector`] so applications can steer the code per
+    /// destination at runtime (default: wire-compatible TM2048 everywhere).
+    pub fn with_fec_selector(mut self, fec: Arc<FecSelector>) -> Self {
+        self.fec = fec;
+        self
+    }
+
+    /// Attach an observer that sees every received packet with its RSSI.
+    pub fn with_rx_observer(mut self, rx_observer: RxObserver) -> Self {
+        self.rx_observer = Some(rx_observer);
+        self
     }
 
     /// Spawn the interface tasks. Matches the pattern used by other Reticulum interfaces.
     pub async fn spawn(context: InterfaceContext<Self>) {
-        let (radio_client, module, tx_observer, error_observer) = {
+        let (radio_client, module, tx_observer, error_observer, rx_observer, fec) = {
             let inner = context.inner.lock().unwrap();
             (
                 inner.radio_client.clone(),
                 inner.module,
                 inner.tx_observer.clone(),
                 inner.error_observer.clone(),
+                inner.rx_observer.clone(),
+                inner.fec.clone(),
             )
         };
 
@@ -113,69 +139,92 @@ impl KaonicCtrlInterface {
             let cancel = cancel.clone();
             let rx_channel = rx_channel.clone();
             let error_observer = error_observer.clone();
+            let rx_observer = rx_observer.clone();
+            let fec = fec.clone();
 
             tokio::spawn(async move {
-                let mut rx_network = build_radio_network();
-                let mut rx_frame = RadioSegmentBuffer::new();
+                // LDPC decode costs ~20 ms/frame on this single-core SoC, so
+                // it runs on a blocking thread; only finished packets return
+                // to the async side.
+                let mut rx_state: Option<Box<RxState>> =
+                    Some(Box::new((build_radio_network(), RadioSegmentBuffer::new())));
                 loop {
                     tokio::select! {
                         _ = cancel.cancelled() => break,
-                        Ok(recv_module) = rx_recv.recv() => {
-                            if recv_module.module == module {
-                                let current_time = network_time_now();
-                                let frame_bytes = recv_module.frame.as_slice();
-                                let mut frame = Frame::<RADIO_FRAME_SIZE>::new();
-                                frame.copy_from_slice(frame_bytes);
-                                if let Err(err) = rx_network.receive(current_time, &frame) {
+                        recv = rx_recv.recv() => {
+                            let recv_module = match recv {
+                                Ok(recv_module) => recv_module,
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                    log::warn!("kaonic_ctrl: rx frame stream lagged by {n} frames (module {module})");
+                                    continue;
+                                }
+                                Err(_) => break,
+                            };
+                            if recv_module.module != module {
+                                continue;
+                            }
+                            let current_time = network_time_now();
+                            let rssi = recv_module.rssi;
+                            let mut frame = Frame::<RADIO_FRAME_SIZE>::new();
+                            frame.copy_from_slice(recv_module.frame.as_slice());
+                            let frame_len = frame.len();
+                            let preview = frame_preview(frame.as_slice());
+                            let state = rx_state.take().expect("rx state");
+                            let (state, outcome) = tokio::task::spawn_blocking(move || {
+                                decode_frame(state, current_time, &frame)
+                            })
+                            .await
+                            .expect("rx decode task");
+                            fec.record_stats(state.0.coder().stats());
+                            rx_state = Some(state);
+
+                            match outcome {
+                                Err(RxFailure::Decode(err)) => {
                                     notify_error(&error_observer, module, InterfaceErrorKind::RxLdpcDecode);
                                     log::warn!(
                                         "kaonic_ctrl: rx ldpc decode failed module={} len={} preview={} err={err:?}",
                                         module,
-                                        frame_bytes.len(),
-                                        frame_preview(frame_bytes)
+                                        frame_len,
+                                        preview
                                     );
-                                    continue;
                                 }
-
-                                loop {
-                                    match rx_network.process(current_time, &mut rx_frame) {
-                                        Ok(assembled) => {
-                                            let bytes = assembled.as_slice();
-                                            let mut input = InputBuffer::new(bytes);
-                                            match Packet::deserialize(&mut input) {
-                                                Ok(packet) => {
-                                                    log::trace!(
-                                                        "kaonic_ctrl: rx module={} rssi={} packet_id={} {}",
-                                                        module,
-                                                        recv_module.rssi,
-                                                        assembled.id(),
-                                                        packet_log_summary(&packet)
-                                                    );
-                                                    let _ = rx_channel
-                                                        .send(RxMessage { address: iface_address, packet })
-                                                        .await;
+                                Err(RxFailure::Reassembly(err)) => {
+                                    notify_error(&error_observer, module, InterfaceErrorKind::RxReassembly);
+                                    log::warn!(
+                                        "kaonic_ctrl: rx ldpc reassembly failed module={} len={} preview={} err={err:?}",
+                                        module,
+                                        frame_len,
+                                        preview
+                                    );
+                                }
+                                Ok(assembled) => {
+                                    for bytes in assembled {
+                                        let mut input = InputBuffer::new(&bytes);
+                                        match Packet::deserialize(&mut input) {
+                                            Ok(packet) => {
+                                                log::trace!(
+                                                    "kaonic_ctrl: rx module={} rssi={} {}",
+                                                    module,
+                                                    rssi,
+                                                    packet_log_summary(&packet)
+                                                );
+                                                fec.observe_rssi(packet.destination, rssi);
+                                                if let Some(observer) = rx_observer.as_ref() {
+                                                    observer(module, rssi, &packet);
                                                 }
-                                                Err(err) => {
-                                                    notify_error(&error_observer, module, InterfaceErrorKind::RxDeserialize);
-                                                    log::warn!(
-                                                        "kaonic_ctrl: rx deserialize failed module={} len={} preview={} err={err:?}",
-                                                        module,
-                                                        bytes.len(),
-                                                        frame_preview(bytes)
-                                                    );
-                                                }
+                                                let _ = rx_channel
+                                                    .send(RxMessage { address: iface_address, packet })
+                                                    .await;
                                             }
-                                        }
-                                        Err(KaonicNetError::TryAgain) => break,
-                                        Err(err) => {
-                                            notify_error(&error_observer, module, InterfaceErrorKind::RxReassembly);
-                                            log::warn!(
-                                                "kaonic_ctrl: rx ldpc reassembly failed module={} len={} preview={} err={err:?}",
-                                                module,
-                                                frame_bytes.len(),
-                                                frame_preview(frame_bytes)
-                                            );
-                                            break;
+                                            Err(err) => {
+                                                notify_error(&error_observer, module, InterfaceErrorKind::RxDeserialize);
+                                                log::warn!(
+                                                    "kaonic_ctrl: rx deserialize failed module={} len={} preview={} err={err:?}",
+                                                    module,
+                                                    bytes.len(),
+                                                    frame_preview(&bytes)
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -191,25 +240,28 @@ impl KaonicCtrlInterface {
             let radio_client = radio_client.clone();
             let tx_observer = tx_observer.clone();
             let error_observer = error_observer.clone();
+            let fec = fec.clone();
 
             tokio::spawn(async move {
                 const BUF_SIZE: usize = reticulum::packet::PACKET_MDU * 2;
-                let mut tx_buffer = [0u8; BUF_SIZE];
-                let mut tx_network = build_radio_network();
-                let mut tx_frames = [Frame::<RADIO_FRAME_SIZE>::new(); LDPC_SEGMENTS_PER_PACKET];
+                let mut tx_state: Option<Box<TxState>> = Some(Box::new((
+                    build_radio_network(),
+                    [Frame::<RADIO_FRAME_SIZE>::new(); LDPC_SEGMENTS_PER_PACKET],
+                    vec![0u8; BUF_SIZE],
+                )));
 
                 loop {
                     tokio::select! {
                         _ = cancel.cancelled() => break,
                         Some(message) = tx_channel.recv() => {
+                            let code = fec.select(&message.packet);
                             transmit_message(
                                 &radio_client,
                                 module,
                                 &tx_observer,
                                 &error_observer,
-                                &mut tx_network,
-                                &mut tx_frames,
-                                &mut tx_buffer,
+                                &mut tx_state,
+                                code,
                                 message,
                             ).await;
                         }
@@ -221,6 +273,35 @@ impl KaonicCtrlInterface {
 
         let _ = tokio::join!(rx_task, tx_task);
     }
+}
+
+type RxState = (RadioNetwork, RadioSegmentBuffer);
+
+enum RxFailure {
+    Decode(KaonicNetError),
+    Reassembly(KaonicNetError),
+}
+
+/// LDPC-decode one radio frame into the reassembly network and drain every
+/// packet that became complete. Runs on a blocking thread.
+fn decode_frame(
+    mut state: Box<RxState>,
+    current_time: u128,
+    frame: &Frame<RADIO_FRAME_SIZE>,
+) -> (Box<RxState>, Result<Vec<Vec<u8>>, RxFailure>) {
+    let (rx_network, rx_frame) = &mut *state;
+    if let Err(err) = rx_network.receive(current_time, frame) {
+        return (state, Err(RxFailure::Decode(err)));
+    }
+    let mut assembled = Vec::new();
+    loop {
+        match rx_network.process(current_time, rx_frame) {
+            Ok(packet) => assembled.push(packet.as_slice().to_vec()),
+            Err(KaonicNetError::TryAgain) => break,
+            Err(err) => return (state, Err(RxFailure::Reassembly(err))),
+        }
+    }
+    (state, Ok(assembled))
 }
 
 fn packet_log_summary(packet: &Packet) -> String {
@@ -247,65 +328,106 @@ async fn transmit_message(
     module: usize,
     tx_observer: &Option<TxObserver>,
     error_observer: &Option<ErrorObserver>,
-    tx_network: &mut RadioNetwork,
-    tx_frames: &mut [Frame<RADIO_FRAME_SIZE>; LDPC_SEGMENTS_PER_PACKET],
-    tx_buffer: &mut [u8],
+    tx_state: &mut Option<Box<TxState>>,
+    code: FecCode,
     message: TxMessage,
 ) {
-    let mut output = OutputBuffer::new(tx_buffer);
-    if let Ok(_) = message.packet.serialize(&mut output) {
-        let bytes = output.as_slice();
-        match tx_network.transmit(bytes, OsRng, tx_frames) {
-            Ok(frames) => {
-                log::trace!(
-                    "kaonic_ctrl: tx module={} {} payload_len={} encoded_frames={}",
-                    module,
-                    packet_log_summary(&message.packet),
-                    bytes.len(),
-                    frames.len()
-                );
-
-                let mut radio_client = radio_client.lock().await;
-                for frame in frames {
-                    let frame_bytes = frame.as_slice();
-                    if let Err(err) = radio_client.transmit(module, frame).await {
-                        notify_error(error_observer, module, InterfaceErrorKind::TxTransmit);
-                        log::warn!(
-                            "kaonic_ctrl: tx failed module={} {} payload_len={} frame_len={} err={err:?}",
-                            module,
-                            packet_log_summary(&message.packet),
-                            bytes.len(),
-                            frame_bytes.len()
-                        );
-                        return;
-                    }
-                    if let Some(observer) = tx_observer {
-                        observer(module, frame_bytes);
-                    }
+    let summary = packet_log_summary(&message.packet);
+    // Serialization + LDPC encode (~5 ms) run off the async worker so the
+    // transport keeps servicing links while a burst is being encoded.
+    let mut state = tx_state.take().expect("tx state");
+    let (state, encoded) = tokio::task::spawn_blocking(move || {
+        let (tx_network, tx_frames, tx_buffer) = &mut *state;
+        tx_network.coder_mut().set_tx_fec(code);
+        let mut output = OutputBuffer::new(tx_buffer.as_mut_slice());
+        let result = match message.packet.serialize(&mut output) {
+            Ok(_) => {
+                let bytes = output.as_slice();
+                let payload_len = bytes.len();
+                match tx_network.transmit(bytes, OsRng, tx_frames) {
+                    Ok(frames) => Ok((payload_len, frames.to_vec())),
+                    Err(err) => Err((
+                        InterfaceErrorKind::TxLdpcEncode,
+                        format!("{err:?}"),
+                        payload_len,
+                    )),
                 }
             }
-            Err(err) => {
-                notify_error(error_observer, module, InterfaceErrorKind::TxLdpcEncode);
-                log::warn!(
-                    "kaonic_ctrl: tx ldpc encode failed module={} {} payload_len={} err={err:?}",
-                    module,
-                    packet_log_summary(&message.packet),
-                    bytes.len()
-                );
+            Err(_) => Err((InterfaceErrorKind::TxSerialize, String::new(), 0)),
+        };
+        (state, result)
+    })
+    .await
+    .expect("tx encode task");
+    *tx_state = Some(state);
+
+    match encoded {
+        Ok((payload_len, frames)) => {
+            log::trace!(
+                "kaonic_ctrl: tx module={} {} payload_len={} encoded_frames={} fec={}",
+                module,
+                summary,
+                payload_len,
+                frames.len(),
+                code.name()
+            );
+
+            let mut radio_client = radio_client.lock().await;
+
+            match radio_client.transmit_batch(module, &frames).await {
+                Ok((_, 0)) => {
+                    if let Some(observer) = tx_observer {
+                        for frame in frames.iter() {
+                            observer(module, frame.as_slice());
+                        }
+                    }
+                }
+                Ok((sent, errors)) => {
+                    notify_error(error_observer, module, InterfaceErrorKind::TxTransmit);
+                    log::warn!(
+                        "kaonic_ctrl: tx batch partial module={} {} payload_len={} sent={} errors={}",
+                        module,
+                        summary,
+                        payload_len,
+                        sent,
+                        errors
+                    );
+                }
+                Err(err) => {
+                    notify_error(error_observer, module, InterfaceErrorKind::TxTransmit);
+                    log::warn!(
+                        "kaonic_ctrl: tx batch failed module={} {} payload_len={} err={err:?}",
+                        module,
+                        summary,
+                        payload_len
+                    );
+                }
             }
         }
-    } else {
-        notify_error(error_observer, module, InterfaceErrorKind::TxSerialize);
-        log::warn!(
-            "kaonic_ctrl: packet serialize failed module={} {}",
-            module,
-            packet_log_summary(&message.packet)
-        );
+        Err((kind, err, payload_len)) => {
+            notify_error(error_observer, module, kind);
+            log::warn!(
+                "kaonic_ctrl: tx {} failed module={} {} payload_len={} err={err}",
+                match kind {
+                    InterfaceErrorKind::TxSerialize => "serialize",
+                    _ => "ldpc encode",
+                },
+                module,
+                summary,
+                payload_len
+            );
+        }
     }
     // Under sustained transmit load, explicitly yield so Reticulum
     // maintenance tasks get time to refresh links and process control traffic.
     tokio::task::yield_now().await;
 }
+
+type TxState = (
+    RadioNetwork,
+    [Frame<RADIO_FRAME_SIZE>; LDPC_SEGMENTS_PER_PACKET],
+    Vec<u8>,
+);
 
 fn notify_error(observer: &Option<ErrorObserver>, module: usize, kind: InterfaceErrorKind) {
     if let Some(observer) = observer {

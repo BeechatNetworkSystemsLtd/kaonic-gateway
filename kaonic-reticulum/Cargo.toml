@@ -13,3 +13,6 @@ radio-common = { git = "https://github.com/BeechatNetworkSystemsLtd/kaonic-radio
 tokio        = { version = "1", features = ["full"] }
 log          = "0.4"
 rand         = "0.8.5"
+
+[dev-dependencies]
+labrador-ldpc = "1.2"
