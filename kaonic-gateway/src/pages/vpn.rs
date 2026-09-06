@@ -298,6 +298,16 @@ fn VpnContent(snapshot: VpnPageSnapshot) -> impl IntoView {
                 <span class="vpn-banner-label">"Drops"</span>
                 <span class="vpn-banner-ip" id="vpn-drop-packets">{vpn.drop_packets}</span>
             </div>
+            <div class="vpn-banner-field feature-switches">
+                <span class="vpn-banner-label">"VPN"</span>
+                <div class="feature-switch-row">
+                    <label class="feature-switch">
+                        <input type="checkbox" id="feature-vpn"/>
+                        <span class="feature-switch-track"><span class="feature-switch-thumb"></span></span>
+                        <span class="feature-switch-label" id="feature-vpn-label">"Running"</span>
+                    </label>
+                </div>
+            </div>
             <div class="vpn-banner-spacer"></div>
             <div class="vpn-banner-peers">
                 <span id="vpn-peer-count">{peer_count}</span>
@@ -1746,6 +1756,51 @@ const VPN_WS_JS: &str = r#"
     connect();
     renderAccessTable();
     maybeHandleAddPeerShortcut();
+
+  // ── Feature switch ────────────────────────────────────────────────────────
+  (function() {
+    var box = document.getElementById('feature-vpn');
+    if (!box) { return; }
+    var label = document.getElementById('feature-vpn-label');
+    var current = {};
+    function paint(f) {
+      current = f || {};
+      if (document.activeElement !== box) { box.checked = f.vpn_enabled !== false; }
+      if (label) {
+        label.textContent = f.vpn_enabled
+          ? (f.restart_required ? 'Restart to apply' : 'Running')
+          : (f.restart_required ? 'Restart to stop' : 'Disabled');
+      }
+      var banner = document.getElementById('vpn-banner');
+      if (banner) { banner.classList.toggle('remote-banner--restart', !!f.restart_required); }
+    }
+    function refresh() {
+      fetch('/api/system/features').then(function(r) { return r.json(); }).then(paint).catch(function() {});
+    }
+    box.addEventListener('change', function() {
+      fetch('/api/system/features', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          vpn_enabled: box.checked,
+          remote_enabled: current.remote_enabled !== false,
+          shell_enabled: !!current.shell_enabled,
+          restart_required: false
+        })
+      }).then(function(r) { return r.json(); }).then(function(f) {
+        paint(f);
+        if (f.restart_required) {
+          var status = document.getElementById('vpn-access-status');
+          if (status) {
+            status.textContent = 'Saved — restart the gateway to apply';
+            status.className = 'vpn-access-status warn';
+          }
+        }
+      }).catch(function() { refresh(); });
+    });
+    refresh();
+    setInterval(refresh, 10000);
+  })();
 })();
 "#;
 
