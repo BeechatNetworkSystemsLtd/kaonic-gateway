@@ -1,0 +1,22 @@
+[package]
+name = "kaonic-remote"
+version = "0.1.0"
+edition = "2021"
+description = "Zero-trust remote control of Kaonic nodes over Reticulum links"
+
+[dependencies]
+reticulum    = { git = "https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs", rev = "151e3b6c77a8c7d33fafa3971a084ae02510ef39" }
+tokio        = { version = "1", features = ["rt", "sync", "time", "macros", "fs", "io-util"] }
+tokio-util   = "0.7"
+serde        = { version = "1", features = ["derive"] }
+rmp-serde    = "1"
+sha2         = "0.10"
+rand         = "0.8"
+log          = "0.4"
+parking_lot  = "0.12"
+reed-solomon-erasure = { version = "6", default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+env_logger = "0.11"
+rand_core = { version = "0.6", features = ["getrandom"] }
