@@ -3,7 +3,7 @@ use std::sync::Arc;
 use kaonic_ctrl::protocol::RADIO_FRAME_SIZE;
 use kaonic_ctrl::radio::RadioClient;
 use kaonic_frame::frame::Frame;
-use kaonic_reticulum::{ErrorObserver, KaonicCtrlInterface, TxObserver};
+use kaonic_reticulum::{ErrorObserver, FecSelector, KaonicCtrlInterface, RxObserver, TxObserver};
 use radio_common::{
     Accelerator, Antenna, Hertz, Modulation, RadioBand, RadioConfig, RadioConfigBuilder,
 };
@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 pub type SharedRadioClient = Arc<Mutex<RadioClient>>;
 pub type SharedTxObserver = TxObserver;
 pub type SharedErrorObserver = ErrorObserver;
+pub type SharedRxObserver = RxObserver;
 
 /// Default baseband acceleration mode for a radio module.
 pub fn default_accelerator() -> Accelerator {
@@ -159,48 +160,21 @@ pub async fn attach_radio_interface(
     rns_module: usize,
     tx_observer: Option<SharedTxObserver>,
     error_observer: Option<SharedErrorObserver>,
+    rx_observer: Option<SharedRxObserver>,
+    fec: Arc<FecSelector>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for (module, cfg) in radio.module_configs.iter().enumerate() {
         log::info!("applying saved radio config on boot (module {module})");
-        if let Err(e) = radio_client
-            .lock()
-            .await
-            .set_radio_config(module, cfg.radio_config.clone())
-            .await
-        {
-            log::warn!("boot radio config error for module {module}: {e:?}");
-        }
-        if let Err(e) = radio_client
-            .lock()
-            .await
-            .set_modulation(module, cfg.modulation.clone())
-            .await
-        {
-            log::warn!("boot modulation error for module {module}: {e:?}");
-        }
-        if let Err(e) = radio_client
-            .lock()
-            .await
-            .set_accelerator(module, cfg.accelerator)
-            .await
-        {
-            log::warn!("boot accelerator error for module {module}: {e:?}");
-        }
-        // Only the 2.4 GHz front-end has an antenna switch; sub-GHz is hard-wired
-        // to the external connector, so there is nothing to select for Band09.
-        if cfg.band() == RadioBand::Band24 {
-            if let Err(e) = radio_client
-                .lock()
-                .await
-                .set_antenna(module, RadioBand::Band24, cfg.antenna)
-                .await
-            {
-                log::warn!("boot antenna error for module {module}: {e:?}");
-            }
+        if let Err(err) = apply_module_config(&radio_client, module, cfg).await {
+            log::warn!("boot radio apply error for module {module}: {err}");
         }
     }
 
-    let iface = KaonicCtrlInterface::new(radio_client, rns_module, tx_observer, error_observer);
+    let mut iface = KaonicCtrlInterface::new(radio_client, rns_module, tx_observer, error_observer)
+        .with_fec_selector(fec);
+    if let Some(rx_observer) = rx_observer {
+        iface = iface.with_rx_observer(rx_observer);
+    }
     let iface_mgr = transport.lock().await.iface_manager();
     iface_mgr
         .lock()

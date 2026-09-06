@@ -252,6 +252,9 @@ pub async fn post_system_codename(
             )
         })?;
     }
+    if let Some(remote) = state.remote.as_ref() {
+        remote.set_codename(&codename);
+    }
 
     Ok(Json(SystemCodenameResponse {
         status: "Codename updated".into(),

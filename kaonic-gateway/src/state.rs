@@ -13,6 +13,9 @@ use crate::audio::AudioService;
 use crate::gateway_reticulum::SharedGatewayReticulum;
 use crate::network::NetworkService;
 use crate::radio::{SharedRadioClient, SharedTxObserver};
+use crate::media_bridge::MediaBridge;
+use crate::remote::SharedRemote;
+use kaonic_reticulum::FecSelector;
 use crate::settings::Settings;
 
 pub type SharedAudioService = Arc<AudioService>;
@@ -93,6 +96,24 @@ impl FrameStats {
     }
 }
 
+/// Clients reaching the API from inside the VPN are remote peers, not the
+/// device's operator; endpoints that change what a peer may do are refused
+/// for them.
+pub fn is_mesh_client(state: &AppState, addr: std::net::SocketAddr) -> bool {
+    let ip = match addr.ip() {
+        std::net::IpAddr::V4(ip) => ip,
+        std::net::IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            Some(ip) => ip,
+            None => return false,
+        },
+    };
+    is_mesh_client_ip(state.vpn_network, ip)
+}
+
+fn is_mesh_client_ip(vpn_network: Option<cidr::Ipv4Cidr>, ip: std::net::Ipv4Addr) -> bool {
+    vpn_network.is_some_and(|network| network.contains(&ip))
+}
+
 /// Shared application state — injected as leptos context for server functions.
 #[derive(Clone)]
 pub struct AppState {
@@ -106,6 +127,11 @@ pub struct AppState {
     pub radio_tx_observer: Option<SharedTxObserver>,
     pub radio_client: Option<SharedRadioClient>,
     pub reticulum: SharedGatewayReticulum,
+    pub remote: Option<SharedRemote>,
+    pub fec: Option<Arc<FecSelector>>,
+    /// Tunnel subnet, used to distinguish local operators from mesh peers.
+    pub vpn_network: Option<cidr::Ipv4Cidr>,
+    pub media: Option<Arc<MediaBridge>>,
     pub serial: String,
     pub ws_events: broadcast::Sender<WsStatusEvent>,
     /// Ring buffers of recent frame events, one per module (index 0 = A, 1 = B).
@@ -123,6 +149,10 @@ impl AppState {
         radio_tx_observer: Option<SharedTxObserver>,
         radio_client: Option<SharedRadioClient>,
         reticulum: SharedGatewayReticulum,
+        remote: Option<SharedRemote>,
+        fec: Option<Arc<FecSelector>>,
+        vpn_network: Option<cidr::Ipv4Cidr>,
+        media: Option<Arc<MediaBridge>>,
         serial: String,
     ) -> Self {
         Self {
@@ -136,6 +166,10 @@ impl AppState {
             radio_tx_observer,
             radio_client,
             reticulum,
+            remote,
+            fec,
+            vpn_network,
+            media,
             serial,
             ws_events: ws_event_bus(),
             rx_buffers: [empty_rx_buffer(), empty_rx_buffer()],
@@ -217,4 +251,21 @@ fn service_label(services: &[ServiceStatusDto], unit: &str) -> String {
             }
         })
         .unwrap_or_else(|| "unknown".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_mesh_client_ip;
+    use std::net::Ipv4Addr;
+    use std::str::FromStr;
+
+    #[test]
+    fn mesh_clients_are_only_those_inside_the_tunnel() {
+        let vpn = cidr::Ipv4Cidr::from_str("10.20.0.0/16").ok();
+        assert!(is_mesh_client_ip(vpn, Ipv4Addr::new(10, 20, 124, 1)));
+        assert!(!is_mesh_client_ip(vpn, Ipv4Addr::new(192, 168, 1, 20)));
+        assert!(!is_mesh_client_ip(vpn, Ipv4Addr::LOCALHOST));
+        // With no VPN configured nothing is treated as a mesh client.
+        assert!(!is_mesh_client_ip(None, Ipv4Addr::new(10, 20, 124, 1)));
+    }
 }

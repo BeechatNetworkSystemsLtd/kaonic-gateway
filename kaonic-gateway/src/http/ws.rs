@@ -40,6 +40,49 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
 }
 
 pub fn spawn_status_publishers(state: AppState) {
+    // Remote snapshots are pushed on change (debounced) rather than polled,
+    // so pairing/link state reaches the map within a fraction of a second.
+    if let Some(remote) = state.remote.clone() {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut changes = remote.subscribe_changes();
+            loop {
+                match changes.recv().await {
+                    Ok(()) | Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => break,
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                // Drain anything that arrived during the debounce window.
+                while changes.try_recv().is_ok() {}
+                if state.ws_events.receiver_count() == 0 {
+                    continue;
+                }
+                let mut snapshot = remote.snapshot();
+                kaonic_gateway::remote::enrich_snapshot(&state, &mut snapshot).await;
+                let _ = state.ws_events.send(WsStatusEvent::Remote(snapshot));
+            }
+        });
+    }
+
+    // CPU/RAM come from /proc and are cheap, so they get their own fast tick
+    // for a live-looking chart; the heavy snapshot (systemctl, VPN, reticulum)
+    // stays on the slow one.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = interval(Duration::from_secs(2));
+            loop {
+                tick.tick().await;
+                if state.ws_events.receiver_count() == 0 {
+                    continue;
+                }
+                let _ = state
+                    .ws_events
+                    .send(WsStatusEvent::System(build_system_status().await));
+            }
+        });
+    }
+
     tokio::spawn(async move {
         let mut tick = interval(Duration::from_secs(10));
         loop {
@@ -75,9 +118,6 @@ async fn publish_periodic_events(state: &AppState) {
     let _ = state
         .ws_events
         .send(WsStatusEvent::Interfaces(build_ws_interfaces()));
-    let _ = state
-        .ws_events
-        .send(WsStatusEvent::System(build_system_status().await));
     let _ = state.ws_events.send(WsStatusEvent::Services(services));
     let _ = state
         .ws_events
@@ -88,12 +128,17 @@ async fn publish_periodic_events(state: &AppState) {
     let _ = state.ws_events.send(WsStatusEvent::Reticulum(
         build_ws_reticulum_snapshot(state).await,
     ));
+    if let Some(remote) = state.remote.as_ref() {
+        let mut snapshot = remote.snapshot();
+        kaonic_gateway::remote::enrich_snapshot(state, &mut snapshot).await;
+        let _ = state.ws_events.send(WsStatusEvent::Remote(snapshot));
+    }
 }
 
 async fn initial_events(state: &AppState) -> Vec<WsStatusEvent> {
     let services = build_services().await;
     let network_ports = build_network_ports(state, &services);
-    vec![
+    let mut events = vec![
         WsStatusEvent::Interfaces(build_ws_interfaces()),
         WsStatusEvent::System(build_system_status().await),
         WsStatusEvent::Services(services),
@@ -110,7 +155,13 @@ async fn initial_events(state: &AppState) -> Vec<WsStatusEvent> {
             frames: build_radio_frames(state, 1).await,
             stats: build_frame_stats(state, 1),
         }),
-    ]
+    ];
+    if let Some(remote) = state.remote.as_ref() {
+        let mut snapshot = remote.snapshot();
+        kaonic_gateway::remote::enrich_snapshot(state, &mut snapshot).await;
+        events.push(WsStatusEvent::Remote(snapshot));
+    }
+    events
 }
 
 async fn send_event(socket: &mut WebSocket, event: &WsStatusEvent) -> Result<(), ()> {

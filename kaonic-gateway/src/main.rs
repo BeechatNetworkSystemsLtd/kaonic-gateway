@@ -16,8 +16,10 @@ use kaonic_gateway::gateway_reticulum::GatewayReticulum;
 use kaonic_gateway::local_https;
 use kaonic_gateway::radio::{
     attach_radio_interface, connect_radio_client, SharedErrorObserver, SharedRadioClient,
-    SharedTxObserver,
+    SharedRxObserver, SharedTxObserver,
 };
+use kaonic_gateway::remote::{load_feature_flags, start_remote, GatewayLinkPolicy};
+use kaonic_reticulum::FecSelector;
 use kaonic_gateway::settings::Settings;
 use kaonic_vpn::{VpnConfig, VpnRuntime};
 use log;
@@ -117,7 +119,7 @@ async fn async_main() -> Result<(), process::ExitCode> {
 
     env_logger::Builder::new()
         .parse_filters(
-            "warn,kaonic_gateway=trace,kaonic_vpn=debug,kaonic_reticulum=warn,reticulum=warn",
+            "warn,kaonic_gateway=trace,kaonic_vpn=debug,kaonic_remote=debug,kaonic_reticulum=warn,reticulum=warn",
         )
         .parse_default_env()
         .init();
@@ -152,6 +154,10 @@ async fn async_main() -> Result<(), process::ExitCode> {
             None,
             None,
             reticulum,
+            None,
+            None,
+            None,
+            None,
             serial,
         );
 
@@ -221,6 +227,63 @@ async fn async_main() -> Result<(), process::ExitCode> {
         }
     });
 
+    // Shared cancellation token — cancelled on Ctrl-C / SIGTERM.
+    let cancel = CancellationToken::new();
+
+    let features = load_feature_flags(&settings);
+    log::info!(
+        "features: vpn={} remote={} shell={}",
+        features.vpn_enabled,
+        features.remote_enabled,
+        features.shell_enabled
+    );
+
+    // Remote control runtime: zero-trust pairing + RPC over Reticulum links.
+    // Started only when enabled — the switch must actually stop the node
+    // announcing and serving commands, not merely hide it from the UI.
+    let remote = if features.remote_enabled {
+        Some(
+            start_remote(
+        settings.clone(),
+        &id,
+        transport.clone(),
+        Some(radio_client.clone()),
+                codename.clone(),
+                serial.clone(),
+                cancel.clone(),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    // Runtime FEC selection: robust/wire-compatible by default, sessions
+    // opt into cheaper codes per destination (see GatewayLinkPolicy).
+    let fec = Arc::new(FecSelector::default());
+    if let Some(remote) = remote.as_ref() {
+        remote.set_link_policy(Arc::new(GatewayLinkPolicy { fec: fec.clone() }));
+    }
+    // Local UDP bridge for PTT/video plugins onto the media transport.
+    let media = match remote.as_ref() {
+        Some(remote) => match kaonic_gateway::media_bridge::MediaBridge::new(remote.clone()).await {
+            Ok(bridge) => Some(bridge),
+            Err(err) => {
+                log::warn!("media bridge unavailable: {err}");
+                None
+            }
+        },
+        None => None,
+    };
+    // Per-packet RSSI + hop count for the remote node map.
+    let remote_rx_observer: SharedRxObserver = Arc::new({
+        let remote = remote.clone();
+        move |_module, rssi, packet| {
+            if let Some(remote) = remote.as_ref() {
+                remote.observe_packet(rssi, packet);
+            }
+        }
+    });
+
     attach_radio_interface(
         &transport,
         radio_client.clone(),
@@ -228,16 +291,19 @@ async fn async_main() -> Result<(), process::ExitCode> {
         0,
         Some(radio_tx_observer.clone()),
         Some(reticulum_error_observer),
+        Some(remote_rx_observer),
+        fec.clone(),
     )
     .await
     .map_err(|err| {
         log::error!("radio interface attach error: {err:?}");
         process::ExitCode::FAILURE
     })?;
-
-    // Shared cancellation token — cancelled on Ctrl-C / SIGTERM.
-    let cancel = CancellationToken::new();
-    let vpn = match VpnRuntime::start(
+    let vpn = if !features.vpn_enabled {
+        log::info!("vpn disabled by feature switch");
+        None
+    } else {
+        match VpnRuntime::start(
         VpnConfig {
             network: config.network,
             allow_all_peers: config.allow_all_peers,
@@ -250,11 +316,12 @@ async fn async_main() -> Result<(), process::ExitCode> {
         cancel.clone(),
     )
     .await
-    {
-        Ok(vpn) => Some(vpn),
-        Err(err) => {
-            log::error!("vpn runtime start failed: {err}");
-            None
+        {
+            Ok(vpn) => Some(vpn),
+            Err(err) => {
+                log::error!("vpn runtime start failed: {err}");
+                None
+            }
         }
     };
 
@@ -267,6 +334,10 @@ async fn async_main() -> Result<(), process::ExitCode> {
         Some(radio_tx_observer.clone()),
         Some(radio_client.clone()),
         reticulum,
+        remote,
+        Some(fec),
+        Some(config.network),
+        media,
         serial,
     );
 

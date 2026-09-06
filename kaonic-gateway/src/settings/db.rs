@@ -32,8 +32,170 @@ impl Database {
             );
             CREATE TABLE IF NOT EXISTS peers (
                 destination_hash TEXT PRIMARY KEY
+            );
+            CREATE TABLE IF NOT EXISTS remote_paired (
+                identity_hash TEXT PRIMARY KEY,
+                identity_hex  TEXT NOT NULL,
+                codename      TEXT NOT NULL,
+                paired_at     INTEGER NOT NULL,
+                permissions   INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS remote_tags (
+                identity_hash TEXT PRIMARY KEY,
+                tag           TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS remote_pairing_requests (
+                identity_hash TEXT NOT NULL,
+                direction     TEXT NOT NULL,
+                identity_hex  TEXT NOT NULL,
+                codename      TEXT NOT NULL,
+                state         TEXT NOT NULL,
+                detail        TEXT NOT NULL,
+                ts            INTEGER NOT NULL,
+                retries       INTEGER NOT NULL,
+                PRIMARY KEY (identity_hash, direction)
             );",
         )
+    }
+
+    // ── Remote control trust store ───────────────────────────────────────────
+
+    pub fn load_remote_paired(&self) -> Result<Vec<kaonic_remote::PairedNode>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT identity_hash, identity_hex, codename, paired_at, permissions
+             FROM remote_paired ORDER BY paired_at",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(kaonic_remote::PairedNode {
+                identity_hash: row.get(0)?,
+                identity_hex: row.get(1)?,
+                codename: row.get(2)?,
+                paired_at: row.get::<_, i64>(3)? as u64,
+                permissions: row.get::<_, i64>(4)? as u32,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn save_remote_paired(&self, node: &kaonic_remote::PairedNode) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO remote_paired
+             (identity_hash, identity_hex, codename, paired_at, permissions)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                node.identity_hash,
+                node.identity_hex,
+                node.codename,
+                node.paired_at as i64,
+                node.permissions as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_remote_paired(&self, identity_hash: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM remote_paired WHERE identity_hash = ?1",
+            params![identity_hash],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_remote_requests(&self) -> Result<Vec<kaonic_remote::PairingRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT identity_hash, direction, identity_hex, codename, state, detail, ts, retries
+             FROM remote_pairing_requests ORDER BY ts",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let direction: String = row.get(1)?;
+            Ok((
+                direction,
+                kaonic_remote::PairingRecord {
+                    identity_hash: row.get(0)?,
+                    identity_hex: row.get(2)?,
+                    codename: row.get(3)?,
+                    direction: kaonic_remote::PairingDirection::Outgoing,
+                    state: row.get(4)?,
+                    detail: row.get(5)?,
+                    ts: row.get::<_, i64>(6)? as u64,
+                    retries: row.get::<_, i64>(7)? as u32,
+                },
+            ))
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            let (direction, mut record) = row?;
+            let Some(direction) = kaonic_remote::PairingDirection::parse(&direction) else {
+                continue;
+            };
+            record.direction = direction;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    pub fn save_remote_request(&self, record: &kaonic_remote::PairingRecord) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO remote_pairing_requests
+             (identity_hash, direction, identity_hex, codename, state, detail, ts, retries)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                record.identity_hash,
+                record.direction.as_str(),
+                record.identity_hex,
+                record.codename,
+                record.state,
+                record.detail,
+                record.ts as i64,
+                record.retries as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_remote_request(
+        &self,
+        identity_hash: &str,
+        direction: kaonic_remote::PairingDirection,
+    ) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM remote_pairing_requests WHERE identity_hash = ?1 AND direction = ?2",
+            params![identity_hash, direction.as_str()],
+        )?;
+        Ok(())
+    }
+
+    // ── Operator labels for remote nodes ─────────────────────────────────────
+
+    pub fn load_remote_tags(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT identity_hash, tag FROM remote_tags")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
+    }
+
+    pub fn set_remote_tag(&self, identity_hash: &str, tag: &str) -> Result<()> {
+        if tag.is_empty() {
+            self.conn.execute(
+                "DELETE FROM remote_tags WHERE identity_hash = ?1",
+                params![identity_hash],
+            )?;
+        } else {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO remote_tags (identity_hash, tag) VALUES (?1, ?2)",
+                params![identity_hash, tag],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        self.get(key)
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.set(key, value)
     }
 
     fn get(&self, key: &str) -> Result<Option<String>> {

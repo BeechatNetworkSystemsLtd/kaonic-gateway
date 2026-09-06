@@ -1,5 +1,6 @@
 pub(crate) mod handlers;
 mod installer;
+mod remote_api;
 pub(crate) mod ws;
 
 use std::net::SocketAddr;
@@ -8,7 +9,7 @@ use axum::extract::{OriginalUri, Path, State};
 use axum::http::{header, HeaderMap};
 use axum::response::{IntoResponse, Redirect};
 use axum::{
-    routing::{any, delete, get, post},
+    routing::{any, delete, get, post, put},
     Router,
 };
 use kaonic_gateway::local_https;
@@ -118,6 +119,57 @@ pub async fn serve(state: AppState, http_addr: SocketAddr, https_addr: SocketAdd
         .route("/network/wifi/mode", post(handlers::post_wifi_mode))
         .route("/network/wifi/antenna", post(handlers::post_wifi_antenna))
         .route("/network/wifi/connect", post(handlers::post_wifi_connect))
+        .route("/api/remote/snapshot", get(remote_api::get_snapshot))
+        .route(
+            "/api/remote/settings",
+            get(remote_api::get_settings).put(remote_api::put_settings),
+        )
+        .route(
+            "/api/remote/fec",
+            get(remote_api::get_fec).put(remote_api::put_fec),
+        )
+        .route("/api/remote/nodes/{hash}/class", post(remote_api::post_node_class))
+        .route("/api/remote/nodes/{hash}/tag", put(remote_api::put_node_tag))
+        .route("/api/remote/media", get(remote_api::get_media))
+        .route("/api/remote/nodes/{hash}/shell", post(remote_api::post_shell))
+        .route(
+            "/api/system/features",
+            get(remote_api::get_features).put(remote_api::put_features),
+        )
+        .route("/api/remote/nodes/{hash}/media", post(remote_api::post_media))
+        .route(
+            "/api/remote/nodes/{hash}/media/{stream}",
+            delete(remote_api::delete_media),
+        )
+        .route("/api/remote/nodes/{hash}/pair", post(remote_api::post_pair))
+        .route("/api/remote/nodes/{hash}/cancel", post(remote_api::post_cancel))
+        .route("/api/remote/nodes/{hash}/approve", post(remote_api::post_approve))
+        .route("/api/remote/nodes/{hash}/reject", post(remote_api::post_reject))
+        .route("/api/remote/nodes/{hash}/unpair", post(remote_api::post_unpair))
+        .route("/api/remote/nodes/{hash}/ping", post(remote_api::post_ping))
+        .route("/api/remote/nodes/{hash}/info", get(remote_api::get_info))
+        .route(
+            "/api/remote/nodes/{hash}/radio/{module}",
+            get(remote_api::get_radio).put(remote_api::put_radio),
+        )
+        .route("/api/remote/nodes/{hash}/plugins", get(remote_api::get_plugins))
+        .route(
+            "/api/remote/nodes/{hash}/plugins/upload",
+            post(remote_api::post_plugin_upload)
+                // Plugin packages are tens of MB; lift the 2 MB multipart default.
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    kaonic_remote::protocol::MAX_BLOB_SIZE as usize + 1024 * 1024,
+                )),
+        )
+        .route(
+            "/api/remote/nodes/{hash}/plugins/{plugin_id}/{action}",
+            post(remote_api::post_plugin_action),
+        )
+        .route("/api/remote/nodes/{hash}/reboot", post(remote_api::post_reboot))
+        .route(
+            "/api/remote/nodes/{hash}/service/restart",
+            post(remote_api::post_service_restart),
+        )
         .route("/api/ws/status", get(ws::ws_status))
         .route("/assets/{*path}", get(serve_asset))
         // Convenience short-paths kept for compatibility
@@ -164,7 +216,8 @@ pub async fn serve(state: AppState, http_addr: SocketAddr, https_addr: SocketAdd
         redirect_app,
     );
     let https_server =
-        axum_server::bind_rustls(https_addr, tls_config).serve(app.into_make_service());
+        axum_server::bind_rustls(https_addr, tls_config)
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>());
 
     tokio::select! {
         result = http_server => result.expect("HTTP redirect server error"),

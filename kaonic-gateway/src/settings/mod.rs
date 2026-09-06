@@ -93,6 +93,50 @@ impl Settings {
     pub fn save_module_config(&self, module: usize, cfg: &RadioModuleConfig) -> Result<()> {
         self.db.save_module_config(module, cfg)
     }
+
+    pub fn load_remote_paired(&self) -> Result<Vec<kaonic_remote::PairedNode>> {
+        self.db.load_remote_paired()
+    }
+
+    pub fn save_remote_paired(&self, node: &kaonic_remote::PairedNode) -> Result<()> {
+        self.db.save_remote_paired(node)
+    }
+
+    pub fn remove_remote_paired(&self, identity_hash: &str) -> Result<()> {
+        self.db.remove_remote_paired(identity_hash)
+    }
+
+    pub fn load_remote_requests(&self) -> Result<Vec<kaonic_remote::PairingRecord>> {
+        self.db.load_remote_requests()
+    }
+
+    pub fn save_remote_request(&self, record: &kaonic_remote::PairingRecord) -> Result<()> {
+        self.db.save_remote_request(record)
+    }
+
+    pub fn remove_remote_request(
+        &self,
+        identity_hash: &str,
+        direction: kaonic_remote::PairingDirection,
+    ) -> Result<()> {
+        self.db.remove_remote_request(identity_hash, direction)
+    }
+
+    pub fn load_remote_tags(&self) -> Result<Vec<(String, String)>> {
+        self.db.load_remote_tags()
+    }
+
+    pub fn set_remote_tag(&self, identity_hash: &str, tag: &str) -> Result<()> {
+        self.db.set_remote_tag(identity_hash, tag)
+    }
+
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        self.db.get_setting(key)
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.db.set_setting(key, value)
+    }
 }
 
 #[cfg(test)]

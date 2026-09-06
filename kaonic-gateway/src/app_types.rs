@@ -190,6 +190,7 @@ pub enum WsStatusEvent {
     Vpn(VpnSnapshot),
     Reticulum(WsReticulumSnapshotDto),
     RadioFrames(WsRadioFramesDto),
+    Remote(kaonic_remote::RemoteSnapshot),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

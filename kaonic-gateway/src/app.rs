@@ -8,7 +8,7 @@ use leptos_router::{
 use crate::components::navbar::Navbar;
 use crate::pages::{
     dashboard::DashboardPage, media::MediaPage, network::NetworkPage, plugins::PluginsPage,
-    radio::RadioPage, reticulum::ReticulumPage, update::SystemPage, vpn::VpnPage,
+    radio::RadioPage, remote::RemotePage, reticulum::ReticulumPage, update::SystemPage, vpn::VpnPage,
 };
 
 const VPN_SHORTCUT_REDIRECT_JS: &str = r#"
@@ -54,6 +54,7 @@ pub fn App() -> impl IntoView {
                     <Route path=StaticSegment("") view=DashboardPage/>
                     <Route path=StaticSegment("radio") view=RadioPage/>
                     <Route path=StaticSegment("reticulum") view=ReticulumPage/>
+                    <Route path=StaticSegment("remote") view=RemotePage/>
                     <Route path=StaticSegment("vpn") view=VpnPage/>
                     <Route path=StaticSegment("plugins") view=PluginsPage/>
                     <Route path=StaticSegment("settings") view=RadioPage/>

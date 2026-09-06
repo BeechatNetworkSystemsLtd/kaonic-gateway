@@ -69,6 +69,7 @@ pub fn Navbar() -> impl IntoView {
                 <A href="/" exact=true attr:class="nav-link">"Dashboard"</A>
                 <A href="/radio" attr:class="nav-link">"Radio"</A>
                 <A href="/reticulum" attr:class="nav-link">"Reticulum"</A>
+                <A href="/remote" attr:class="nav-link">"Remote"</A>
                 <A href="/vpn" attr:class="nav-link">"VPN"</A>
                 <A href="/plugins" attr:class="nav-link">"Plugins"</A>
                 <A href="/network" attr:class="nav-link">"Network"</A>

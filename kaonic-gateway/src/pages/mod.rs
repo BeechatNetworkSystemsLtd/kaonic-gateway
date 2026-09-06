@@ -5,6 +5,7 @@ pub mod media;
 pub mod network;
 pub mod plugins;
 pub mod radio;
+pub mod remote;
 pub mod reticulum;
 pub mod update;
 pub mod vpn;
