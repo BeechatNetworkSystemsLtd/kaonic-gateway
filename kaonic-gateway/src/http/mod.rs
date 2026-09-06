@@ -88,6 +88,7 @@ pub async fn serve(state: AppState, http_addr: SocketAddr, https_addr: SocketAdd
         .route("/api/vpn/access", post(handlers::put_vpn_access))
         .route("/api/vpn/ping", post(handlers::post_vpn_ping))
         .route("/api/vpn/speed-test", post(handlers::post_vpn_speed_test))
+        .route("/api/speed-payload", get(handlers::get_speed_payload))
         .route("/api/plugins", get(installer::list_plugins))
         .route(
             "/api/plugins/installer-version",

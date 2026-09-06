@@ -392,6 +392,34 @@ pub async fn post_vpn_ping(
     }))
 }
 
+#[derive(serde::Deserialize)]
+pub struct SpeedPayloadQuery {
+    #[serde(default)]
+    pub bytes: Option<usize>,
+}
+
+/// Fixed-size payload so a speed test measures the link, not whatever the
+/// index page happens to weigh today. Served over the VPN tunnel.
+pub async fn get_speed_payload(
+    axum::extract::Query(query): axum::extract::Query<SpeedPayloadQuery>,
+) -> impl IntoResponse {
+    const DEFAULT: usize = 32 * 1024;
+    const MAX: usize = 256 * 1024;
+    let len = query.bytes.unwrap_or(DEFAULT).clamp(1024, MAX);
+    // Incompressible bytes so a proxy or gzip cannot flatter the result.
+    let mut body = vec![0u8; len];
+    for (i, byte) in body.iter_mut().enumerate() {
+        *byte = (i.wrapping_mul(31) % 251) as u8;
+    }
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "application/octet-stream"),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+}
+
 pub async fn post_vpn_speed_test(
     State(state): State<AppState>,
     Json(request): Json<VpnSpeedTestRequest>,
@@ -417,7 +445,10 @@ pub async fn post_vpn_speed_test(
         return Err((StatusCode::NOT_FOUND, "peer tunnel IP not found".into()));
     }
 
-    let url = format!("https://{peer_ip}/");
+    // Ask for a fixed-size payload; older peers without the endpoint fall
+    // back to their index page below.
+    let payload_bytes = request.bytes.unwrap_or(32 * 1024).clamp(1024, 256 * 1024);
+    let url = format!("https://{peer_ip}/api/speed-payload?bytes={payload_bytes}");
     let root_ca_pem = std::fs::read(local_https::root_ca_cert_path()).map_err(|err| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -430,9 +461,17 @@ pub async fn post_vpn_speed_test(
             format!("failed to parse local Root CA certificate: {err}"),
         )
     })?;
+    // The TLS handshake alone moves a few KB over the radio, so both
+    // timeouts are generous; short ones expire mid-handshake.
+    // Every device signs its certificate with its own Root CA, so a peer can
+    // never chain to ours. This request only times a fixed payload over a
+    // tunnel Reticulum already authenticates and encrypts, sends no
+    // credentials and keeps only the byte count, so verification is skipped
+    // here and nowhere else.
     let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(3))
-        .timeout(Duration::from_secs(15))
+        .connect_timeout(Duration::from_secs(90))
+        .timeout(Duration::from_secs(180))
+        .danger_accept_invalid_certs(true)
         .add_root_certificate(root_ca)
         .build()
         .map_err(|err| {
@@ -449,11 +488,38 @@ pub async fn post_vpn_speed_test(
         .send()
         .await
         .map_err(|err| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("speed-test request failed: {err}"),
-            )
+            let mut detail = err.to_string();
+            let mut source = std::error::Error::source(&err);
+            while let Some(inner) = source {
+                detail.push_str(&format!(": {inner}"));
+                source = inner.source();
+            }
+            let reason = if err.is_timeout() {
+                format!("timed out — the link is too slow or the peer is unreachable ({detail})")
+            } else if err.is_connect() {
+                format!("could not connect to the peer ({detail})")
+            } else {
+                detail
+            };
+            (StatusCode::BAD_GATEWAY, format!("speed-test failed: {reason}"))
         })?;
+
+    let response = if response.status() == reqwest::StatusCode::NOT_FOUND {
+        // Peer predates the payload endpoint: measure its index page instead.
+        client
+            .get(format!("https://{peer_ip}/"))
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
+            .send()
+            .await
+            .map_err(|err| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("speed-test fallback failed: {err}"),
+                )
+            })?
+    } else {
+        response
+    };
 
     if !response.status().is_success() {
         return Err((
@@ -462,14 +528,30 @@ pub async fn post_vpn_speed_test(
         ));
     }
 
-    let bytes = response.bytes().await.map_err(|err| {
+    // Count the body as it streams and stop at a sane ceiling: the peer is
+    // paired, not trusted, and an unbounded read would exhaust memory.
+    const MAX_DOWNLOAD: u64 = 8 * 1024 * 1024;
+    let mut bytes_len = 0u64;
+    let mut response = response;
+    while let Some(chunk) = response.chunk().await.map_err(|err| {
         (
             StatusCode::BAD_GATEWAY,
-            format!("failed to read speed-test body: {err}"),
+            if err.is_timeout() {
+                "speed-test timed out while downloading".to_string()
+            } else {
+                format!("failed to read speed-test body: {err}")
+            },
         )
-    })?;
+    })? {
+        bytes_len += chunk.len() as u64;
+        if bytes_len > MAX_DOWNLOAD {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "speed-test response exceeded the size limit".into(),
+            ));
+        }
+    }
     let duration_ms = started.elapsed().as_millis().max(1) as u64;
-    let bytes_len = bytes.len() as u64;
     let bps = ((bytes_len as u128) * 8 * 1000 / duration_ms as u128) as u64;
 
     log::info!(
@@ -550,6 +632,9 @@ pub struct VpnPingRequest {
 #[derive(Deserialize)]
 pub struct VpnSpeedTestRequest {
     pub address: String,
+    /// Payload size to request; defaults to 32 KiB.
+    #[serde(default)]
+    pub bytes: Option<usize>,
 }
 
 #[derive(Deserialize)]
