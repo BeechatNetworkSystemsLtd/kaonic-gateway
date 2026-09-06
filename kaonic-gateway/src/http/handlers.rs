@@ -941,11 +941,161 @@ pub async fn post_wifi_connect(
     State(state): State<AppState>,
     Form(form): Form<WifiConnectForm>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    connect_and_remember(&state, form.ssid, form.psk).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn unix_timestamp_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Connect and keep the credentials so the operator can switch back later.
+async fn connect_and_remember(
+    state: &AppState,
+    ssid: String,
+    psk: String,
+) -> Result<(), (StatusCode, String)> {
+    let ssid = ssid.trim().to_string();
+    if ssid.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "ssid is required".into()));
+    }
     state
         .network
-        .connect_wifi(&form.ssid, &form.psk)
+        .connect_wifi(&ssid, &psk)
         .await
-        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(map_network_error)?;
+    let now = unix_timestamp_secs();
+    let settings = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+    let existing = settings
+        .load_wifi_networks()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|n| n.ssid == ssid);
+    let network = kaonic_gateway::network::SavedWifiNetwork {
+        ssid: ssid.clone(),
+        psk,
+        priority: existing.as_ref().map(|n| n.priority).unwrap_or(0),
+        created_at: existing.as_ref().map(|n| n.created_at).unwrap_or(now),
+        last_used: now,
+    };
+    if let Err(err) = settings.save_wifi_network(&network) {
+        log::warn!("failed to save wifi network {ssid}: {err}");
+    }
+    let _ = settings.touch_wifi_network(&ssid, now);
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+pub struct WifiNetworkRequest {
+    pub ssid: String,
+    #[serde(default)]
+    pub psk: String,
+}
+
+/// Saved networks (PSKs are never sent back to the browser).
+pub async fn get_wifi_networks(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<kaonic_gateway::network::SavedWifiNetwork>>, (StatusCode, String)> {
+    let settings = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+    settings
+        .load_wifi_networks()
+        .map(Json)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+}
+
+pub async fn post_wifi_network(
+    State(state): State<AppState>,
+    Json(request): Json<WifiNetworkRequest>,
+) -> Result<Json<SystemActionResponse>, (StatusCode, String)> {
+    let ssid = request.ssid.trim().to_string();
+    if ssid.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "ssid is required".into()));
+    }
+    let now = unix_timestamp_secs();
+    let settings = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+    let existing = settings
+        .load_wifi_networks()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|n| n.ssid == ssid);
+    // An empty PSK means "keep what we have" — the client never sees the
+    // stored value, so overwriting it would lose the credential for good.
+    let psk = match (request.psk.is_empty(), existing.as_ref()) {
+        (true, Some(previous)) => previous.psk.clone(),
+        (true, None) => {
+            return Err((StatusCode::BAD_REQUEST, "psk is required".into()));
+        }
+        (false, _) => request.psk,
+    };
+    settings
+        .save_wifi_network(&kaonic_gateway::network::SavedWifiNetwork {
+            ssid: ssid.clone(),
+            psk,
+            priority: existing.as_ref().map(|n| n.priority).unwrap_or(0),
+            created_at: existing.as_ref().map(|n| n.created_at).unwrap_or(now),
+            last_used: existing.as_ref().map(|n| n.last_used).unwrap_or(0),
+        })
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(SystemActionResponse {
+        status: format!("Saved {ssid}"),
+    }))
+}
+
+pub async fn delete_wifi_network(
+    State(state): State<AppState>,
+    Path(ssid): Path<String>,
+) -> Result<Json<SystemActionResponse>, (StatusCode, String)> {
+    let settings = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+    settings
+        .remove_wifi_network(&ssid)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(SystemActionResponse {
+        status: format!("Removed {ssid}"),
+    }))
+}
+
+/// Connect to an already-saved network by SSID.
+pub async fn post_wifi_network_connect(
+    State(state): State<AppState>,
+    Path(ssid): Path<String>,
+) -> Result<Json<SystemActionResponse>, (StatusCode, String)> {
+    let saved = {
+        let settings = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+        settings
+            .load_wifi_networks()
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+            .into_iter()
+            .find(|n| n.ssid == ssid)
+            .ok_or((StatusCode::NOT_FOUND, "unknown network".to_string()))?
+    };
+    connect_and_remember(&state, saved.ssid.clone(), saved.psk).await?;
+    Ok(Json(SystemActionResponse {
+        status: format!("Connecting to {ssid}"),
+    }))
+}
+
+pub async fn get_wifi_scan(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<kaonic_gateway::network::WifiScanEntry>>, (StatusCode, String)> {
+    state
+        .network
+        .scan_wifi()
+        .await
+        .map(Json)
+        .map_err(map_network_error)
+}
+
+pub async fn get_network_firewall(
+    State(state): State<AppState>,
+) -> Result<Json<kaonic_gateway::network::FirewallSnapshotDto>, (StatusCode, String)> {
+    state
+        .network
+        .firewall()
+        .await
+        .map(Json)
         .map_err(map_network_error)
 }
 

@@ -130,6 +130,22 @@ impl Settings {
         self.db.set_remote_tag(identity_hash, tag)
     }
 
+    pub fn load_wifi_networks(&self) -> Result<Vec<crate::network::SavedWifiNetwork>> {
+        self.db.load_wifi_networks()
+    }
+
+    pub fn save_wifi_network(&self, network: &crate::network::SavedWifiNetwork) -> Result<()> {
+        self.db.save_wifi_network(network)
+    }
+
+    pub fn remove_wifi_network(&self, ssid: &str) -> Result<()> {
+        self.db.remove_wifi_network(ssid)
+    }
+
+    pub fn touch_wifi_network(&self, ssid: &str, when: u64) -> Result<()> {
+        self.db.touch_wifi_network(ssid, when)
+    }
+
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
         self.db.get_setting(key)
     }

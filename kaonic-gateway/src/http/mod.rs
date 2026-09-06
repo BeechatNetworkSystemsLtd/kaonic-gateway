@@ -119,6 +119,20 @@ pub async fn serve(state: AppState, http_addr: SocketAddr, https_addr: SocketAdd
         .route("/network/wifi/mode", post(handlers::post_wifi_mode))
         .route("/network/wifi/antenna", post(handlers::post_wifi_antenna))
         .route("/network/wifi/connect", post(handlers::post_wifi_connect))
+        .route("/api/network/wifi/scan", get(handlers::get_wifi_scan))
+        .route("/api/network/firewall", get(handlers::get_network_firewall))
+        .route(
+            "/api/network/wifi/networks",
+            get(handlers::get_wifi_networks).post(handlers::post_wifi_network),
+        )
+        .route(
+            "/api/network/wifi/networks/{ssid}",
+            delete(handlers::delete_wifi_network),
+        )
+        .route(
+            "/api/network/wifi/networks/{ssid}/connect",
+            post(handlers::post_wifi_network_connect),
+        )
         .route("/api/remote/snapshot", get(remote_api::get_snapshot))
         .route(
             "/api/remote/settings",

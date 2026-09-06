@@ -44,6 +44,13 @@ impl Database {
                 identity_hash TEXT PRIMARY KEY,
                 tag           TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS wifi_networks (
+                ssid       TEXT PRIMARY KEY,
+                psk        TEXT NOT NULL,
+                priority   INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL DEFAULT 0,
+                last_used  INTEGER NOT NULL DEFAULT 0
+            );
             CREATE TABLE IF NOT EXISTS remote_pairing_requests (
                 identity_hash TEXT NOT NULL,
                 direction     TEXT NOT NULL,
@@ -187,6 +194,55 @@ impl Database {
                 params![identity_hash, tag],
             )?;
         }
+        Ok(())
+    }
+
+    // ── Saved Wi-Fi networks ─────────────────────────────────────────────────
+
+    pub fn load_wifi_networks(&self) -> Result<Vec<crate::network::SavedWifiNetwork>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ssid, psk, priority, created_at, last_used FROM wifi_networks
+             ORDER BY priority DESC, last_used DESC, ssid",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(crate::network::SavedWifiNetwork {
+                ssid: row.get(0)?,
+                psk: row.get(1)?,
+                priority: row.get::<_, i64>(2)? as i32,
+                created_at: row.get::<_, i64>(3)? as u64,
+                last_used: row.get::<_, i64>(4)? as u64,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn save_wifi_network(&self, network: &crate::network::SavedWifiNetwork) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO wifi_networks (ssid, psk, priority, created_at, last_used)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(ssid) DO UPDATE SET psk = ?2, priority = ?3",
+            params![
+                network.ssid,
+                network.psk,
+                network.priority as i64,
+                network.created_at as i64,
+                network.last_used as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_wifi_network(&self, ssid: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM wifi_networks WHERE ssid = ?1", params![ssid])?;
+        Ok(())
+    }
+
+    pub fn touch_wifi_network(&self, ssid: &str, when: u64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE wifi_networks SET last_used = ?2 WHERE ssid = ?1",
+            params![ssid, when as i64],
+        )?;
         Ok(())
     }
 

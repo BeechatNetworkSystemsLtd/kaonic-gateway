@@ -97,6 +97,59 @@ pub enum NetworkError {
     CommandFailed { command: String, message: String },
 }
 
+/// A Wi-Fi network remembered by the gateway (PSK stored so the operator can
+/// switch back without retyping it).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SavedWifiNetwork {
+    pub ssid: String,
+    #[serde(skip_serializing)]
+    pub psk: String,
+    #[serde(default)]
+    pub priority: i32,
+    #[serde(default)]
+    pub created_at: u64,
+    #[serde(default)]
+    pub last_used: u64,
+}
+
+/// One access point from a scan.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct WifiScanEntry {
+    pub ssid: String,
+    pub bssid: String,
+    pub signal_dbm: i32,
+    pub frequency_mhz: u32,
+    pub channel: u32,
+    /// "open", "wep", "wpa2", "wpa3", …
+    pub security: String,
+    pub connected: bool,
+}
+
+/// A firewall rule the VPN installed (or any rule in its chains).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct FirewallRuleDto {
+    pub table: String,
+    pub chain: String,
+    pub rule: String,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct RouteEntryDto {
+    pub destination: String,
+    pub via: String,
+    pub device: String,
+    pub scope: String,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct FirewallSnapshotDto {
+    pub available: bool,
+    pub rules: Vec<FirewallRuleDto>,
+    pub routes: Vec<RouteEntryDto>,
+    pub forwarding: bool,
+    pub detail: String,
+}
+
 #[derive(Debug)]
 pub struct NetworkService {
     #[cfg(not(target_os = "linux"))]
@@ -181,6 +234,46 @@ impl NetworkService {
         #[cfg(not(target_os = "linux"))]
         {
             self.connect_wifi_mock(ssid)
+        }
+    }
+
+    /// Scan for access points (STA mode only; an AP-mode radio cannot scan).
+    pub async fn scan_wifi(&self) -> Result<Vec<WifiScanEntry>, NetworkError> {
+        #[cfg(target_os = "linux")]
+        {
+            tokio::task::spawn_blocking(scan_wifi_linux)
+                .await
+                .map_err(|err| NetworkError::TaskJoin(err.to_string()))?
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(vec![WifiScanEntry {
+                ssid: "mock-network".into(),
+                bssid: "00:11:22:33:44:55".into(),
+                signal_dbm: -42,
+                frequency_mhz: 2437,
+                channel: 6,
+                security: "wpa2".into(),
+                connected: false,
+            }])
+        }
+    }
+
+    /// Kernel routes plus the VPN's own iptables chains.
+    pub async fn firewall(&self) -> Result<FirewallSnapshotDto, NetworkError> {
+        #[cfg(target_os = "linux")]
+        {
+            tokio::task::spawn_blocking(read_firewall_linux)
+                .await
+                .map_err(|err| NetworkError::TaskJoin(err.to_string()))?
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(FirewallSnapshotDto {
+                available: false,
+                detail: "not available on this platform".into(),
+                ..Default::default()
+            })
         }
     }
 
@@ -270,6 +363,153 @@ impl NetworkService {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn scan_wifi_linux() -> Result<Vec<WifiScanEntry>, NetworkError> {
+    let output = run_command("iw dev wlan0 scan", "iw", &["dev", "wlan0", "scan"])?;
+    let connected = read_station_link_linux().map(|(ssid, _)| ssid).unwrap_or(None);
+    let mut entries: Vec<WifiScanEntry> = Vec::new();
+    let mut current: Option<WifiScanEntry> = None;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("BSS ") {
+            if let Some(entry) = current.take() {
+                if !entry.ssid.is_empty() {
+                    entries.push(entry);
+                }
+            }
+            let bssid = trimmed
+                .trim_start_matches("BSS ")
+                .split(['(', ' '])
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            current = Some(WifiScanEntry {
+                bssid,
+                security: "open".into(),
+                ..Default::default()
+            });
+            continue;
+        }
+        let Some(entry) = current.as_mut() else {
+            continue;
+        };
+        if let Some(rest) = trimmed.strip_prefix("SSID: ") {
+            entry.ssid = rest.trim().to_string();
+        } else if let Some(rest) = trimmed.strip_prefix("signal: ") {
+            entry.signal_dbm = rest
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(0.0) as i32;
+        } else if let Some(rest) = trimmed.strip_prefix("freq: ") {
+            // iw prints "2437.0"; take the integer part.
+            entry.frequency_mhz = rest.trim().parse::<f32>().unwrap_or(0.0) as u32;
+            entry.channel = frequency_to_channel(entry.frequency_mhz);
+        } else if trimmed.starts_with("RSN:") {
+            entry.security = "wpa2".into();
+        } else if trimmed.starts_with("WPA:") && entry.security == "open" {
+            entry.security = "wpa".into();
+        } else if trimmed.contains("SAE") && entry.security.starts_with("wpa") {
+            entry.security = "wpa3".into();
+        }
+    }
+    if let Some(entry) = current {
+        if !entry.ssid.is_empty() {
+            entries.push(entry);
+        }
+    }
+    // Strongest first, one row per SSID.
+    entries.sort_by(|a, b| b.signal_dbm.cmp(&a.signal_dbm));
+    let mut seen = std::collections::HashSet::new();
+    entries.retain(|entry| seen.insert(entry.ssid.clone()));
+    for entry in &mut entries {
+        entry.connected = connected.as_deref() == Some(entry.ssid.as_str());
+    }
+    Ok(entries)
+}
+
+fn frequency_to_channel(mhz: u32) -> u32 {
+    match mhz {
+        2412..=2472 => (mhz - 2407) / 5,
+        2484 => 14,
+        5000..=5900 => (mhz - 5000) / 5,
+        _ => 0,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_firewall_linux() -> Result<FirewallSnapshotDto, NetworkError> {
+    const CHAINS: [(&str, &str); 3] = [
+        ("nat", "KAONIC_VPN_PREROUTING"),
+        ("nat", "KAONIC_VPN_POSTROUTING"),
+        ("mangle", "KAONIC_VPN_MSS"),
+    ];
+    let iptables = ["iptables", "iptables-nft", "iptables-legacy"]
+        .into_iter()
+        .find(|cmd| {
+            std::process::Command::new(cmd)
+                .arg("--version")
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false)
+        });
+    let mut snapshot = FirewallSnapshotDto {
+        available: iptables.is_some(),
+        forwarding: std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false),
+        ..Default::default()
+    };
+    if let Some(ipt) = iptables {
+        for (table, chain) in CHAINS {
+            let Ok(out) = run_command(
+                &format!("{ipt} -t {table} -S {chain}"),
+                ipt,
+                &["-t", table, "-S", chain],
+            ) else {
+                continue;
+            };
+            for line in out.lines() {
+                let line = line.trim();
+                // Skip the chain declaration itself; keep the rules.
+                if line.is_empty() || line.starts_with("-N ") {
+                    continue;
+                }
+                snapshot.rules.push(FirewallRuleDto {
+                    table: table.into(),
+                    chain: chain.into(),
+                    rule: line.to_string(),
+                });
+            }
+        }
+    } else {
+        snapshot.detail = "iptables not found".into();
+    }
+    if let Ok(out) = run_command("ip route show", "ip", &["route", "show"]) {
+        for line in out.lines() {
+            let mut parts = line.split_whitespace();
+            let Some(destination) = parts.next() else {
+                continue;
+            };
+            let mut route = RouteEntryDto {
+                destination: destination.to_string(),
+                ..Default::default()
+            };
+            let tokens: Vec<&str> = parts.collect();
+            for pair in tokens.windows(2) {
+                match pair[0] {
+                    "via" => route.via = pair[1].to_string(),
+                    "dev" => route.device = pair[1].to_string(),
+                    "scope" => route.scope = pair[1].to_string(),
+                    _ => {}
+                }
+            }
+            snapshot.routes.push(route);
+        }
+    }
+    Ok(snapshot)
+}
+
 pub fn read_interface_ipv4(interface_name: &str) -> Option<String> {
     if_addrs::get_if_addrs()
         .ok()?
@@ -285,12 +525,19 @@ pub fn read_interface_ipv4(interface_name: &str) -> Option<String> {
         })
 }
 
+/// Credentials end up in `wpa_supplicant.conf` via an external script, so
+/// reject anything that could break out of a quoted value, and measure the
+/// PSK in bytes as wpa_supplicant does.
 fn validate_wifi_credentials(ssid: &str, psk: &str) -> Result<(), NetworkError> {
-    if ssid.trim().is_empty() {
+    let unsafe_char = |value: &str| {
+        value
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '"' | '\\'))
+    };
+    if ssid.trim().is_empty() || ssid.len() > 32 || unsafe_char(ssid) {
         return Err(NetworkError::InvalidSsid);
     }
-    let psk_len = psk.chars().count();
-    if !(8..=63).contains(&psk_len) {
+    if !(8..=63).contains(&psk.len()) || unsafe_char(psk) {
         return Err(NetworkError::InvalidPsk);
     }
     Ok(())
