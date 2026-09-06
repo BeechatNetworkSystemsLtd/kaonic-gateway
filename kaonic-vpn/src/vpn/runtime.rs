@@ -716,6 +716,7 @@ fn spawn_out_link_events(
                                 }
                             }
                             LinkEvent::Proof(_) => {}
+                            LinkEvent::RemoteIdentified(_) => {}
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,

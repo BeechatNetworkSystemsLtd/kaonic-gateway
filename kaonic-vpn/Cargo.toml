@@ -8,7 +8,7 @@ rust-version = "1.85"
 run = ["dep:reticulum", "dep:kaonic-reticulum", "dep:tokio-util", "dep:cidr-v3"]
 
 [dependencies]
-reticulum        = { git = "https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs", branch = "fix/add-timer-configs", optional = true }
+reticulum        = { git = "https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs", rev = "151e3b6c77a8c7d33fafa3971a084ae02510ef39", optional = true }
 kaonic-reticulum = { path = "../kaonic-reticulum", optional = true }
 cidr-v3          = { package = "cidr", version = "0.3", features = ["serde"], optional = true }
 cidr             = { version = "0.2", features = ["serde"] }

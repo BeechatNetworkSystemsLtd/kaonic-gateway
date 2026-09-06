@@ -7,7 +7,7 @@ edition = "2021"
 kaonic-ctrl  = { git = "https://github.com/BeechatNetworkSystemsLtd/kaonic-radio" }
 kaonic-frame = { git = "https://github.com/BeechatNetworkSystemsLtd/kaonic-radio" }
 kaonic-net   = { git = "https://github.com/BeechatNetworkSystemsLtd/kaonic-radio" }
-reticulum    = { git = "https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs", branch = "fix/add-timer-configs" }
+reticulum    = { git = "https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs", rev = "151e3b6c77a8c7d33fafa3971a084ae02510ef39" }
 tokio-util   = "0.7"
 radio-common = { git = "https://github.com/BeechatNetworkSystemsLtd/kaonic-radio" }
 tokio        = { version = "1", features = ["full"] }

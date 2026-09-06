@@ -21,6 +21,17 @@ dependencies = [
 
 [[package]]
 name = "ahash"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "891477e0c6a8957309ee5c45a6368af3ae14bb510732d2684ffa19af310920f9"
+dependencies = [
+ "getrandom 0.2.17",
+ "once_cell",
+ "version_check",
+]
+
+[[package]]
+name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
@@ -1336,11 +1347,20 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a9ee70c43aaf417c914396645a0fa852624801b24ebb7ae78fe8272889ac888"
+dependencies = [
+ "ahash 0.7.8",
+]
+
+[[package]]
+name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
 dependencies = [
- "ahash",
+ "ahash 0.8.12",
 ]
 
 [[package]]
@@ -1525,19 +1545,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hyper-timeout"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b90d566bffbce6a75bd8b09a05aa8c2cb1fabb6cb348f8840c9e4c90a0d83b0"
-dependencies = [
- "hyper",
- "hyper-util",
- "pin-project-lite",
- "tokio",
- "tower-service",
-]
-
-[[package]]
 name = "hyper-util"
 version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1554,7 +1561,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tokio",
  "tower-service",
  "tracing",
@@ -1813,16 +1820,15 @@ dependencies = [
 [[package]]
 name = "kaonic-crc"
 version = "0.1.0"
-source = "git+https://github.com/BeechatNetworkSystemsLtd/kaonic-radio#2eb0a979b705605d3deb048b79c30adb436304dc"
 dependencies = [
  "crc32fast",
+ "libc",
  "log",
 ]
 
 [[package]]
 name = "kaonic-ctrl"
 version = "0.1.1"
-source = "git+https://github.com/BeechatNetworkSystemsLtd/kaonic-radio#2eb0a979b705605d3deb048b79c30adb436304dc"
 dependencies = [
  "kaonic-frame",
  "kaonic-net",
@@ -1843,11 +1849,10 @@ dependencies = [
 [[package]]
 name = "kaonic-frame"
 version = "0.1.0"
-source = "git+https://github.com/BeechatNetworkSystemsLtd/kaonic-radio#2eb0a979b705605d3deb048b79c30adb436304dc"
 
 [[package]]
 name = "kaonic-gateway"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "axum 0.8.9",
  "axum-server",
@@ -1858,6 +1863,7 @@ dependencies = [
  "if-addrs",
  "kaonic-ctrl",
  "kaonic-frame",
+ "kaonic-remote",
  "kaonic-reticulum",
  "kaonic-vpn",
  "leptos",
@@ -1868,6 +1874,7 @@ dependencies = [
  "log",
  "mime_guess",
  "p256",
+ "parking_lot",
  "qrcodegen",
  "radio-common",
  "rand 0.8.5",
@@ -1912,7 +1919,6 @@ dependencies = [
 [[package]]
 name = "kaonic-net"
 version = "0.1.0"
-source = "git+https://github.com/BeechatNetworkSystemsLtd/kaonic-radio#2eb0a979b705605d3deb048b79c30adb436304dc"
 dependencies = [
  "kaonic-crc",
  "kaonic-frame",
@@ -1926,12 +1932,31 @@ name = "kaonic-plugin-sample"
 version = "0.1.0"
 
 [[package]]
+name = "kaonic-remote"
+version = "0.1.0"
+dependencies = [
+ "env_logger 0.11.10",
+ "log",
+ "parking_lot",
+ "rand 0.8.5",
+ "rand_core 0.6.4",
+ "reed-solomon-erasure",
+ "reticulum",
+ "rmp-serde",
+ "serde",
+ "sha2",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "kaonic-reticulum"
 version = "0.1.0"
 dependencies = [
  "kaonic-ctrl",
  "kaonic-frame",
  "kaonic-net",
+ "labrador-ldpc",
  "log",
  "radio-common",
  "rand 0.8.5",
@@ -2222,6 +2247,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52ff2c0fe9bc6cb6b14a0592c2ff4fa9ceb83eea9db979b0487cd054946a2b8f"
 
 [[package]]
+name = "libm"
+version = "0.2.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+
+[[package]]
 name = "libsqlite3-sys"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2258,6 +2289,15 @@ name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+
+[[package]]
+name = "lru"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e999beba7b6e8345721bd280141ed958096a2e4abdf74f67ff4ce49b4b54e47a"
+dependencies = [
+ "hashbrown 0.12.3",
+]
 
 [[package]]
 name = "lru-slab"
@@ -2791,7 +2831,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2828,7 +2868,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tracing",
  "windows-sys 0.59.0",
 ]
@@ -2879,7 +2919,6 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 [[package]]
 name = "radio-common"
 version = "0.1.0"
-source = "git+https://github.com/BeechatNetworkSystemsLtd/kaonic-radio#2eb0a979b705605d3deb048b79c30adb436304dc"
 dependencies = [
  "serde",
 ]
@@ -3020,6 +3059,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "reed-solomon-erasure"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7263373d500d4d4f505d43a2a662d475a894aa94503a1ee28e9188b5f3960d4f"
+dependencies = [
+ "libm",
+ "lru",
+ "smallvec",
+ "spin",
+]
+
+[[package]]
 name = "regex"
 version = "1.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3091,26 +3142,34 @@ dependencies = [
 [[package]]
 name = "reticulum"
 version = "0.1.0"
-source = "git+https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs?branch=fix%2Fadd-timer-configs#bbb09ed7a8b6ead454737bd63671cb2f8be65e70"
+source = "git+https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs?rev=151e3b6c77a8c7d33fafa3971a084ae02510ef39#151e3b6c77a8c7d33fafa3971a084ae02510ef39"
+dependencies = [
+ "env_logger 0.10.2",
+ "log",
+ "rand_core 0.6.4",
+ "reticulum-core",
+ "rmp",
+ "serde",
+ "tokio",
+ "tokio-util",
+ "tonic-build",
+]
+
+[[package]]
+name = "reticulum-core"
+version = "0.1.0"
+source = "git+https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs?rev=151e3b6c77a8c7d33fafa3971a084ae02510ef39#151e3b6c77a8c7d33fafa3971a084ae02510ef39"
 dependencies = [
  "aes",
  "cbc",
  "crypto-common",
  "ed25519-dalek",
- "env_logger 0.10.2",
  "hkdf",
  "hmac",
  "log",
- "prost",
  "rand_core 0.6.4",
  "rmp",
- "serde",
  "sha2",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "tonic-build",
  "x25519-dalek",
 ]
 
@@ -4024,35 +4083,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
-name = "tonic"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e581ba15a835f4d9ea06c55ab1bd4dce26fc53752c69a04aac00703bfb49ba9"
-dependencies = [
- "async-trait",
- "axum 0.8.9",
- "base64",
- "bytes",
- "h2",
- "http",
- "http-body",
- "http-body-util",
- "hyper",
- "hyper-timeout",
- "hyper-util",
- "percent-encoding",
- "pin-project",
- "prost",
- "socket2 0.5.10",
- "tokio",
- "tokio-stream",
- "tower",
- "tower-layer",
- "tower-service",
- "tracing",
-]
-
-[[package]]
 name = "tonic-build"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4074,12 +4104,9 @@ checksum = "ebe5ef63511595f1344e2d5cfa636d973292adc0eec1f0ad45fae9f0851ab1d4"
 dependencies = [
  "futures-core",
  "futures-util",
- "indexmap",
  "pin-project-lite",
- "slab",
  "sync_wrapper",
  "tokio",
- "tokio-util",
  "tower-layer",
  "tower-service",
  "tracing",
