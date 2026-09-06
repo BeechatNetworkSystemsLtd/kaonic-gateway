@@ -12,6 +12,7 @@ struct NavbarPluginInfo {
 #[derive(Clone, Serialize, Deserialize)]
 struct TopbarInfo {
     serial: String,
+    codename: String,
     gateway_version: String,
 }
 
@@ -20,6 +21,12 @@ async fn fetch_topbar_info() -> Result<TopbarInfo, ServerFnError> {
 
     let state = leptos::context::use_context::<AppState>()
         .ok_or_else(|| ServerFnError::new("missing AppState"))?;
+    let codename = state
+        .settings
+        .lock()
+        .map_err(|_| ServerFnError::new("settings lock poisoned"))?
+        .load_or_create_codename()
+        .map_err(|err| ServerFnError::new(err.to_string()))?;
     let gateway_version = match reqwest::Client::new()
         .get("http://127.0.0.1:8682/api/plugins")
         .send()
@@ -44,6 +51,7 @@ async fn fetch_topbar_info() -> Result<TopbarInfo, ServerFnError> {
 
     Ok(TopbarInfo {
         serial: state.serial.clone(),
+        codename,
         gateway_version,
     })
 }
@@ -72,6 +80,8 @@ pub fn Navbar() -> impl IntoView {
                     {move || topbar.get().and_then(|r| r.ok()).map(|info| view! {
                         <span class="serial-label">"SN"</span>
                         <code class="serial-value">{info.serial}</code>
+                        <span class="serial-label">"CN"</span>
+                        <code class="serial-value">{info.codename}</code>
                         <span class="serial-label">"GW"</span>
                         <code class="serial-value">{info.gateway_version}</code>
                     })}

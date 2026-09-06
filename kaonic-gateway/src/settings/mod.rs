@@ -1,13 +1,30 @@
 mod db;
 
+use std::io::{self, Write};
+use std::path::Path;
+
 use db::Database;
+use rand::RngCore;
 use rusqlite::Result;
 
 use crate::config::GatewayConfig;
 use crate::radio::RadioModuleConfig;
 
+const CODENAME_PATH: &str = "/etc/kaonic/codename";
+const CODENAME_LEN: usize = 8;
+const CODENAME_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+
 pub struct Settings {
     db: Database,
+}
+
+fn generate_codename() -> String {
+    let mut bytes = [0u8; CODENAME_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    bytes
+        .into_iter()
+        .map(|byte| CODENAME_ALPHABET[(byte as usize) % CODENAME_ALPHABET.len()] as char)
+        .collect()
 }
 
 pub fn normalize_codename(value: &str) -> std::result::Result<String, &'static str> {
@@ -39,12 +56,30 @@ impl Settings {
         self.db.load_or_create_named_seed(key)
     }
 
-    pub fn load_or_create_codename(&self) -> Result<String> {
-        self.db.load_or_create_codename()
+    pub fn load_or_create_codename(&self) -> io::Result<String> {
+        match std::fs::read_to_string(CODENAME_PATH) {
+            Ok(contents) => {
+                let codename = contents.trim().to_string();
+                if !codename.is_empty() {
+                    return Ok(codename);
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        let codename = generate_codename();
+        self.save_codename(&codename)?;
+        log::info!("generated system codename '{codename}'");
+        Ok(codename)
     }
 
-    pub fn save_codename(&self, codename: &str) -> Result<()> {
-        self.db.save_codename(codename)
+    pub fn save_codename(&self, codename: &str) -> io::Result<()> {
+        if let Some(parent) = Path::new(CODENAME_PATH).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = std::fs::File::create(CODENAME_PATH)?;
+        file.write_all(codename.as_bytes())?;
+        Ok(())
     }
 
     pub fn load_config(&self) -> Result<GatewayConfig> {
