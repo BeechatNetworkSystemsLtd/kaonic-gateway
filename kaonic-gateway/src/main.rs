@@ -106,10 +106,21 @@ async fn async_main() -> Result<(), process::ExitCode> {
             process::exit(1);
         });
 
+    let seed = settings
+        .lock()
+        .unwrap()
+        .load_or_create_seed()
+        .unwrap_or_else(|err| {
+            eprintln!("failed to load/create identity seed: {err}");
+            process::exit(1);
+        });
+    let id = PrivateIdentity::new_from_name(&seed);
+    let vpn_hash = id.address_hash().to_hex_string();
+
     let codename = settings
         .lock()
         .unwrap()
-        .load_or_create_codename()
+        .load_or_create_codename(&vpn_hash)
         .unwrap_or_else(|err| {
             eprintln!("failed to load codename from database: {err}");
             process::exit(1);
@@ -129,6 +140,7 @@ async fn async_main() -> Result<(), process::ExitCode> {
         .unwrap_or_else(|_| "unknown".to_string());
     log::info!("device serial: {serial}");
     log::info!("system codename: {codename}");
+    log::info!("Reticulum identity ready: {vpn_hash}");
     local_https::install_rustls_crypto_provider();
     if let Err(err) = local_https::ensure_root_ca_files() {
         log::warn!("failed to prepare local Root CA files: {err}");
@@ -144,7 +156,7 @@ async fn async_main() -> Result<(), process::ExitCode> {
         let reticulum = Arc::new(GatewayReticulum::new());
         let app_state = AppState::new(
             settings.clone(),
-            "webapp-only".into(),
+            vpn_hash,
             None,
             cmd.kaonic_ctrl_server
                 .unwrap_or_else(|| "192.168.10.1:9090".parse().unwrap()),
@@ -159,18 +171,6 @@ async fn async_main() -> Result<(), process::ExitCode> {
         shutdown_signal(CancellationToken::new()).await;
         return Ok(());
     }
-
-    let seed = settings
-        .lock()
-        .unwrap()
-        .load_or_create_seed()
-        .unwrap_or_else(|err| {
-            log::error!("failed to load/create identity seed: {err}");
-            process::exit(1);
-        });
-    let id = PrivateIdentity::new_from_name(&seed);
-    let vpn_hash = id.address_hash().to_hex_string();
-    log::info!("Reticulum identity ready: {vpn_hash}");
 
     let default_server: std::net::SocketAddr = "192.168.10.1:9090".parse().unwrap();
     let default_listen: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();

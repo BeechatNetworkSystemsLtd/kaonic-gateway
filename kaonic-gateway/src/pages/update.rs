@@ -35,7 +35,7 @@ pub async fn load_system_about() -> Result<SystemAbout, ServerFnError> {
         .settings
         .lock()
         .map_err(|_| ServerFnError::new("settings lock poisoned"))?
-        .load_or_create_codename()
+        .load_or_create_codename(&state.vpn_hash)
         .map_err(|err| ServerFnError::new(err.to_string()))?;
     let certs_dir = match local_https::ensure_root_ca_files() {
         Ok(path) => path,

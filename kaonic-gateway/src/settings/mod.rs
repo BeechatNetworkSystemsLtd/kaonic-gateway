@@ -39,8 +39,8 @@ impl Settings {
         self.db.load_or_create_named_seed(key)
     }
 
-    pub fn load_or_create_codename(&self) -> Result<String> {
-        self.db.load_or_create_codename()
+    pub fn load_or_create_codename(&self, identity_hash: &str) -> Result<String> {
+        self.db.load_or_create_codename(identity_hash)
     }
 
     pub fn save_codename(&self, codename: &str) -> Result<()> {

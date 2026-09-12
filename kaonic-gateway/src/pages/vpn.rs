@@ -40,7 +40,7 @@ pub async fn load_vpn_snapshot() -> Result<VpnPageSnapshot, ServerFnError> {
             .lock()
             .map_err(|_| ServerFnError::new("settings lock poisoned"))?;
         settings
-            .load_or_create_codename()
+            .load_or_create_codename(&state.vpn_hash)
             .map_err(|err| ServerFnError::new(err.to_string()))?
     };
 
