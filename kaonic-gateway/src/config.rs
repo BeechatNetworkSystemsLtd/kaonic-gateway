@@ -7,8 +7,10 @@ fn default_announce_freq_secs() -> u32 {
     5
 }
 
+/// Off, matching `kaonic_vpn`: VPN membership comes from pairing or an
+/// explicit list, never from merely being in radio range.
 fn default_allow_all_peers() -> bool {
-    true
+    false
 }
 
 fn default_advertised_routes() -> Vec<Ipv4Cidr> {

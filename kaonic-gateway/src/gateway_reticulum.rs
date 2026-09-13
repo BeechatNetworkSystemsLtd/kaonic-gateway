@@ -58,6 +58,24 @@ impl GatewayReticulum {
         }
     }
 
+    /// A one-off note about the radio path (e.g. which pipeline is in use),
+    /// so it shows up on the Reticulum page and not only in the journal.
+    pub async fn record_note(&self, kind: &str, details: impl Into<String>) {
+        let ts = unix_timestamp_secs();
+        let mut state = self.state.lock().await;
+        push_event(
+            &mut state.events,
+            ReticulumEventDto {
+                ts,
+                direction: "interface".into(),
+                kind: kind.into(),
+                link_id: String::new(),
+                destination: String::new(),
+                details: details.into(),
+            },
+        );
+    }
+
     pub async fn record_interface_error(&self, module: usize, kind: InterfaceErrorKind) {
         let ts = unix_timestamp_secs();
         let mut state = self.state.lock().await;

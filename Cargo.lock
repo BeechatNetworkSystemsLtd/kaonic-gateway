@@ -1830,6 +1830,8 @@ dependencies = [
 name = "kaonic-ctrl"
 version = "0.1.1"
 dependencies = [
+ "bytes",
+ "kaonic-fec",
  "kaonic-frame",
  "kaonic-net",
  "log",
@@ -1847,12 +1849,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kaonic-fec"
+version = "0.1.0"
+dependencies = [
+ "kaonic-net",
+ "serde",
+]
+
+[[package]]
 name = "kaonic-frame"
 version = "0.1.0"
 
 [[package]]
 name = "kaonic-gateway"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "axum 0.8.9",
  "axum-server",
@@ -1925,11 +1935,26 @@ dependencies = [
  "labrador-ldpc",
  "log",
  "rand 0.8.5",
+ "serde",
 ]
 
 [[package]]
 name = "kaonic-plugin-sample"
 version = "0.1.0"
+
+[[package]]
+name = "kaonic-plugin-sdk"
+version = "0.1.0"
+dependencies = [
+ "kaonic-reticulum",
+ "log",
+ "reqwest",
+ "reticulum",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
 
 [[package]]
 name = "kaonic-remote"
@@ -1954,6 +1979,7 @@ name = "kaonic-reticulum"
 version = "0.1.0"
 dependencies = [
  "kaonic-ctrl",
+ "kaonic-fec",
  "kaonic-frame",
  "kaonic-net",
  "labrador-ldpc",
@@ -1971,6 +1997,7 @@ version = "0.1.0"
 dependencies = [
  "cidr 0.2.3",
  "cidr 0.3.2",
+ "env_logger 0.11.10",
  "etherparse",
  "if-addrs",
  "kaonic-reticulum",

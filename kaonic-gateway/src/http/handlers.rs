@@ -274,10 +274,300 @@ pub async fn post_system_service_restart(
     Ok(Json(SystemActionResponse { status }))
 }
 
+/// The node this device routes through, and what that currently reaches.
+#[derive(serde::Serialize)]
+pub struct VpnUplinkResponse {
+    pub enabled: bool,
+    pub active: bool,
+    pub peer: Option<String>,
+    pub peer_codename: Option<String>,
+    pub routes: Vec<String>,
+    /// True when the router shares its whole uplink, so general traffic from
+    /// this device and its clients goes over the radio.
+    pub default_route: bool,
+    pub detail: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct PutVpnUplinkRequest {
+    pub enabled: bool,
+    /// Destination hash of the node to route through.
+    #[serde(default)]
+    pub peer: Option<String>,
+}
+
+pub async fn get_vpn_uplink(
+    State(state): State<AppState>,
+) -> Result<Json<VpnUplinkResponse>, (StatusCode, String)> {
+    let uplink = match &state.vpn {
+        Some(vpn) => vpn.snapshot().await.uplink,
+        None => Default::default(),
+    };
+    // The stored selection is the operator-facing identity hash; the VPN's own
+    // `peer` is the derived tunnel hash, which would mean nothing on the page.
+    let peer = state
+        .settings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .load_vpn_uplink()
+        .ok()
+        .and_then(|saved| saved.peer);
+    let peer_codename = peer.as_deref().and_then(|hash| codename_for(&state, hash));
+    Ok(Json(VpnUplinkResponse {
+        enabled: uplink.enabled,
+        active: uplink.active,
+        peer,
+        peer_codename,
+        routes: uplink.routes,
+        default_route: uplink.default_route,
+        detail: uplink.detail,
+    }))
+}
+
+fn codename_for(state: &AppState, identity_hash: &str) -> Option<String> {
+    let paired = state
+        .settings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .load_remote_paired()
+        .ok()?;
+    paired
+        .into_iter()
+        .find(|node| node.identity_hash == identity_hash)
+        .map(|node| node.codename)
+        .filter(|codename| !codename.is_empty())
+}
+
+pub async fn put_vpn_uplink(
+    State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    Json(request): Json<PutVpnUplinkRequest>,
+) -> Result<Json<SystemActionResponse>, (StatusCode, String)> {
+    deny_mesh(&state, peer)?;
+
+    let selected = request
+        .peer
+        .map(|hash| hash.trim().to_lowercase())
+        .filter(|hash| !hash.is_empty());
+    if request.enabled {
+        let hash = selected.as_deref().ok_or((
+            StatusCode::BAD_REQUEST,
+            "choose a node to route through".to_string(),
+        ))?;
+        if hash.len() != 32 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err((StatusCode::BAD_REQUEST, "invalid node hash".into()));
+        }
+        // Routing through a node means trusting it with everything this device
+        // and its clients send. That has to be a node the operator paired, not
+        // any hash someone can put in a request.
+        if codename_for(&state, hash).is_none() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "that node is not paired; pair it first on the Remote page".into(),
+            ));
+        }
+    }
+
+    // Stored as the identity hash the operator chose, applied as the VPN
+    // destination hash the tunnel actually sees announces from.
+    let saved = kaonic_vpn::VpnUplinkConfig {
+        enabled: request.enabled,
+        peer: selected.clone(),
+    };
+    let applied = kaonic_vpn::VpnUplinkConfig {
+        enabled: request.enabled,
+        peer: selected
+            .as_deref()
+            .and_then(|hash| kaonic_gateway::remote::vpn_hash_for_identity(&state.settings, hash)),
+    };
+    if request.enabled && applied.peer.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "that node's keys are not on file; re-pair it on the Remote page".into(),
+        ));
+    }
+
+    {
+        let settings = state.settings.lock().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "settings lock poisoned".into(),
+            )
+        })?;
+        settings.save_vpn_uplink(&saved).map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to save uplink settings: {err}"),
+            )
+        })?;
+    }
+
+    if let Some(vpn) = &state.vpn {
+        vpn.set_uplink(applied);
+    }
+    let uplink = saved;
+
+    Ok(Json(SystemActionResponse {
+        status: if uplink.enabled {
+            "Router selected".into()
+        } else {
+            "Router cleared".into()
+        },
+    }))
+}
+
+/// Refuses writes that arrive over the tunnel.
+///
+/// What this node advertises, who may join, and where it routes are decisions
+/// made at the device. A peer already on the mesh must not be able to reach
+/// back through it and rearrange the network around itself.
+fn deny_mesh(state: &AppState, peer: std::net::SocketAddr) -> Result<(), (StatusCode, String)> {
+    if kaonic_gateway::state::is_mesh_client(state, peer) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "not permitted from the mesh; use the device's own interface".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Gateway mode: what this node forwards for its peers, and out of which
+/// interface. `GET` reports what is running, which is not always what was
+/// asked for — see `active` and `detail`.
+#[derive(serde::Serialize)]
+pub struct VpnGatewayResponse {
+    pub enabled: bool,
+    pub active: bool,
+    pub egress_interface: Option<String>,
+    pub routes: Vec<String>,
+    pub detail: Option<String>,
+    /// Interfaces the operator can pick from, so the UI need not guess.
+    pub available_interfaces: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct PutVpnGatewayRequest {
+    pub enabled: bool,
+    /// `None` (or empty) uses whichever interface carries the default route.
+    #[serde(default)]
+    pub egress_interface: Option<String>,
+    /// Destinations peers may reach through this node, as CIDRs.
+    #[serde(default)]
+    pub routes: Vec<String>,
+}
+
+pub async fn get_vpn_gateway(
+    State(state): State<AppState>,
+) -> Result<Json<VpnGatewayResponse>, (StatusCode, String)> {
+    let snapshot = match &state.vpn {
+        Some(vpn) => vpn.snapshot().await.gateway,
+        None => Default::default(),
+    };
+    Ok(Json(VpnGatewayResponse {
+        enabled: snapshot.enabled,
+        active: snapshot.active,
+        egress_interface: snapshot.egress_interface,
+        routes: snapshot.routes,
+        detail: snapshot.detail,
+        available_interfaces: forwardable_interfaces(),
+    }))
+}
+
+/// Interfaces that could plausibly be an egress: up, not loopback, and not the
+/// tunnel itself (forwarding the tunnel back into the tunnel is never right).
+fn forwardable_interfaces() -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir("/sys/class/net")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name != "lo" && !name.starts_with("kaonic") && !name.starts_with("tun"))
+        .collect();
+    names.sort();
+    names
+}
+
+pub async fn put_vpn_gateway(
+    State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    Json(request): Json<PutVpnGatewayRequest>,
+) -> Result<Json<SystemActionResponse>, (StatusCode, String)> {
+    deny_mesh(&state, peer)?;
+    let routes = request
+        .routes
+        .iter()
+        .map(|route| {
+            route.trim().parse::<cidr::Ipv4Cidr>().map_err(|err| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid route '{route}': {err}"),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Turning it on with nothing to forward is almost always a mistake, and
+    // silently doing nothing would be hard to debug from the UI.
+    if request.enabled && routes.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "list at least one destination to forward (0.0.0.0/0 shares the full uplink)".into(),
+        ));
+    }
+
+    let egress = request
+        .egress_interface
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty());
+    if let Some(name) = egress.as_deref() {
+        if !forwardable_interfaces().iter().any(|iface| iface == name) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("'{name}' is not an interface this node can forward out of"),
+            ));
+        }
+    }
+
+    let gateway = kaonic_vpn::VpnGatewayConfig {
+        enabled: request.enabled,
+        egress_interface: egress,
+        routes,
+    };
+
+    {
+        let settings = state.settings.lock().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "settings lock poisoned".into(),
+            )
+        })?;
+        settings.save_vpn_gateway(&gateway).map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to save gateway settings: {err}"),
+            )
+        })?;
+    }
+
+    if let Some(vpn) = &state.vpn {
+        vpn.set_gateway(gateway.clone());
+    }
+
+    Ok(Json(SystemActionResponse {
+        status: if gateway.enabled {
+            "VPN gateway mode enabled".into()
+        } else {
+            "VPN gateway mode disabled".into()
+        },
+    }))
+}
+
 pub async fn put_vpn_routes(
     State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     Json(request): Json<PutVpnRoutesRequest>,
 ) -> Result<Json<SystemActionResponse>, (StatusCode, String)> {
+    deny_mesh(&state, peer)?;
     let routes = request
         .routes
         .iter()
@@ -324,8 +614,10 @@ pub async fn put_vpn_routes(
 
 pub async fn put_vpn_access(
     State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     Json(request): Json<PutVpnAccessRequest>,
 ) -> Result<Json<VpnAccessResponse>, (StatusCode, String)> {
+    deny_mesh(&state, peer)?;
     let peers = normalize_vpn_peer_hashes(&request.peers)?;
 
     {
@@ -1357,8 +1649,12 @@ pub async fn build_ws_reticulum_snapshot(state: &AppState) -> WsReticulumSnapsho
 }
 
 pub async fn build_vpn_snapshot(state: &AppState) -> VpnSnapshot {
-    match &state.vpn {
+    let mut snapshot = match &state.vpn {
         Some(vpn) => vpn.snapshot().await,
         None => VpnSnapshot::default(),
-    }
+    };
+    kaonic_gateway::state::present_uplink_peer(state, &mut snapshot);
+    kaonic_gateway::state::present_peer_names(state, &mut snapshot);
+    snapshot
 }
+

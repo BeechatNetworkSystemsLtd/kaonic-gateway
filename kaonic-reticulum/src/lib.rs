@@ -11,6 +11,7 @@ use kaonic_net::{
 };
 use rand::rngs::OsRng;
 use reticulum::buffer::{InputBuffer, OutputBuffer};
+use reticulum::hash::AddressHash;
 use reticulum::iface::{Interface, InterfaceContext, RxMessage, TxMessage};
 use reticulum::packet::Packet;
 use reticulum::serde::Serialize;
@@ -19,8 +20,16 @@ use tokio_util::sync::CancellationToken;
 
 pub use kaonic_ctrl::radio::RadioClient;
 
-pub mod fec;
-pub use fec::{FecCode, FecSelector, TrafficClass};
+pub use kaonic_fec::{CoderStats, FecCode, TrafficClass};
+
+/// Channels: the payload-level API every radio user builds on. The gateway's
+/// Reticulum interface, plugins and tools all go through here.
+pub mod channel;
+pub use channel::{profiles, Radio, ReticulumChannel};
+
+/// FEC adaptation keyed by Reticulum destination address. The policy itself
+/// lives in `kaonic-fec` next to the radio, and knows nothing about Reticulum.
+pub type FecSelector = kaonic_fec::FecSelector<AddressHash>;
 
 pub type TxObserver = Arc<dyn Fn(usize, &[u8]) + Send + Sync>;
 pub type ErrorObserver = Arc<dyn Fn(usize, InterfaceErrorKind) + Send + Sync>;
@@ -254,7 +263,7 @@ impl KaonicCtrlInterface {
                     tokio::select! {
                         _ = cancel.cancelled() => break,
                         Some(message) = tx_channel.recv() => {
-                            let code = fec.select(&message.packet);
+                            let code = fec.select(message.packet.destination);
                             transmit_message(
                                 &radio_client,
                                 module,

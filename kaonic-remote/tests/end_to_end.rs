@@ -85,6 +85,17 @@ async fn node(
     cancel: CancellationToken,
     accept_pairing: bool,
 ) -> Node {
+    node_with(name, bind, forward, cancel, accept_pairing, false).await
+}
+
+async fn node_with(
+    name: &str,
+    bind: u16,
+    forward: u16,
+    cancel: CancellationToken,
+    accept_pairing: bool,
+    auto_link: bool,
+) -> Node {
     let id = PrivateIdentity::new_from_rand(OsRng);
     let transport = Transport::new(TransportConfig::new(name, &id));
     transport.iface_manager().lock().await.spawn(
@@ -106,6 +117,7 @@ async fn node(
         spool_dir: PathBuf::from(std::env::temp_dir())
             .join(format!("kaonic-remote-e2e-{name}-{}", std::process::id())),
         accept_pairing,
+        auto_link,
         link_idle_close_secs: 4,
         rpc_timeout: Duration::from_secs(6),
         link_timeout: Duration::from_secs(12),
@@ -118,6 +130,7 @@ async fn node(
             codename: name.into(),
             gateway_version: "0.2.5".into(),
             serial: "serial".into(),
+            services_digest: 0,
         },
         transport.clone(),
         handler.clone(),
@@ -142,6 +155,16 @@ async fn wait_for<F: Fn() -> bool>(what: &str, secs: u64, f: F) {
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+}
+
+/// The `kaonic.remote` destination `node` knows for `identity`.
+fn dest_of(node: &Node, identity: &AddressHash) -> AddressHash {
+    AddressHash::new_from_hex_string(
+        &node_state(&node.runtime, identity)
+            .unwrap()
+            .destination_hash,
+    )
+    .unwrap()
 }
 
 fn node_state(runtime: &RemoteRuntime, identity: &AddressHash) -> Option<kaonic_remote::NodeDto> {
@@ -461,5 +484,118 @@ async fn media_stream_delivers_packets_to_sink() {
         .media
         .iter()
         .all(|m| m.direction != "out"));
+    cancel.cancel();
+}
+
+/// With automatic links on, paired nodes link up without any command, the
+/// link is kept through the idle-close window, and exactly one side (the
+/// lower identity hash) initiates while both report the link as active.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paired_nodes_link_automatically_from_one_side() {
+    let _ = env_logger::Builder::new()
+        .parse_filters("kaonic_remote=debug,reticulum=warn")
+        .is_test(true)
+        .try_init();
+    let cancel = CancellationToken::new();
+    let a = node_with("nodei", 47501, 47502, cancel.clone(), true, true).await;
+    let b = node_with("nodej", 47502, 47501, cancel.clone(), true, true).await;
+
+    wait_for("mutual discovery", 20, || {
+        node_state(&a.runtime, &b.identity)
+            .map(|n| n.online)
+            .unwrap_or(false)
+            && node_state(&b.runtime, &a.identity)
+                .map(|n| n.online)
+                .unwrap_or(false)
+    })
+    .await;
+    // Not paired yet: nobody links on their own.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert!(a
+        .transport
+        .lock()
+        .await
+        .find_out_link(&dest_of(&a, &b.identity))
+        .await
+        .is_none());
+    assert!(b
+        .transport
+        .lock()
+        .await
+        .find_out_link(&dest_of(&b, &a.identity))
+        .await
+        .is_none());
+
+    a.runtime.request_pairing(b.identity).await.unwrap();
+    wait_for("incoming request on B", 10, || {
+        !b.runtime.snapshot().incoming_requests.is_empty()
+    })
+    .await;
+    b.runtime.approve_pairing(a.identity).unwrap();
+    wait_for("both paired", 25, || {
+        node_state(&a.runtime, &b.identity)
+            .map(|n| n.paired)
+            .unwrap_or(false)
+            && node_state(&b.runtime, &a.identity)
+                .map(|n| n.paired)
+                .unwrap_or(false)
+    })
+    .await;
+
+    // The pairing RPCs' link closes when idle; the automatic one replaces
+    // it and both sides show it, whichever side holds the out-link.
+    wait_for("automatic link on both sides", 40, || {
+        node_state(&a.runtime, &b.identity)
+            .map(|n| n.link == LinkState::Active)
+            .unwrap_or(false)
+            && node_state(&b.runtime, &a.identity)
+                .map(|n| n.link == LinkState::Active)
+                .unwrap_or(false)
+    })
+    .await;
+    // Well past the idle-close window (4 s) the link is still there.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(
+        node_state(&a.runtime, &b.identity).unwrap().link,
+        LinkState::Active
+    );
+    assert_eq!(
+        node_state(&b.runtime, &a.identity).unwrap().link,
+        LinkState::Active
+    );
+
+    // Exactly one out-link between the two, held by the lower identity hash.
+    let (low, high) = if a.identity.as_slice() < b.identity.as_slice() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
+    let high_dest = dest_of(low, &high.identity);
+    let low_dest = dest_of(high, &low.identity);
+    assert!(low
+        .transport
+        .lock()
+        .await
+        .find_out_link(&high_dest)
+        .await
+        .is_some());
+    assert!(high
+        .transport
+        .lock()
+        .await
+        .find_out_link(&low_dest)
+        .await
+        .is_none());
+
+    // Commands from either side work over what is there.
+    assert_eq!(
+        low.runtime.info(high.identity).await.unwrap().codename,
+        high.handler.codename
+    );
+    assert_eq!(
+        high.runtime.info(low.identity).await.unwrap().codename,
+        low.handler.codename
+    );
+
     cancel.cancel();
 }

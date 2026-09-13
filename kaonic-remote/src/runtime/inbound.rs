@@ -69,6 +69,54 @@ impl RemoteRuntime {
                 self.media.receive(identity.address_hash, shard).await;
             }
             Frame::Request { id, op, body } => {
+                // Identify is a separate packet and the air does not promise
+                // order: a request can land before the identify that was sent
+                // ahead of it. Refusing it outright would make the controller
+                // re-identify and race the same way again, so on a link that
+                // has not identified yet the request waits a moment for the
+                // identify to catch up — off the queue, so other links are
+                // not held up.
+                let identified = self
+                    .in_sessions
+                    .lock()
+                    .get(&link_id)
+                    .map(|session| session.remote.is_some())
+                    .unwrap_or(false);
+                if !identified {
+                    let runtime = self.clone();
+                    tokio::spawn(async move {
+                        runtime.await_identify(&link_id).await;
+                        runtime.handle_request(link_id, id, op, body).await;
+                    });
+                    return;
+                }
+                self.handle_request(link_id, id, op, body).await;
+            }
+            Frame::Response { .. } => {
+                // Targets never issue requests on inbound links.
+            }
+        }
+    }
+
+    /// Wait (bounded) for the initiator of `link_id` to identify.
+    async fn await_identify(&self, link_id: &LinkId) {
+        let deadline = tokio::time::Instant::now() + IDENTIFY_WAIT;
+        while tokio::time::Instant::now() < deadline {
+            let identified = self
+                .in_sessions
+                .lock()
+                .get(link_id)
+                .map(|session| session.remote.is_some());
+            match identified {
+                Some(true) | None => return,
+                Some(false) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    }
+
+    async fn handle_request(self: &Arc<Self>, link_id: LinkId, id: u16, op: u8, body: Vec<u8>) {
+        {
+            {
                 let cached = self
                     .in_sessions
                     .lock()
@@ -120,9 +168,6 @@ impl RemoteRuntime {
                         self.close_in_link(&link_id).await;
                     }
                 }
-            }
-            Frame::Response { .. } => {
-                // Targets never issue requests on inbound links.
             }
         }
     }
@@ -371,6 +416,7 @@ pub(super) fn decode_command(op: u8, body: &[u8]) -> Result<Command, RemoteError
     Ok(match op {
         op::PING => Command::Ping,
         op::INFO => Command::Info,
+        op::SERVICES => Command::Services,
         op::RADIO_GET => Command::RadioGet {
             module: decode_body::<RadioGetBody>(body)
                 .map_err(RemoteError::bad_request)?
@@ -412,6 +458,7 @@ pub(super) fn encode_reply(reply: Reply) -> (u8, Vec<u8>) {
         Reply::Empty => (status::OK, Vec::new()),
         Reply::Detail(detail) => ok_body(&DetailBody { detail }),
         Reply::Info(info) => ok_body(&info),
+        Reply::Services(services) => ok_body(&services),
         Reply::Radio(config) => ok_body(&config),
         Reply::Plugins(plugins) => ok_body(&plugins),
         Reply::Shell(result) => ok_body(&result),

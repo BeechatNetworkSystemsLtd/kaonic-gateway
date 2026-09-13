@@ -4,9 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-kaonic-ctrl  = { git = "https://github.com/BeechatNetworkSystemsLtd/kaonic-radio" }
+kaonic-ctrl  = { path = "../../kaonic-radio/kaonic-ctrl" }
 kaonic-frame = { git = "https://github.com/BeechatNetworkSystemsLtd/kaonic-radio" }
 kaonic-net   = { git = "https://github.com/BeechatNetworkSystemsLtd/kaonic-radio" }
+# Path dependency until the crate lands in a pinned kaonic-radio revision;
+# the workspace already sources the other radio crates from the sibling tree.
+kaonic-fec   = { path = "../../kaonic-radio/kaonic-fec" }
 reticulum    = { git = "https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs", rev = "151e3b6c77a8c7d33fafa3971a084ae02510ef39" }
 tokio-util   = "0.7"
 radio-common = { git = "https://github.com/BeechatNetworkSystemsLtd/kaonic-radio" }

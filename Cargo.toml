@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["kaonic-gateway", "kaonic-vpn", "kaonic-reticulum", "kaonic-installer", "kaonic-plugin-sample", "kaonic-remote"]
+members = ["kaonic-gateway", "kaonic-vpn", "kaonic-reticulum", "kaonic-installer", "kaonic-plugin-sample", "kaonic-plugin-sdk", "kaonic-remote"]
 
 # Local development override: use the sibling kaonic-radio working tree
 # (batch transmit API) instead of the published git revision.

@@ -112,7 +112,7 @@ const WS_SCRIPT: &str = r#"
     var HISTORY = 90;
     var mods = [newModule(0), newModule(1)];
     function newModule(i) {
-      return { index: i, stats: null, last: null, lastTs: 0, rx: [], tx: [], peakRx: 0, peakTx: 0 };
+      return { index: i, stats: null, last: null, lastTs: 0, rx: [], tx: [], rssi: [], peakRx: 0, peakTx: 0 };
     }
     function fmtRate(bps) {
       if (bps >= 1048576) { return (bps / 1048576).toFixed(2) + ' MB/s'; }
@@ -146,7 +146,10 @@ const WS_SCRIPT: &str = r#"
         }
         if (m.stats) { m.last = { rx_bytes: m.stats.rx_bytes || 0, tx_bytes: m.stats.tx_bytes || 0 }; m.lastTs = now; }
         m.rx.push(rx); m.tx.push(tx);
-        if (m.rx.length > HISTORY) { m.rx.shift(); m.tx.shift(); }
+        // Sampled on the same tick as the rates, so a column in the strip is
+        // the same moment as the column above it.
+        m.rssi.push(m.stats && m.stats.last_rssi != null ? m.stats.last_rssi : null);
+        if (m.rx.length > HISTORY) { m.rx.shift(); m.tx.shift(); m.rssi.shift(); }
         m.peakRx = Math.max(m.peakRx, rx); m.peakTx = Math.max(m.peakTx, tx);
         draw(m, rx, tx);
       });
@@ -190,11 +193,43 @@ const WS_SCRIPT: &str = r#"
         '<line class="tg-mid" x1="0" x2="' + W + '" y1="' + mid + '" y2="' + mid + '"/>' +
         '<text class="tg-scale" x="4" y="12">' + fmtRate(step) + '</text>' +
         '<text class="tg-scale" x="4" y="' + (H - 4) + '">' + fmtRate(step) + '</text>';
+      drawRssi(m);
       set('traffic-rx-rate-' + m.index, fmtRate(rx));
       set('traffic-tx-rate-' + m.index, fmtRate(tx));
       set('traffic-rx-peak-' + m.index, 'peak ' + fmtRate(m.peakRx));
       set('traffic-tx-peak-' + m.index, 'peak ' + fmtRate(m.peakTx));
     }
+    // Signal quality bands. Chosen for what an operator does about them, not
+    // for even spacing: above -70 nothing needs doing, below -95 a link is
+    // about to stop working.
+    function rssiColor(dbm) {
+      if (dbm == null) { return 'rgba(148,163,184,.18)'; }
+      if (dbm >= -70) { return '#34d058'; }
+      if (dbm >= -80) { return '#a3d94a'; }
+      if (dbm >= -88) { return '#f2c744'; }
+      if (dbm >= -95) { return '#f08a3c'; }
+      return '#f04b4b';
+    }
+
+    // One column per sample, aligned with the chart above. No text: the strip
+    // is stretched to the card width, which distorts glyphs but not blocks.
+    function drawRssi(m) {
+      var svg = document.getElementById('rssi-strip-' + m.index);
+      if (!svg) { return; }
+      var W = 600, H = 20;
+      var colW = W / (HISTORY - 1);
+      var start = HISTORY - m.rssi.length;
+      var out = '', last = null;
+      for (var i = 0; i < m.rssi.length; i++) {
+        var v = m.rssi[i];
+        if (v != null) { last = v; }
+        out += '<rect x="' + ((start + i) * colW).toFixed(2) + '" y="0" width="' +
+               (colW + 0.6).toFixed(2) + '" height="' + H + '" fill="' + rssiColor(v) + '"/>';
+      }
+      svg.innerHTML = out;
+      set('traffic-rssi-strip-' + m.index, last == null ? 'no signal' : last + ' dBm');
+    }
+
     setInterval(sample, 1000);
     return { update: update };
   })();
@@ -958,6 +993,11 @@ fn RadioTrafficCard(index: usize, module: RadioModuleConfigDto) -> impl IntoView
                 </div>
             </div>
             <svg class="traffic-chart" id=id("traffic-chart") viewBox="0 0 600 160" preserveAspectRatio="none"></svg>
+            <div class="rssi-strip-row">
+                <span class="rssi-strip-label">"Signal"</span>
+                <svg class="rssi-strip" id=id("rssi-strip") viewBox="0 0 600 20" preserveAspectRatio="none"></svg>
+                <span class="rssi-strip-value" id=id("traffic-rssi-strip")>"no signal"</span>
+            </div>
             <div class="traffic-counters">
                 <div class="traffic-counter">
                     <span class="metric-label">"RX frames"</span>

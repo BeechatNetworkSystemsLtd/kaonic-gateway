@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LocalNodeDto {
     pub identity_hash: String,
+    /// Hex public + verifying key. This is what a pairing code carries: it
+    /// lets another operator add this node before it has ever announced.
+    #[serde(default)]
+    pub identity_hex: String,
     pub destination_hash: String,
     pub codename: String,
     pub gateway_version: String,
@@ -81,6 +85,10 @@ pub struct NodeDto {
     pub accepts_pairing: bool,
     /// Peer decodes per-frame FEC selection (faster codes may be used).
     pub fec_capable: bool,
+    /// Digest of the node's plugin service directory as last announced
+    /// (0 = not advertised). Lets the host fetch the directory only on change.
+    #[serde(default)]
+    pub services_digest: u32,
     /// Operator's own label for this node, kept in the local database.
     #[serde(default)]
     pub tag: String,

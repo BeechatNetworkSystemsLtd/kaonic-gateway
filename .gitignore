@@ -2,3 +2,6 @@ kaonic-dashboard/target
 kaonic-settings/target
 target
 /kaonic-gateway/kaonic-gateway.db
+
+# Local plugin/update packages (scripts/package_plugin.sh)
+deploy/

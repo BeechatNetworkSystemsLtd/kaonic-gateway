@@ -15,7 +15,7 @@ use http::{AppState, SharedSettings};
 use kaonic_gateway::gateway_reticulum::GatewayReticulum;
 use kaonic_gateway::local_https;
 use kaonic_gateway::radio::{
-    attach_radio_interface, connect_radio_client, SharedErrorObserver, SharedRadioClient,
+    attach_radio_channel, attach_radio_interface, connect_radio_client, SharedErrorObserver, SharedRadioClient,
     SharedRxObserver, SharedTxObserver,
 };
 use kaonic_gateway::remote::{load_feature_flags, start_remote, GatewayLinkPolicy};
@@ -199,16 +199,12 @@ async fn async_main() -> Result<(), process::ExitCode> {
     // so they must be chained rather than called as bare statements.
     let transport_cfg = TransportConfig::new("kaonic-gateway", &id)
         .set_retransmit(true)
-        .set_timer_config(TimerConfig {
-            in_link_stale: Duration::from_secs(30),
-            in_link_close: Duration::from_secs(15),
-            out_link_restart: Duration::from_secs(45),
-            out_link_stale: Duration::from_secs(30),
-            out_link_close: Duration::from_secs(15),
-            out_link_repeat: Duration::from_secs(10),
-            out_link_keep: Duration::from_secs(5),
-            ..TimerConfig::default()
-        })
+        // Scaled to the radio's actual rate; unchanged for OFDM, stretched
+        // for modulations whose frames take seconds rather than milliseconds.
+        .set_timer_config(kaonic_gateway::radio::link_timers(
+            // The gateway's Reticulum rides module 0; see attach_radio_channel.
+            &config.radio.module_configs[0].modulation,
+        ))
         // Lossy radio interfaces can miss several keep-alive round-trips under
         // load, so keep links alive longer before marking them stale and
         // restart stale out-links after 45 s instead of forcing a full
@@ -260,9 +256,6 @@ async fn async_main() -> Result<(), process::ExitCode> {
     // Runtime FEC selection: robust/wire-compatible by default, sessions
     // opt into cheaper codes per destination (see GatewayLinkPolicy).
     let fec = Arc::new(FecSelector::default());
-    if let Some(remote) = remote.as_ref() {
-        remote.set_link_policy(Arc::new(GatewayLinkPolicy { fec: fec.clone() }));
-    }
     // Local UDP bridge for PTT/video plugins onto the media transport.
     let media = match remote.as_ref() {
         Some(remote) => match kaonic_gateway::media_bridge::MediaBridge::new(remote.clone()).await {
@@ -284,21 +277,103 @@ async fn async_main() -> Result<(), process::ExitCode> {
         }
     });
 
-    attach_radio_interface(
-        &transport,
-        radio_client.clone(),
-        &config.radio,
-        0,
-        Some(radio_tx_observer.clone()),
-        Some(reticulum_error_observer),
-        Some(remote_rx_observer),
-        fec.clone(),
-    )
-    .await
-    .map_err(|err| {
-        log::error!("radio interface attach error: {err:?}");
-        process::ExitCode::FAILURE
-    })?;
+    // Reticulum reaches the radio through a daemon-side channel: framing,
+    // coding and scheduling happen in kaonic-commd. `KAONIC_RADIO_LEGACY=1`
+    // keeps the in-process pipeline for a daemon that predates channels.
+    //
+    // A daemon that does not know channels never answers the channel
+    // request, so the attach times out. That must not take the gateway
+    // down with it: the gateway is also the node's UI and Wi-Fi manager, and
+    // a gateway update reaches nodes whose commd was not updated with it.
+    // Fall back to the in-process pipeline (channel 0, the legacy wire
+    // format) and say so where the operator will see it.
+    let legacy_radio = std::env::var("KAONIC_RADIO_LEGACY").map(|v| v == "1").unwrap_or(false);
+    let channel_attach = if legacy_radio {
+        None
+    } else {
+        Some(
+            attach_radio_channel(
+                &transport,
+                radio_client.clone(),
+                &config.radio,
+                0,
+                Some(radio_tx_observer.clone()),
+                Some(remote_rx_observer.clone()),
+                fec.clone(),
+            )
+            .await,
+        )
+    };
+    let radio_channel = match channel_attach {
+        Some(Ok(tx)) => Some(tx),
+        other => {
+            if let Some(Err(err)) = other {
+                log::warn!(
+                    "radio channel attach failed ({err:?}); the radio daemon probably predates \
+                     channels — falling back to the in-process radio pipeline (legacy wire \
+                     format, no bundling). Update kaonic-commd, or set KAONIC_RADIO_LEGACY=1 \
+                     to skip this probe."
+                );
+                reticulum
+                    .record_note(
+                        "warning",
+                        format!(
+                            "radio channel unavailable ({err:?}); using the legacy in-process \
+                             radio pipeline — update kaonic-commd for channels"
+                        ),
+                    )
+                    .await;
+            }
+            attach_radio_interface(
+                &transport,
+                radio_client.clone(),
+                &config.radio,
+                0,
+                Some(radio_tx_observer.clone()),
+                Some(reticulum_error_observer),
+                Some(remote_rx_observer),
+                fec.clone(),
+            )
+            .await
+            .map_err(|err| {
+                log::error!("radio interface attach error: {err:?}");
+                process::ExitCode::FAILURE
+            })?;
+            None
+        }
+    };
+    if let Some(remote) = remote.as_ref() {
+        remote.set_link_policy(Arc::new(GatewayLinkPolicy {
+            fec: fec.clone(),
+            channel: radio_channel.clone(),
+        }));
+    }
+    // Its own settings key, so saving the settings page never disturbs it.
+    let vpn_gateway = settings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .load_vpn_gateway()
+        .unwrap_or_default();
+    if vpn_gateway.enabled {
+        log::info!(
+            "vpn gateway mode enabled for {} via {}",
+            vpn_gateway
+                .routes
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+            vpn_gateway.egress_interface.as_deref().unwrap_or("default route")
+        );
+    }
+    let vpn_uplink = settings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .load_vpn_uplink()
+        .unwrap_or_default();
+    if let (true, Some(peer)) = (vpn_uplink.enabled, vpn_uplink.peer.as_deref()) {
+        log::info!("vpn uplink: routing through {peer}");
+    }
     let vpn = if !features.vpn_enabled {
         log::info!("vpn disabled by feature switch");
         None
@@ -310,6 +385,13 @@ async fn async_main() -> Result<(), process::ExitCode> {
             peers: config.peers.clone(),
             advertised_routes: config.advertised_routes.clone(),
             announce_freq_secs: config.announce_freq_secs,
+            gateway: vpn_gateway.clone(),
+            uplink: kaonic_vpn::VpnUplinkConfig {
+                enabled: vpn_uplink.enabled,
+                peer: vpn_uplink.peer.as_deref().and_then(|hash| {
+                    kaonic_gateway::remote::vpn_hash_for_identity(&settings, hash)
+                }),
+            },
         },
         transport.clone(),
         id.clone(),
@@ -317,7 +399,14 @@ async fn async_main() -> Result<(), process::ExitCode> {
     )
     .await
         {
-            Ok(vpn) => Some(vpn),
+            Ok(vpn) => {
+                // VPN membership follows pairing, so a node the operator never
+                // approved cannot take a tunnel address or advertise routes.
+                vpn.set_authority(Arc::new(
+                    kaonic_gateway::remote::PairedPeerAuthority::new(settings.clone()),
+                ));
+                Some(vpn)
+            }
             Err(err) => {
                 log::error!("vpn runtime start failed: {err}");
                 None
@@ -361,18 +450,35 @@ async fn async_main() -> Result<(), process::ExitCode> {
             std::sync::atomic::AtomicBool::new(false),
             std::sync::atomic::AtomicBool::new(false),
         ]);
+        // Receiving every frame off the air costs a 2 KB decode each, and the
+        // only thing that needs them is the dashboard's frame view. So the
+        // stream is off unless somebody is watching, and toggled as viewers
+        // come and go. On a one-core node this is a large share of the CPU
+        // during a transfer.
+        if let Err(e) = radio_client.lock().await.set_frame_stream(false).await {
+            log::warn!("can't turn the frame stream off: {e:?}");
+        }
         {
             use http::ws::publish_radio_frames;
             let dirty = dirty.clone();
             let ws_state = ws_state.clone();
             let rx_bufs = rx_bufs.clone();
             let cancel = cancel.clone();
+            let radio_client = radio_client.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_millis(250));
+                let mut streaming = false;
                 loop {
                     tokio::select! {
                         _ = cancel.cancelled() => break,
                         _ = interval.tick() => {
+                            let watching = ws_state.ws_events.receiver_count() > 0;
+                            if watching != streaming {
+                                match radio_client.lock().await.set_frame_stream(watching).await {
+                                    Ok(()) => streaming = watching,
+                                    Err(e) => log::warn!("can't switch the frame stream: {e:?}"),
+                                }
+                            }
                             for module in 0..2 {
                                 if !dirty[module].swap(false, Ordering::Relaxed) {
                                     continue;

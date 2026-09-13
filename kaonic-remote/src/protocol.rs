@@ -28,7 +28,11 @@ pub const ASPECT: &str = "remote";
 pub const ANNOUNCE_MAGIC: [u8; 2] = *b"KR";
 pub const CODENAME_LEN: usize = 8;
 /// Fixed announce record length.
+/// Minimum announce length; announces from the first protocol revision are
+/// exactly this long.
 pub const ANNOUNCE_LEN: usize = 16;
+/// Full announce length: the base fields plus the services digest.
+pub const ANNOUNCE_LEN_FULL: usize = ANNOUNCE_LEN + 4;
 
 /// Largest link payload that still fits one radio frame after Reticulum
 /// framing (19 B header) and link encryption (16 B IV + PKCS7 + 32 B HMAC)
@@ -90,6 +94,10 @@ pub mod op {
 
     /// Run a shell command; the reply carries the exit code and the first
     /// slice of output. Remaining output is paged with [`SHELL_FETCH`].
+    /// The service directory: which plugin destinations this node serves, so a
+    /// paired peer's plugins know what they may link to.
+    pub const SERVICES: u8 = 0x55;
+
     pub const SHELL_EXEC: u8 = 0x60;
     pub const SHELL_FETCH: u8 = 0x61;
 
@@ -110,6 +118,7 @@ pub mod op {
             BLOB_ABORT => "blob-abort",
             SYSTEM_REBOOT => "system-reboot",
             SERVICE_RESTART => "service-restart",
+            SERVICES => "services",
             SHELL_EXEC => "shell-exec",
             SHELL_FETCH => "shell-fetch",
             _ => "unknown",
@@ -164,7 +173,9 @@ pub mod perm {
     pub fn required(op: u8) -> u32 {
         use super::op;
         match op {
-            op::PING | op::INFO => INFO,
+            // A service directory says no more than an announce already does,
+            // and only a paired node gets this far.
+            op::PING | op::INFO | op::SERVICES => INFO,
             op::RADIO_GET | op::RADIO_SET => RADIO,
             op::PLUGIN_LIST | op::PLUGIN_ACTION => PLUGINS,
             op::BLOB_BEGIN | op::BLOB_STATUS | op::BLOB_END | op::BLOB_ABORT => PLUGINS,
@@ -202,10 +213,36 @@ pub struct AnnounceInfo {
     pub gateway_version: (u8, u8, u8),
     /// Announce period the node runs on, so peers can derive "online".
     pub announce_secs: u8,
+    /// [`services_digest`] of the node's plugin service directory, so a peer
+    /// only asks for the directory when it has changed. 0 = not advertised
+    /// (an announce predating the field).
+    pub services_digest: u32,
 }
 
-pub fn encode_announce(info: &AnnounceInfo) -> [u8; ANNOUNCE_LEN] {
-    let mut out = [0u8; ANNOUNCE_LEN];
+/// Change detector for a service directory (`(name, destination)` pairs in
+/// any order). Never 0, so an absent digest is distinguishable from an empty
+/// directory. FNV-1a: cheap, and this only has to be stable on one node.
+pub fn services_digest<'a>(entries: impl IntoIterator<Item = (&'a str, &'a str)>) -> u32 {
+    let mut sorted: Vec<(&str, &str)> = entries.into_iter().collect();
+    sorted.sort_unstable();
+    let mut hash: u32 = 0x811c_9dc5;
+    let mut feed = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u32::from(*byte);
+            hash = hash.wrapping_mul(0x0100_0193);
+        }
+    };
+    for (name, destination) in sorted {
+        feed(name.as_bytes());
+        feed(&[0]);
+        feed(destination.as_bytes());
+        feed(&[b'\n']);
+    }
+    hash.max(1)
+}
+
+pub fn encode_announce(info: &AnnounceInfo) -> [u8; ANNOUNCE_LEN_FULL] {
+    let mut out = [0u8; ANNOUNCE_LEN_FULL];
     out[0..2].copy_from_slice(&ANNOUNCE_MAGIC);
     out[2] = info.protocol;
     out[3] = info.flags;
@@ -218,6 +255,7 @@ pub fn encode_announce(info: &AnnounceInfo) -> [u8; ANNOUNCE_LEN] {
     out[13] = info.gateway_version.1;
     out[14] = info.gateway_version.2;
     out[15] = info.announce_secs;
+    out[16..20].copy_from_slice(&info.services_digest.to_be_bytes());
     out
 }
 
@@ -236,6 +274,11 @@ pub fn decode_announce(app_data: &[u8]) -> Option<AnnounceInfo> {
         codename,
         gateway_version: (app_data[12], app_data[13], app_data[14]),
         announce_secs: app_data[15],
+        // Older nodes stop at 16 bytes; they advertise no digest.
+        services_digest: app_data
+            .get(16..20)
+            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+            .unwrap_or(0),
     })
 }
 
@@ -456,6 +499,25 @@ pub struct InfoBody {
     pub radio_modules: u8,
 }
 
+/// One plugin destination a node serves. `name` is the protocol name both
+/// ends already share (plugins derive their channel id from the same string).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceEntry {
+    pub name: String,
+    /// Reticulum destination hash, lowercase hex.
+    pub destination: String,
+}
+
+/// Answer to [`op::SERVICES`]. Additive by design: a node that learns a field
+/// it does not know ignores it, and an empty list is a valid answer.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServicesBody {
+    pub services: Vec<ServiceEntry>,
+}
+
+/// Cap on a directory, so a peer cannot make us hold an unbounded list.
+pub const MAX_SERVICES: usize = 32;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DetailBody {
     pub detail: String,
@@ -595,12 +657,33 @@ mod tests {
             codename: "b4o0cvts".into(),
             gateway_version: (0, 2, 5),
             announce_secs: 20,
+            services_digest: 0xdead_beef,
         };
         let bytes = encode_announce(&info);
-        assert_eq!(bytes.len(), ANNOUNCE_LEN);
+        assert_eq!(bytes.len(), ANNOUNCE_LEN_FULL);
         assert!(is_remote_announce(&bytes));
-        assert_eq!(decode_announce(&bytes), Some(info));
+        assert_eq!(decode_announce(&bytes), Some(info.clone()));
         assert!(!is_remote_announce(b"KV"));
+
+        // A first-revision announce (no digest) still decodes.
+        let legacy = &bytes[..ANNOUNCE_LEN];
+        assert!(is_remote_announce(legacy));
+        assert_eq!(
+            decode_announce(legacy),
+            Some(AnnounceInfo {
+                services_digest: 0,
+                ..info
+            })
+        );
+    }
+
+    #[test]
+    fn services_digest_is_order_independent_and_never_zero() {
+        let a = services_digest([("chat", "aa"), ("video", "bb")]);
+        let b = services_digest([("video", "bb"), ("chat", "aa")]);
+        assert_eq!(a, b);
+        assert_ne!(a, services_digest([("chat", "aa")]));
+        assert_ne!(services_digest(std::iter::empty()), 0);
     }
 
     #[test]

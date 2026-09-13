@@ -114,6 +114,63 @@ fn is_mesh_client_ip(vpn_network: Option<cidr::Ipv4Cidr>, ip: std::net::Ipv4Addr
     vpn_network.is_some_and(|network| network.contains(&ip))
 }
 
+/// Rewrites the chosen router to the identifier the operator uses.
+///
+/// Inside the tunnel a peer is its VPN destination hash; on the Remote page and
+/// in every list a person reads, it is its identity hash. Those are different
+/// values, so a snapshot handed to the UI has to be translated — otherwise the
+/// UI compares an identity hash against a tunnel hash, finds no match, and the
+/// selection silently never appears to take.
+/// Joins operator-facing names onto the tunnel's peer list.
+///
+/// The VPN layer knows destinations; people know codenames and their own
+/// labels. Doing the join here means every surface — page, websocket, API —
+/// shows the same names without each one repeating the lookup.
+pub fn present_peer_names(state: &AppState, snapshot: &mut kaonic_vpn::VpnSnapshot) {
+    let paired = state
+        .settings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .load_remote_paired()
+        .unwrap_or_default();
+    let tags = state
+        .settings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .load_remote_tags()
+        .unwrap_or_default();
+    for peer in snapshot.peers.iter_mut() {
+        let Some(node) = paired.iter().find(|node| {
+            crate::remote::vpn_destination_hash(node)
+                .map(|hash| hash.to_hex_string() == peer.destination)
+                .unwrap_or(false)
+        }) else {
+            continue;
+        };
+        peer.identity_hash = node.identity_hash.clone();
+        peer.codename = node.codename.clone();
+        peer.tag = tags
+            .iter()
+            .find(|(hash, _)| *hash == node.identity_hash)
+            .map(|(_, tag)| tag.clone())
+            .unwrap_or_default();
+    }
+}
+
+pub fn present_uplink_peer(state: &AppState, snapshot: &mut kaonic_vpn::VpnSnapshot) {
+    if snapshot.uplink.peer.is_none() {
+        return;
+    }
+    let stored = state
+        .settings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .load_vpn_uplink()
+        .ok()
+        .and_then(|saved| saved.peer);
+    snapshot.uplink.peer = stored;
+}
+
 /// Shared application state — injected as leptos context for server functions.
 #[derive(Clone)]
 pub struct AppState {

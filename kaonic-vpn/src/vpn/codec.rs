@@ -70,6 +70,15 @@ impl Subnet {
 pub struct Announce {
     #[serde(default)]
     pub routes: Vec<Subnet>,
+    /// The sender forwards traffic for its advertised networks and masquerades
+    /// it on the way out, so a peer can reach them without the far LAN knowing
+    /// anything about the tunnel.
+    ///
+    /// Named-field msgpack with `serde(default)`, so a node that predates this
+    /// field simply reads `false` — which is the safe reading: assume nothing
+    /// routes unless it says so.
+    #[serde(default, rename = "g")]
+    pub gateway: bool,
 }
 
 /// Control frames carried inside a link. Uses short integer tags for compactness.
@@ -78,10 +87,18 @@ pub struct Announce {
 pub enum Ctrl {
     /// Sent once by each side when a link activates; carries the sender's exported routes.
     #[serde(rename = "h")]
-    Hello { routes: Vec<Subnet> },
+    Hello {
+        routes: Vec<Subnet>,
+        #[serde(default, rename = "g")]
+        gateway: bool,
+    },
     /// Periodic/incremental route refresh.
     #[serde(rename = "r")]
-    Routes { routes: Vec<Subnet> },
+    Routes {
+        routes: Vec<Subnet>,
+        #[serde(default, rename = "g")]
+        gateway: bool,
+    },
     /// Heartbeat; receiver updates link liveness.
     #[serde(rename = "p")]
     Ping,
@@ -89,9 +106,10 @@ pub enum Ctrl {
 
 // ── Announce ─────────────────────────────────────────────────────────────────
 
-pub fn encode_announce(routes: &[Ipv4Cidr]) -> Result<Vec<u8>, CodecError> {
+pub fn encode_announce(routes: &[Ipv4Cidr], gateway: bool) -> Result<Vec<u8>, CodecError> {
     let body = Announce {
         routes: routes.iter().copied().map(Subnet::from_cidr).collect(),
+        gateway,
     };
     let mut out = Vec::with_capacity(8 + routes.len() * 6);
     out.extend_from_slice(ANNOUNCE_MAGIC);
@@ -101,7 +119,8 @@ pub fn encode_announce(routes: &[Ipv4Cidr]) -> Result<Vec<u8>, CodecError> {
     Ok(out)
 }
 
-pub fn decode_announce(data: &[u8]) -> Result<Vec<Ipv4Cidr>, CodecError> {
+/// Routes the sender advertises, and whether it will actually forward them.
+pub fn decode_announce(data: &[u8]) -> Result<(Vec<Ipv4Cidr>, bool), CodecError> {
     if data.len() < 5 {
         return Err(CodecError::Short);
     }
@@ -114,7 +133,12 @@ pub fn decode_announce(data: &[u8]) -> Result<Vec<Ipv4Cidr>, CodecError> {
     }
     let body: Announce =
         rmp_serde::from_slice(&data[5..]).map_err(|e| CodecError::Decode(e.to_string()))?;
-    body.routes.iter().map(Subnet::to_cidr).collect()
+    let routes = body
+        .routes
+        .iter()
+        .map(Subnet::to_cidr)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((routes, body.gateway))
 }
 
 pub fn is_announce(data: &[u8]) -> bool {
@@ -130,15 +154,17 @@ pub fn encode_ctrl(msg: &Ctrl) -> Result<Vec<u8>, CodecError> {
     Ok(out)
 }
 
-pub fn encode_hello(routes: &[Ipv4Cidr]) -> Result<Vec<u8>, CodecError> {
+pub fn encode_hello(routes: &[Ipv4Cidr], gateway: bool) -> Result<Vec<u8>, CodecError> {
     encode_ctrl(&Ctrl::Hello {
         routes: routes.iter().copied().map(Subnet::from_cidr).collect(),
+        gateway,
     })
 }
 
-pub fn encode_routes(routes: &[Ipv4Cidr]) -> Result<Vec<u8>, CodecError> {
+pub fn encode_routes(routes: &[Ipv4Cidr], gateway: bool) -> Result<Vec<u8>, CodecError> {
     encode_ctrl(&Ctrl::Routes {
         routes: routes.iter().copied().map(Subnet::from_cidr).collect(),
+        gateway,
     })
 }
 
@@ -169,30 +195,58 @@ mod tests {
             "192.168.10.0/24".parse().unwrap(),
             "10.0.0.0/8".parse().unwrap(),
         ];
-        let bytes = encode_announce(&routes).unwrap();
+        let bytes = encode_announce(&routes, true).unwrap();
         assert!(is_announce(&bytes));
-        let got = decode_announce(&bytes).unwrap();
+        let (got, gateway) = decode_announce(&bytes).unwrap();
         assert_eq!(got, routes);
+        assert!(gateway, "the flag must survive the round trip");
     }
 
     #[test]
     fn empty_announce_round_trips() {
-        let bytes = encode_announce(&[]).unwrap();
-        assert!(decode_announce(&bytes).unwrap().is_empty());
+        let bytes = encode_announce(&[], false).unwrap();
+        let (routes, gateway) = decode_announce(&bytes).unwrap();
+        assert!(routes.is_empty());
+        assert!(!gateway);
     }
 
     #[test]
     fn ctrl_hello_round_trips() {
         let routes: Vec<Ipv4Cidr> = vec!["192.168.77.0/24".parse().unwrap()];
-        let bytes = encode_hello(&routes).unwrap();
+        let bytes = encode_hello(&routes, true).unwrap();
         assert!(is_ctrl(&bytes));
         match decode_ctrl(&bytes).unwrap() {
-            Ctrl::Hello { routes: got } => {
+            Ctrl::Hello { routes: got, gateway } => {
+                assert!(gateway);
                 let got: Vec<Ipv4Cidr> = got.iter().map(|s| s.to_cidr().unwrap()).collect();
                 assert_eq!(got, routes);
             }
             _ => panic!("expected Hello"),
         }
+    }
+
+    /// A node built before the flag existed sends an announce without it. It
+    /// must still decode, and must read as "does not route" rather than as an
+    /// error or an optimistic default.
+    #[test]
+    fn announce_without_the_flag_reads_as_not_routing() {
+        #[derive(serde::Serialize)]
+        struct OldAnnounce {
+            routes: Vec<Subnet>,
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(ANNOUNCE_MAGIC);
+        out.push(ANNOUNCE_VERSION);
+        rmp_serde::encode::write_named(
+            &mut out,
+            &OldAnnounce {
+                routes: vec![Subnet::from_cidr("192.168.9.0/24".parse().unwrap())],
+            },
+        )
+        .unwrap();
+        let (routes, gateway) = decode_announce(&out).unwrap();
+        assert_eq!(routes.len(), 1);
+        assert!(!gateway);
     }
 
     #[test]

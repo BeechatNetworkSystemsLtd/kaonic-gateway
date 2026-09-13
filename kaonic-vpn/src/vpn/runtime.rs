@@ -26,7 +26,7 @@ use reticulum::transport::Transport;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::VpnConfig;
+use crate::config::{VpnConfig, VpnGatewayConfig, VpnUplinkConfig};
 
 use super::codec::{
     decode_announce, decode_ctrl, encode_announce, encode_hello, is_announce, is_ctrl, Ctrl,
@@ -37,11 +37,38 @@ use super::peer::{LinkState, Peer, PeerRegistry};
 use super::platform::{self, LocalRouteTranslation};
 use super::router::{RouteTable, Router};
 use super::tun::{self, SharedTun, TUN_MTU};
-use super::types::{VpnPeerSnapshot, VpnRouteMappingSnapshot, VpnRouteSnapshot, VpnSnapshot};
+use super::types::{
+    VpnGatewaySnapshot, VpnPeerSnapshot, VpnUplinkSnapshot, VpnRouteMappingSnapshot, VpnRouteSnapshot, VpnSnapshot,
+};
+
+/// Decides which nodes may join this node's VPN.
+///
+/// The VPN crate deliberately does not know what "paired" means — the gateway
+/// supplies an implementation backed by the remote feature's trust store, so
+/// VPN membership inherits the operator's existing pairing decision instead of
+/// being a second, weaker allowlist that can drift from it.
+pub trait PeerAuthority: Send + Sync {
+    /// True when this node has an operator-approved relationship with `hash`.
+    fn is_trusted(&self, hash: &AddressHash) -> bool;
+}
+
+/// Trusts nobody. The safe default when no host authority is installed: a node
+/// with no authority and no explicit allowlist accepts no peers at all.
+pub struct DenyAll;
+
+impl PeerAuthority for DenyAll {
+    fn is_trusted(&self, _: &AddressHash) -> bool {
+        false
+    }
+}
 
 /// Peer routes are dropped this long after the last announce. Keeps a small
 /// grace window so a single missed announce does not flap the kernel route.
 const ROUTE_GRACE_SECS: u64 = 45;
+
+/// Most subnets one peer may advertise. A real site has a handful; a long list
+/// is either a misconfiguration or an attempt to fill this node's route table.
+const MAX_PEER_ROUTES: usize = 16;
 /// Watchdog cadence.
 const WATCHDOG_SECS: u64 = 10;
 /// Give a link this long to finish its handshake before we tear it down and
@@ -110,6 +137,8 @@ pub struct VpnRuntime {
     status: AtomicU8,
 
     metrics: Metrics,
+    /// Recent packet summaries for the live view on the VPN page.
+    recent: super::metrics::RecentPackets,
     peers: PeerRegistry,
     router: Router,
     out_links: LinkRegistry,
@@ -125,6 +154,18 @@ struct SlowState {
     local_routes: Vec<Ipv4Cidr>,
     installed_routes: BTreeSet<String>,
     conflicted_routes: BTreeSet<String>,
+    /// What the operator asked for; what is actually installed is derived from
+    /// it each time [`VpnRuntime::sync_routes`] runs.
+    gateway: VpnGatewayConfig,
+    /// Egress interface in use, and why it is not forwarding if it is not.
+    gateway_egress: Option<String>,
+    gateway_detail: Option<String>,
+    /// Host-supplied trust check; see [`PeerAuthority`].
+    authority: Arc<dyn PeerAuthority>,
+    /// The node this one routes through, if any.
+    uplink: VpnUplinkConfig,
+    uplink_routes: Vec<Ipv4Cidr>,
+    uplink_detail: Option<String>,
     last_error: Option<String>,
 }
 
@@ -178,6 +219,7 @@ impl VpnRuntime {
             route_aliasing_enabled,
             status: AtomicU8::new(status),
             metrics: Metrics::default(),
+            recent: Default::default(),
             peers: PeerRegistry::new(),
             router: Router::new(),
             out_links: LinkRegistry::new(),
@@ -188,6 +230,13 @@ impl VpnRuntime {
                 local_routes,
                 installed_routes: BTreeSet::new(),
                 conflicted_routes: BTreeSet::new(),
+                gateway: config.gateway.clone(),
+                gateway_egress: None,
+                gateway_detail: None,
+                authority: Arc::new(DenyAll),
+                uplink: config.uplink.clone(),
+                uplink_routes: Vec::new(),
+                uplink_detail: None,
                 last_error: None,
             }),
         });
@@ -330,6 +379,11 @@ impl VpnRuntime {
             };
             let m = peer.metrics.snapshot();
             peers_snap.push(VpnPeerSnapshot {
+                is_gateway: peer.is_gateway(),
+                // Filled in by the gateway, which is where names live.
+                identity_hash: String::new(),
+                codename: String::new(),
+                tag: String::new(),
                 destination: peer.hash.to_hex_string(),
                 tunnel_ip: Some(peer.tunnel_ip.to_string()),
                 link_state: state.as_str().into(),
@@ -373,6 +427,7 @@ impl VpnRuntime {
             &slow.local_routes,
             &self.destination,
             self.route_aliasing_enabled,
+            &self.literal_routes(&slow),
         );
         let mut local_routes: Vec<String> = translations
             .iter()
@@ -433,6 +488,31 @@ impl VpnRuntime {
             peers: peers_snap,
             remote_routes,
             route_mappings,
+            gateway: VpnGatewaySnapshot {
+                enabled: slow.gateway.enabled,
+                // Enabled is what was asked for; active is whether anything is
+                // actually being forwarded right now.
+                active: slow.gateway.enabled
+                    && slow.gateway_detail.is_none()
+                    && self.interface_name.is_some(),
+                egress_interface: slow.gateway_egress.clone(),
+                routes: slow.gateway.routes.iter().map(ToString::to_string).collect(),
+                detail: slow.gateway_detail.clone(),
+            },
+            recent: self.recent.snapshot(),
+            uplink: VpnUplinkSnapshot {
+                enabled: slow.uplink.enabled,
+                active: slow.uplink.enabled
+                    && slow.uplink_detail.is_none()
+                    && !slow.uplink_routes.is_empty(),
+                peer: slow.uplink.peer.clone(),
+                // The VPN layer does not know codenames; the gateway joins
+                // that in from the remote node map when it renders the page.
+                peer_codename: None,
+                routes: slow.uplink_routes.iter().map(ToString::to_string).collect(),
+                default_route: slow.uplink_routes.iter().any(|r| r.network_length() == 0),
+                detail: slow.uplink_detail.clone(),
+            },
             last_error: slow.last_error.clone(),
         }
     }
@@ -456,24 +536,49 @@ impl VpnRuntime {
     /// watchdog after peer routes change.
     fn sync_routes(&self) {
         let table = self.router.snapshot();
-        let (interface, local_routes, aliasing) = {
+        let (interface, local_routes, aliasing, literal) = {
             let slow = self.slow.read();
             (
                 self.interface_name.clone(),
                 slow.local_routes.clone(),
                 self.route_aliasing_enabled,
+                self.literal_routes(&slow),
             )
         };
-        let translations = local_route_translations(&local_routes, &self.destination, aliasing);
+        let translations =
+            local_route_translations(&local_routes, &self.destination, aliasing, &literal);
         let local_conflicts =
             conflicting_local_routes(&translations, table.subnets().iter().map(|(c, _)| *c));
 
-        let desired: BTreeSet<String> = table
-            .subnets()
-            .iter()
-            .filter(|(route, _)| !local_conflicts.contains(&route.to_string()))
-            .map(|(route, _)| route.to_string())
-            .collect();
+        // A default route from a peer would replace this node's own and cut it
+        // off entirely, so it is only honoured from the router the operator
+        // chose — and even then as two halves, never as `default` itself.
+        let router = self.selected_router();
+        let mut uplink_routes: Vec<Ipv4Cidr> = Vec::new();
+        let mut desired: BTreeSet<String> = BTreeSet::new();
+        let mut takes_default = false;
+        for (route, owner) in table.subnets() {
+            if local_conflicts.contains(&route.to_string()) {
+                continue;
+            }
+            let from_router = router.is_some_and(|hash| hash == *owner);
+            if route.network_length() == 0 {
+                if !from_router {
+                    log::debug!("ignoring default route offered by a node that is not the router");
+                    continue;
+                }
+                takes_default = true;
+                for half in platform::split_default_halves() {
+                    desired.insert(half.to_string());
+                }
+                uplink_routes.push(*route);
+                continue;
+            }
+            desired.insert(route.to_string());
+            if from_router {
+                uplink_routes.push(*route);
+            }
+        }
 
         let (installed_before, iface) = {
             let slow = self.slow.read();
@@ -496,6 +601,9 @@ impl VpnRuntime {
             }
         }
 
+        self.sync_gateway();
+        self.sync_uplink(uplink_routes, takes_default);
+
         let mut slow = self.slow.write();
         slow.installed_routes = desired;
         slow.conflicted_routes = local_conflicts;
@@ -503,6 +611,199 @@ impl VpnRuntime {
         if self.status.load(Ordering::Relaxed) != STATUS_MOCK {
             self.status.store(STATUS_RUNNING, Ordering::Relaxed);
         }
+    }
+
+    /// Installs the forwarding and masquerade rules for gateway mode.
+    ///
+    /// Called from [`Self::sync_routes`], so it re-runs whenever routes change
+    /// and re-asserts the rules if something else flushed the tables. When the
+    /// feature is off this still runs, and clears the chains.
+    fn sync_gateway(&self) {
+        let Some(interface) = self.interface_name.as_deref() else {
+            // No tun: nothing can be forwarded, and there are no chains to
+            // clear. A mock backend reports the request, not a failure.
+            let mut slow = self.slow.write();
+            slow.gateway_egress = None;
+            slow.gateway_detail = slow
+                .gateway
+                .enabled
+                .then(|| "no tunnel interface on this platform".to_string());
+            return;
+        };
+
+        let config = self.slow.read().gateway.clone();
+
+        // One egress per destination, asked of the kernel unless the operator
+        // pinned one. A route with no usable egress is dropped and reported
+        // rather than installed against the wrong interface.
+        let mut resolved: Vec<(Ipv4Cidr, String)> = Vec::new();
+        let mut unresolved: Vec<String> = Vec::new();
+        for route in &config.routes {
+            match config
+                .egress_interface
+                .clone()
+                .or_else(|| platform::egress_for(route, interface))
+            {
+                Some(egress) => resolved.push((*route, egress)),
+                None => unresolved.push(route.to_string()),
+            }
+        }
+
+        let detail = if !config.enabled {
+            None
+        } else if config.routes.is_empty() {
+            Some("no destinations listed, so nothing is forwarded".to_string())
+        } else if resolved.is_empty() {
+            Some(format!(
+                "no route to {} from this node",
+                unresolved.join(", ")
+            ))
+        } else if !unresolved.is_empty() {
+            Some(format!("no route to {}", unresolved.join(", ")))
+        } else {
+            None
+        };
+
+        let rules = platform::GatewayRules {
+            enabled: config.enabled,
+            tunnel_network: Some(self.network),
+            routes: resolved.clone(),
+        };
+        if let Err(err) = platform::sync_gateway(interface, &rules) {
+            self.set_error(format!("gateway rules: {err}"));
+            return;
+        }
+        if config.enabled && !resolved.is_empty() {
+            log::debug!(
+                "vpn gateway: forwarding {} for {}",
+                resolved
+                    .iter()
+                    .map(|(route, egress)| format!("{route} via {egress}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                self.network
+            );
+        }
+        let egress = resolved.first().map(|(_, egress)| egress.clone());
+        let mut slow = self.slow.write();
+        slow.gateway_egress = egress;
+        slow.gateway_detail = detail;
+    }
+
+    /// Routes exported under their real addresses rather than an alias.
+    ///
+    /// Aliasing exists so two sites that both use `192.168.1.0/24` do not
+    /// collide. But a route the operator explicitly shares in gateway mode is
+    /// one they want reached at the address it really has — a TAK server is
+    /// configured in its clients by IP, and an alias would defeat that. Naming
+    /// it in `gateway.routes` is the operator taking on the collision risk in
+    /// exchange for literal addressing.
+    fn literal_routes(&self, slow: &SlowState) -> Vec<Ipv4Cidr> {
+        if !slow.gateway.enabled {
+            return Vec::new();
+        }
+        slow.gateway.routes.clone()
+    }
+
+    /// Destination hash of the node this one routes through, when one is set.
+    fn selected_router(&self) -> Option<AddressHash> {
+        let slow = self.slow.read();
+        if !slow.uplink.enabled {
+            return None;
+        }
+        slow.uplink
+            .peer
+            .as_deref()
+            .and_then(|hex| AddressHash::new_from_hex_string(hex).ok())
+    }
+
+    /// Installs the rules that let this node's own LAN clients use the router.
+    ///
+    /// `routes` is what the chosen router actually offers right now, so
+    /// unplugging the router — or it withdrawing a subnet — takes the client
+    /// path down with it rather than leaving rules pointing nowhere.
+    fn sync_uplink(&self, routes: Vec<Ipv4Cidr>, takes_default: bool) {
+        let Some(interface) = self.interface_name.as_deref() else {
+            return;
+        };
+        let (enabled, peer) = {
+            let slow = self.slow.read();
+            (slow.uplink.enabled, slow.uplink.peer.clone())
+        };
+        // Whether the chosen node actually forwards. A node that advertises a
+        // network but will not forward it produces the worst possible failure:
+        // packets leave, nothing comes back, and nothing reports an error. It
+        // is better to install no rules and say why.
+        let router_forwards = self
+            .selected_router()
+            .and_then(|hash| self.peers.get(&hash))
+            .map(|peer| peer.is_gateway());
+
+        let detail = if !enabled {
+            None
+        } else if peer.is_none() {
+            Some("no router selected".to_string())
+        } else if router_forwards == Some(false) {
+            Some(
+                "that node is not sharing a network — turn on \"Share with peers\" there"
+                    .to_string(),
+            )
+        } else if router_forwards.is_none() {
+            Some("waiting for that node to come online".to_string())
+        } else if routes.is_empty() {
+            Some("the selected router is not offering any networks".to_string())
+        } else {
+            None
+        };
+
+        // Nothing is installed while the detail explains why not, so a
+        // half-working path never looks like a working one.
+        let routes = if detail.is_some() { Vec::new() } else { routes };
+        let rules = platform::UplinkRules {
+            enabled,
+            routes: routes.clone(),
+            tunnel_network: Some(self.network),
+        };
+        if let Err(err) = platform::sync_uplink(interface, &rules) {
+            self.set_error(format!("uplink rules: {err}"));
+            return;
+        }
+        if enabled && detail.is_none() {
+            log::debug!(
+                "vpn uplink: clients reach {} through the selected router{}",
+                routes.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+                if takes_default { " (whole uplink)" } else { "" }
+            );
+        }
+        let mut slow = self.slow.write();
+        slow.uplink_routes = routes;
+        slow.uplink_detail = detail;
+    }
+
+    pub fn uplink_config(&self) -> VpnUplinkConfig {
+        self.slow.read().uplink.clone()
+    }
+
+    /// Chooses (or clears) the router this node uses. Applies immediately.
+    pub fn set_uplink(&self, uplink: VpnUplinkConfig) {
+        self.slow.write().uplink = uplink;
+        // Through sync_routes, because selecting a router changes which routes
+        // may be installed, not just the firewall rules.
+        self.sync_routes();
+    }
+
+    /// Current gateway settings, for the API.
+    pub fn gateway_config(&self) -> VpnGatewayConfig {
+        self.slow.read().gateway.clone()
+    }
+
+    /// Replaces the gateway settings and applies them immediately.
+    ///
+    /// Turning it off tears the rules down in the same call, so revoking
+    /// access does not wait for the next route change.
+    pub fn set_gateway(&self, gateway: VpnGatewayConfig) {
+        self.slow.write().gateway = gateway;
+        self.sync_gateway();
     }
 
     fn set_error(&self, msg: String) {
@@ -514,10 +815,12 @@ impl VpnRuntime {
 
     fn exported_routes(&self) -> Vec<Ipv4Cidr> {
         let slow = self.slow.read();
+        let literal = self.literal_routes(&slow);
         local_route_translations(
             &slow.local_routes,
             &self.destination,
             self.route_aliasing_enabled,
+            &literal,
         )
         .into_iter()
         .map(|t| t.exported)
@@ -534,27 +837,92 @@ impl VpnRuntime {
         self.slow.read().allow_all_peers
     }
 
+    /// Whether `hash` may hold a tunnel IP and have its routes believed.
+    ///
+    /// Three ways in, in order of preference: the host says it is paired, the
+    /// operator listed it explicitly, or the node has been put in
+    /// `allow_all_peers` mode. The last is a deliberate opt-out of
+    /// authentication and is off unless someone turns it on.
     fn peer_allowed(&self, hash: &AddressHash) -> bool {
         if *hash == self.destination {
             return false;
         }
+        let (allow_all, listed) = {
+            let slow = self.slow.read();
+            (slow.allow_all_peers, slow.allowed_peers.contains(hash))
+        };
+        if listed {
+            return true;
+        }
+        if self.slow.read().authority.is_trusted(hash) {
+            return true;
+        }
+        allow_all
+    }
+
+    /// Installs the host's trust check. Called once at startup.
+    pub fn set_authority(&self, authority: Arc<dyn PeerAuthority>) {
+        self.slow.write().authority = authority;
+    }
+
+    /// Rejects announced routes that would let a peer capture traffic it has
+    /// no business seeing, however well-behaved the rest of the system is.
+    ///
+    /// A peer that advertised the tunnel network would sit in front of every
+    /// other peer's traffic; one that advertised loopback or link-local would
+    /// capture this node's own. These are refused whatever the allowlist says,
+    /// because no legitimate configuration needs them.
+    fn sanitize_routes(&self, hash: &AddressHash, routes: Vec<Ipv4Cidr>) -> Vec<Ipv4Cidr> {
+        let mut kept = Vec::new();
+        for route in routes {
+            let first = route.first_address();
+            let reason = if route.network_length() != 0 && self.network.contains(&first) {
+                Some("covers the tunnel network")
+            } else if first.is_loopback() {
+                Some("loopback")
+            } else if first.is_link_local() {
+                Some("link-local")
+            } else if first.is_multicast() || first.is_broadcast() {
+                Some("multicast or broadcast")
+            } else {
+                None
+            };
+            match reason {
+                Some(reason) => {
+                    log::warn!("vpn peer={hash} advertised {route}, refused: {reason}")
+                }
+                None => kept.push(route),
+            }
+            if kept.len() >= MAX_PEER_ROUTES {
+                log::warn!("vpn peer={hash} advertised more than {MAX_PEER_ROUTES} routes; rest ignored");
+                break;
+            }
+        }
+        kept
+    }
+
+    /// True when this node is currently forwarding for its advertised
+    /// networks, which is what a peer needs to know before routing through it.
+    pub fn gateway_active(&self) -> bool {
         let slow = self.slow.read();
-        slow.allow_all_peers || slow.allowed_peers.contains(hash)
+        slow.gateway.enabled && slow.gateway_detail.is_none() && !slow.gateway.routes.is_empty()
     }
 
     fn handle_peer_announce(
         &self,
         desc: reticulum::destination::DestinationDesc,
         routes: Vec<Ipv4Cidr>,
+        gateway: bool,
     ) -> bool {
         let hash = desc.address_hash;
         if hash == self.destination {
             return false;
         }
         if !self.peer_allowed(&hash) {
-            log::debug!("vpn peer={} announce ignored by allowlist", hash);
+            log::debug!("vpn peer={} announce ignored: not a trusted peer", hash);
             return false;
         }
+        let routes = self.sanitize_routes(&hash, routes);
         let tunnel_ip = match derive_tunnel_ip(self.network, &hash) {
             Ok(ip) => ip,
             Err(_) => return false,
@@ -568,6 +936,7 @@ impl VpnRuntime {
         peer.route_expires_ts
             .store(now + ROUTE_GRACE_SECS, Ordering::Relaxed);
         peer.set_routes(routes);
+        peer.set_gateway(gateway);
         peer.clear_error();
         self.rebuild_router();
         self.sync_routes();
@@ -611,7 +980,7 @@ fn spawn_announce_tx(
                 _ = interval.tick() => {
                     runtime.refresh_local_routes();
                     let routes = runtime.exported_routes();
-                    match encode_announce(&routes) {
+                    match encode_announce(&routes, runtime.gateway_active()) {
                         Ok(app_data) => {
                             transport.lock().await.send_announce(&destination, Some(&app_data)).await;
                         }
@@ -642,7 +1011,8 @@ fn spawn_announce_rx(
                         }
                         match decode_announce(app_data) {
                             Ok(routes) => {
-                                if !runtime.handle_peer_announce(desc.clone(), routes) {
+                                let (routes, gateway) = routes;
+                            if !runtime.handle_peer_announce(desc.clone(), routes, gateway) {
                                     continue;
                                 }
                                 // Announces are the primary trigger for opening
@@ -682,6 +1052,17 @@ fn spawn_out_link_events(
                 recv = rx.recv() => match recv {
                     Ok(event) => {
                         let peer_hash = event.address_hash;
+                        // The transport fans out every out-link's events,
+                        // including the remote-control links other features
+                        // open to the same nodes. Only links this runtime
+                        // requested (or to peers it knows) are VPN links;
+                        // reacting to the rest would send a hello over a
+                        // foreign link and shadow its state as a VPN peer.
+                        if runtime.out_links.get(&peer_hash).is_none()
+                            && runtime.peers.get(&peer_hash).is_none()
+                        {
+                            continue;
+                        }
                         match event.event {
                             LinkEvent::Activated => {
                                 runtime.set_link_state(peer_hash, LinkState::Active);
@@ -695,7 +1076,8 @@ fn spawn_out_link_events(
                                     runtime.out_links.insert(peer_hash, link);
                                 }
                                 let routes = runtime.exported_routes();
-                                if let Ok(hello) = encode_hello(&routes) {
+                                let gateway_active = runtime.gateway_active();
+                                if let Ok(hello) = encode_hello(&routes, gateway_active) {
                                     let _ = transport.lock().await.send_to_out_links(&peer_hash, &hello).await;
                                 }
                                 log::info!("vpn peer={} out-link activated", peer_hash);
@@ -809,6 +1191,7 @@ fn spawn_tun_rx(
                             tokio::time::sleep(Duration::from_millis(TUN_TX_BACKOFF_MILLIS)).await;
                         } else {
                             runtime.metrics.record_tx(packet.len());
+                            runtime.recent.record("tx", packet);
                             if let Some(peer) = runtime.peers.get(&peer_hash) {
                                 peer.mark_tx();
                                 peer.metrics.record_tx(packet.len());
@@ -924,13 +1307,14 @@ async fn handle_link_data(
             return;
         };
         match decode_ctrl(data) {
-            Ok(Ctrl::Hello { routes }) | Ok(Ctrl::Routes { routes }) => {
+            Ok(Ctrl::Hello { routes, gateway }) | Ok(Ctrl::Routes { routes, gateway }) => {
                 let cidrs: Vec<Ipv4Cidr> = routes.iter().filter_map(|s| s.to_cidr().ok()).collect();
                 if let Some(peer) = runtime.peers.get(&hash) {
                     peer.mark_seen();
                     peer.route_expires_ts
                         .store(now_secs() + ROUTE_GRACE_SECS, Ordering::Relaxed);
                     peer.set_routes(cidrs);
+                    peer.set_gateway(gateway);
                 }
                 runtime.rebuild_router();
                 runtime.sync_routes();
@@ -971,6 +1355,7 @@ async fn handle_link_data(
     match tun.send(data).await {
         Ok(_) => {
             runtime.metrics.record_rx(data.len());
+            runtime.recent.record("rx", data);
             if let Some(peer) = credited {
                 peer.metrics.record_rx(data.len());
                 peer.mark_seen();
@@ -1127,12 +1512,13 @@ fn local_route_translations(
     routes: &[Ipv4Cidr],
     destination: &AddressHash,
     aliasing: bool,
+    literal: &[Ipv4Cidr],
 ) -> Vec<LocalRouteTranslation> {
     routes
         .iter()
         .map(|r| LocalRouteTranslation {
             local: *r,
-            exported: if aliasing {
+            exported: if aliasing && !literal.contains(r) {
                 export_local_route(destination, *r)
             } else {
                 *r

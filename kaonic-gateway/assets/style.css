@@ -3210,6 +3210,7 @@ select.field-input {
 .rm-node.selected .rm-dot { stroke: var(--text); stroke-width: 3; }
 .rm-label { fill: var(--text); font-size: 12px; font-weight: 600; text-anchor: middle; font-family: var(--font-mono); }
 .rm-node.offline .rm-label { fill: var(--text-muted); }
+.rm-hash { fill: var(--text-muted); font-size: 10px; font-weight: 400; }
 .rm-meta { fill: var(--text-muted); font-size: 10px; text-anchor: middle; font-family: var(--font-mono); }
 .rm-self-halo { fill: rgba(13,203,240,.15); }
 .rm-self-dot { fill: var(--accent); stroke: var(--bg); stroke-width: 3; }
@@ -3325,14 +3326,31 @@ select.field-input {
   margin-bottom: 28px;
 }
 .traffic-card { display: flex; flex-direction: column; gap: 10px; }
+/* Every figure in these cards is a live reading, so digits get a fixed
+   advance width throughout: a value that changes must not move its neighbours. */
+.traffic-card { font-variant-numeric: tabular-nums; }
 .traffic-rssi { font-family: var(--font-mono); font-size: 12px; color: var(--text-muted); }
-.traffic-legend { display: flex; gap: 18px; flex-wrap: wrap; font-family: var(--font-mono); font-size: 13px; }
-.traffic-legend-item { display: flex; align-items: baseline; gap: 8px; }
+/* Two fixed columns rather than a flex row: the TX group then always starts
+   at the same place, instead of being pushed around by how wide the RX peak
+   text happens to be this second — and the two radio cards agree with each
+   other. */
+.traffic-legend {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 18px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  /* Narrow cards are unaffected; a full-width one stops flinging OUT into the
+     middle of the page. */
+  max-width: 560px;
+}
+.traffic-legend-item { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
 .traffic-legend-item.rx .traffic-arrow, .traffic-legend-item.rx .traffic-rate { color: var(--ok); }
 .traffic-legend-item.tx .traffic-arrow, .traffic-legend-item.tx .traffic-rate { color: var(--accent); }
 .traffic-legend-label { color: var(--text-muted); font-weight: 600; letter-spacing: .06em; }
-.traffic-rate { font-weight: 700; min-width: 80px; }
-.traffic-peak { color: var(--text-muted); font-size: 11px; }
+.traffic-rate { font-weight: 700; min-width: 80px; font-variant-numeric: tabular-nums; }
+.traffic-peak { color: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.traffic-chart { max-height: 160px; }
 .traffic-chart {
   width: 100%;
   height: 160px;
@@ -3349,10 +3367,21 @@ select.field-input {
 .tg-rx { stroke: var(--ok); }
 .tg-tx { stroke: var(--accent); }
 .tg-scale { fill: var(--text-muted); font-family: var(--font-mono); font-size: 10px; }
-.traffic-counters { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.traffic-counters { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; max-width: 560px; }
 .traffic-counter { display: flex; flex-direction: column; gap: 2px; }
-.traffic-counter .metric-value { font-size: 18px; font-family: var(--font-mono); }
-.traffic-sub { font-size: 11px; color: var(--text-muted); font-family: var(--font-mono); }
+/* The generic .metric-value is a right-aligned column in label/value rows.
+   Here the value stacks under its own label, so it starts on the same edge as
+   the label and the byte count below it. */
+.traffic-counter .metric-value {
+  font-size: 18px;
+  font-family: var(--font-mono);
+  text-align: left;
+  min-width: 0;
+  /* Digits keep their column as the counters tick, so RX and TX stay lined up
+     with each other instead of shifting on every update. */
+  font-variant-numeric: tabular-nums;
+}
+.traffic-sub { font-size: 11px; color: var(--text-muted); font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
 
 /* Remote page — polish */
 .remote-grid--three { grid-template-columns: 1fr 1fr 1fr; }
@@ -3396,6 +3425,15 @@ select.field-input {
 
 .rm-pulse { fill: none; stroke: var(--accent); stroke-width: 2; opacity: 0; animation: rm-ring 2.6s ease-out infinite; }
 @keyframes rm-ring { 0% { r: 12; opacity: .7; } 100% { r: 26; opacity: 0; } }
+/* Radar pings behind the map, running from this node to the map edge
+   (r 30 → 240, the glow radius in viewBox units). */
+.rm-radar { pointer-events: none; }
+.rm-ping { fill: none; stroke: var(--accent); stroke-width: 1.5; opacity: 0; animation: rm-ping 4.2s ease-out infinite; }
+.rm-ping--late { animation-delay: 2.1s; }
+@keyframes rm-ping { 0% { r: 30; opacity: .45; } 100% { r: 240; opacity: 0; } }
+@media (prefers-reduced-motion: reduce) {
+    .rm-ping, .rm-pulse { animation: none; opacity: 0; }
+}
 .rm-flag { fill: var(--warn); font-size: 10px; font-weight: 700; text-anchor: middle; font-family: var(--font-mono); }
 .rm-node.selected .rm-halo { fill: rgba(13,203,240,.22); stroke: var(--accent); stroke-width: 1; stroke-dasharray: 3 3; }
 .remote-fec-stats { font-family: var(--font-mono); font-size: 12px; color: var(--text-muted); display: block; padding-top: 8px; }
@@ -3650,3 +3688,346 @@ body.term-fullscreen { overflow: hidden; }
 
 .remote-tag-row { display: flex; gap: 8px; align-items: center; margin: 10px 0 12px; }
 .remote-tag-input { flex: 1; }
+
+/* ── VPN page ─────────────────────────────────────────────────────────────── */
+
+/* `.card` carries no margin by design — spacing is the container's job. The
+   page is a single stack, so one gap rule covers every section and none of
+   them need to know what sits above or below. */
+.vpn-stack { display: flex; flex-direction: column; gap: 18px; }
+.vpn-stack > .vpn-twin-row { margin-bottom: 0; }
+
+/* The router picker. Each paired node is one control that both selects and
+   clears, so there is no separate stop button to look for. */
+.vpn-node-list { display: flex; flex-direction: column; gap: 8px; }
+.vpn-node {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 12px;
+  text-align: left;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-2);
+  color: inherit;
+  cursor: pointer;
+  transition: border-color 120ms ease, background-color 120ms ease;
+}
+.vpn-node:hover { border-color: var(--accent); }
+.vpn-node:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.vpn-node.is-selected { border-color: var(--ok); background: color-mix(in srgb, var(--ok) 10%, var(--surface-2)); }
+.vpn-node-dot {
+  flex: 0 0 auto;
+  width: 8px; height: 8px;
+  border-radius: 999px;
+  background: var(--text-muted);
+}
+.vpn-node-dot.is-online { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); }
+.vpn-node-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+.vpn-node-name { font-weight: 600; font-size: 14px; }
+.vpn-node-sub {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  /* A node can offer several subnets; the row must not grow to fit them. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.vpn-node-action {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--text-muted);
+}
+.vpn-node.is-selected .vpn-node-action { color: var(--ok); }
+
+/* Explains why something is not doing what the switch says. Empty most of the
+   time, so it collapses rather than leaving a gap. */
+.vpn-note { margin: 10px 0 0; font-size: 12px; color: var(--text-muted); }
+.vpn-note:empty { display: none; }
+
+.vpn-share-controls { display: flex; align-items: center; gap: 12px; }
+.vpn-share-body { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+.vpn-share-presets { display: flex; gap: 8px; flex-wrap: wrap; }
+.vpn-field-label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--text-muted);
+}
+
+/* Signal strip under each radio's rate chart. One column per sample, on the
+   same clock as the chart above, so a dip in signal lines up with the traffic
+   it explains. */
+.rssi-strip-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: -4px;
+}
+.rssi-strip-label,
+.rssi-strip-value {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.rssi-strip-label {
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  font-weight: 700;
+}
+.rssi-strip-value { min-width: 62px; text-align: right; }
+.rssi-strip {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 20px;
+  border-radius: 3px;
+  /* The blocks are drawn edge to edge; the radius alone would leave corners
+     poking out. */
+  overflow: hidden;
+  background: var(--surface-2);
+}
+
+/* ── Remote: pairing by code ──────────────────────────────────────────────── */
+
+.remote-pair-card { margin-top: 18px; }
+.remote-pair-body {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 24px;
+  align-items: start;
+}
+@media (max-width: 720px) {
+  .remote-pair-body { grid-template-columns: 1fr; }
+}
+.remote-pair-mine { display: flex; gap: 14px; align-items: center; }
+.remote-pair-qr {
+  width: 148px;
+  height: 148px;
+  /* The code has to survive being read off a screen at an angle, so it keeps
+     its white quiet zone rather than inheriting the dark surface. */
+  background: #fff;
+  border-radius: 8px;
+  padding: 6px;
+  box-sizing: border-box;
+}
+.remote-pair-qr svg { display: block; width: 100%; height: 100%; }
+.remote-pair-qr--empty {
+  display: grid;
+  place-items: center;
+  color: #6b7280;
+  font-size: 12px;
+}
+.remote-pair-mine-meta { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+.remote-pair-codename { font-weight: 700; font-size: 15px; }
+.remote-pair-hash { font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); }
+.remote-pair-add { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.remote-pair-input { width: 100%; box-sizing: border-box; font-family: var(--font-mono); font-size: 12px; }
+.remote-pair-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.vpn-note.is-ok { color: var(--ok); }
+.vpn-note.is-err { color: var(--err, #f04b4b); }
+
+/* Peer table. The tunnel IP is the column people come here for, so it gets
+   monospace and its own emphasis. */
+.vpn-peers-wrap { overflow-x: auto; }
+.vpn-peers-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+.vpn-peers-table th {
+  text-align: left;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--text-muted);
+  padding: 0 12px 8px 0;
+  white-space: nowrap;
+}
+.vpn-peers-table td {
+  padding: 8px 12px 8px 0;
+  border-top: 1px solid var(--border);
+  vertical-align: middle;
+}
+.vpn-peers-table td .status-dot { margin-right: 8px; }
+.vpn-peers-hash,
+.vpn-peers-ip,
+.vpn-peers-routes { font-family: var(--font-mono); font-size: 12px; }
+.vpn-peers-ip { color: var(--accent); font-weight: 600; }
+.vpn-peers-routes { color: var(--text-muted); }
+.vpn-peers-empty {
+  color: var(--text-muted);
+  padding: 14px 0;
+  border-top: 1px solid var(--border);
+}
+
+/* Per-row controls in the peer table. */
+.vpn-peers-name { font-weight: 600; }
+.vpn-peers-sub {
+  display: block;
+  margin-left: 16px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.vpn-peers-seen { color: var(--text-muted); white-space: nowrap; }
+.vpn-peers-muted { color: var(--text-muted); font-size: 12px; }
+.vpn-route-switch { margin: 0; }
+.vpn-peers-ping { white-space: nowrap; }
+.vpn-ping-result {
+  margin-left: 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.vpn-ping-result.is-ok { color: var(--ok); }
+.vpn-ping-result.is-err { color: var(--err, #f04b4b); }
+
+/* Chart and device panel side by side; the table gets the full width below,
+   because that is the one thing here that benefits from it. */
+.vpn-top-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(320px, 1fr);
+  gap: 18px;
+  /* Stretch, not start: the two panels are a pair and should end on the same
+     line. The traffic side gives its spare height to the packet log below. */
+  align-items: stretch;
+}
+
+/* The device panel sets the height: it is the side with fixed content, and
+   clipping it to an arbitrary box hid controls. The traffic panel then
+   stretches to match, and the packet log takes whatever is left over.
+   No fixed height anywhere — the row is as tall as this device needs. */
+.vpn-top-row > .card {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* Inside the bounded traffic card only the packet log flexes. Everything else
+   keeps its size, or the chart would be squeezed to nothing on a short window
+   and the counters would be the first thing pushed out of view. */
+.vpn-top-row .traffic-card > .card-header,
+.vpn-top-row .traffic-card > .traffic-legend,
+.vpn-top-row .traffic-card > .traffic-counters { flex: 0 0 auto; }
+.vpn-top-row .traffic-card > .traffic-chart { flex: 0 0 150px; height: 150px; }
+
+@media (max-width: 1000px) {
+  /* Stacked: nothing competes for height, so the log takes a set size of its
+     own rather than filling a row that no longer exists. */
+  .vpn-top-row .traffic-card > .vpn-wire > .vpn-wire-list { flex: 0 0 auto; height: 200px; }
+}
+@media (max-width: 1000px) {
+  .vpn-top-row { grid-template-columns: 1fr; }
+}
+.vpn-device-card { display: flex; flex-direction: column; }
+/* Only inside this row — the dashboard's traffic cards keep their own sizing. */
+.vpn-top-row .traffic-card > .vpn-wire { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
+/* `flex: 1 1 0` with `height: 0` is the load-bearing part: a zero basis means
+   the list contributes nothing to the panel's natural height, so packets can
+   never make the panel grow. It then expands into whatever space the device
+   panel's height leaves, and scrolls. The floor keeps it usable when the
+   device panel happens to be short. */
+.vpn-top-row .traffic-card > .vpn-wire > .vpn-wire-list {
+  flex: 1 1 0;
+  height: 0;
+  min-height: 110px;
+}
+
+/* Grouped facts rather than one long list: an operator looks for "what is my
+   tunnel address" or "what am I sharing", never for all of it at once. */
+.vpn-section { padding: 12px 0; border-top: 1px solid var(--border); }
+.vpn-section:first-of-type { border-top: 0; padding-top: 0; }
+.vpn-section--last { padding-bottom: 0; }
+.vpn-section-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+}
+.vpn-section-title--action {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+/* Label/value pairs on a fixed label column, so values line up down the panel
+   instead of stepping in and out with the length of each label. */
+.vpn-facts {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  gap: 6px 12px;
+  margin: 0;
+  font-size: 13px;
+}
+.vpn-facts dt { color: var(--text-muted); }
+.vpn-facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.vpn-facts-mono { font-family: var(--font-mono); font-size: 12px; }
+.vpn-facts-accent { color: var(--accent); font-weight: 600; }
+
+/* The ping column holds a button plus a result that appears later; reserving
+   the width stops the row shifting when the answer lands. */
+.vpn-peers-ping { min-width: 140px; }
+.vpn-ping-result { display: inline-block; min-width: 58px; }
+
+/* Live packet view. A fixed-height scroll so the panel never grows as traffic
+   arrives — the chart above it must not move while you are reading it. */
+.vpn-wire { margin-top: 12px; }
+.vpn-wire-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.vpn-wire-pause .feature-switch-label { font-size: 11px; color: var(--text-muted); }
+.vpn-wire-list {
+  height: 132px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-2);
+  padding: 4px 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.vpn-wire-row {
+  /* Flex with fixed widths rather than fr columns: an IPv4 address needs about
+     120px and no more, and letting the columns absorb the panel width pushed
+     the two addresses to opposite ends of a very wide row. */
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 1px 8px;
+  white-space: nowrap;
+}
+.vpn-wire-time { flex: 0 0 82px; }
+.vpn-wire-dir { flex: 0 0 10px; }
+.vpn-wire-addr { flex: 0 0 158px; }
+.vpn-wire-arrow { flex: 0 0 10px; }
+.vpn-wire-proto { flex: 0 0 42px; }
+.vpn-wire-len { flex: 0 0 52px; }
+.vpn-wire-row:hover { background: rgba(148,163,184,.06); }
+.vpn-wire-time { color: var(--text-muted); }
+.vpn-wire-row.is-tx .vpn-wire-dir { color: var(--accent); }
+.vpn-wire-row.is-rx .vpn-wire-dir { color: var(--ok); }
+.vpn-wire-addr { overflow: hidden; text-overflow: ellipsis; }
+
+.vpn-wire-arrow,
+.vpn-wire-proto { color: var(--text-muted); }
+.vpn-wire-port { color: var(--text-muted); }
+.vpn-wire-len { text-align: right; color: var(--text-muted); }
+.vpn-wire-empty { padding: 8px; color: var(--text-muted); }

@@ -6,6 +6,14 @@ rust-version = "1.85"
 
 [features]
 run = ["dep:reticulum", "dep:kaonic-reticulum", "dep:tokio-util", "dep:cidr-v3"]
+# The container test rig: a VPN node whose Reticulum rides TCP instead of the
+# radio. Not built into the gateway.
+lab = ["run", "dep:env_logger"]
+
+[[bin]]
+name = "kaonic-vpn-lab"
+path = "src/bin/kaonic-vpn-lab.rs"
+required-features = ["lab"]
 
 [dependencies]
 reticulum        = { git = "https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs", rev = "151e3b6c77a8c7d33fafa3971a084ae02510ef39", optional = true }
@@ -19,6 +27,7 @@ if-addrs         = "0.13"
 rmp-serde        = "1"
 parking_lot      = "0.12"
 
+env_logger = { version = "0.11", optional = true }
 log   = "0.4"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }

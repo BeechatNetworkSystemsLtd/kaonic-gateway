@@ -146,6 +146,46 @@ impl Settings {
         self.db.touch_wifi_network(ssid, when)
     }
 
+    pub fn plugin_get(&self, plugin: &str, key: &str) -> Result<Option<String>> {
+        self.db.plugin_get(plugin, key)
+    }
+
+    pub fn plugin_set(&self, plugin: &str, key: &str, value: &str, when: u64) -> Result<()> {
+        self.db.plugin_set(plugin, key, value, when)
+    }
+
+    pub fn plugin_delete(&self, plugin: &str, key: &str) -> Result<()> {
+        self.db.plugin_delete(plugin, key)
+    }
+
+    pub fn plugin_keys(&self, plugin: &str) -> Result<Vec<String>> {
+        self.db.plugin_keys(plugin)
+    }
+
+    pub fn set_local_service(&self, service: &str, destination: &str, when: u64) -> Result<()> {
+        self.db.set_local_service(service, destination, when)
+    }
+
+    pub fn load_local_services(&self) -> Result<Vec<(String, String)>> {
+        self.db.load_local_services()
+    }
+
+    pub fn load_vpn_gateway(&self) -> Result<kaonic_vpn::VpnGatewayConfig> {
+        self.db.load_vpn_gateway()
+    }
+
+    pub fn save_vpn_gateway(&self, gateway: &kaonic_vpn::VpnGatewayConfig) -> Result<()> {
+        self.db.save_vpn_gateway(gateway)
+    }
+
+    pub fn load_vpn_uplink(&self) -> Result<kaonic_vpn::VpnUplinkConfig> {
+        self.db.load_vpn_uplink()
+    }
+
+    pub fn save_vpn_uplink(&self, uplink: &kaonic_vpn::VpnUplinkConfig) -> Result<()> {
+        self.db.save_vpn_uplink(uplink)
+    }
+
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
         self.db.get_setting(key)
     }

@@ -11,5 +11,7 @@ mod runtime;
 mod tun;
 mod types;
 
-pub use runtime::{VpnRuntime, VpnRuntimeError};
-pub use types::{VpnPeerSnapshot, VpnRouteMappingSnapshot, VpnRouteSnapshot, VpnSnapshot};
+pub use runtime::{DenyAll, PeerAuthority, VpnRuntime, VpnRuntimeError};
+pub use types::{
+    VpnGatewaySnapshot, VpnPeerSnapshot, VpnUplinkSnapshot, VpnRouteMappingSnapshot, VpnRouteSnapshot, VpnSnapshot,
+};

@@ -31,6 +31,8 @@ pub struct NodeEntry {
     pub protocol: u8,
     pub flags: u8,
     pub announce_secs: u8,
+    /// Last advertised plugin service directory digest (0 = none).
+    pub services_digest: u32,
     pub last_announce_ts: u64,
     pub hops: Option<u8>,
     pub rssi: Option<i8>,
@@ -145,6 +147,7 @@ impl NodeRegistry {
                 entry.protocol = info.protocol;
                 entry.flags = info.flags;
                 entry.announce_secs = info.announce_secs;
+                entry.services_digest = info.services_digest;
                 entry.last_announce_ts = now;
                 false
             }
@@ -161,6 +164,7 @@ impl NodeRegistry {
                         protocol: info.protocol,
                         flags: info.flags,
                         announce_secs: info.announce_secs,
+                        services_digest: info.services_digest,
                         last_announce_ts: now,
                         hops: None,
                         rssi: None,
@@ -191,6 +195,7 @@ impl NodeRegistry {
             protocol: 0,
             flags: 0,
             announce_secs: 0,
+            services_digest: 0,
             last_announce_ts: 0,
             hops: None,
             rssi: None,
@@ -265,6 +270,7 @@ mod tests {
             codename: codename.into(),
             gateway_version: (0, 2, 5),
             announce_secs: secs,
+            services_digest: 0,
         }
     }
 

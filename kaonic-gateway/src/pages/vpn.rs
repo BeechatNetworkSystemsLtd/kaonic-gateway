@@ -1,11 +1,61 @@
-use kaonic_vpn::{VpnPeerSnapshot, VpnRouteSnapshot, VpnSnapshot};
+//! The VPN page.
+//!
+//! Two questions an operator actually has: *am I reaching another site through
+//! someone?* and *is anyone reaching a site through me?* The page answers those
+//! two and shows the traffic, and does not try to be a routing table viewer —
+//! pairing lives on the Remote page, and the kernel's own tables are a better
+//! debugger than a rendering of them.
+
+use kaonic_vpn::VpnSnapshot;
 use leptos::prelude::*;
-use qrcodegen::{QrCode, QrCodeEcc};
 use serde::{Deserialize, Serialize};
 
 use super::PageTitle;
 
 // ── Snapshot ──────────────────────────────────────────────────────────────────
+
+/// A node the operator paired with, as the router picker needs it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PairedPeerDto {
+    pub identity_hash: String,
+    pub codename: String,
+    /// The operator's own label, when they set one.
+    pub tag: String,
+    pub online: bool,
+    /// Networks this peer is currently offering.
+    pub routes: Vec<String>,
+}
+
+impl PairedPeerDto {
+    fn display_name(&self) -> String {
+        if !self.tag.is_empty() {
+            return self.tag.clone();
+        }
+        if !self.codename.is_empty() {
+            return self.codename.clone();
+        }
+        self.identity_hash.chars().take(8).collect()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VpnGatewayDto {
+    pub enabled: bool,
+    pub active: bool,
+    pub routes: Vec<String>,
+    pub egress_interface: Option<String>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VpnUplinkDto {
+    pub enabled: bool,
+    pub active: bool,
+    pub peer: Option<String>,
+    pub routes: Vec<String>,
+    pub default_route: bool,
+    pub detail: Option<String>,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VpnPageSnapshot {
@@ -13,8 +63,9 @@ pub struct VpnPageSnapshot {
     pub codename: String,
     pub wlan0_ip: Option<String>,
     pub usb0_ip: Option<String>,
-    pub allow_all_peers: bool,
-    pub allowed_peers: Vec<String>,
+    pub paired: Vec<PairedPeerDto>,
+    pub gateway: VpnGatewayDto,
+    pub uplink: VpnUplinkDto,
     pub vpn: VpnSnapshot,
 }
 
@@ -25,15 +76,6 @@ pub async fn load_vpn_snapshot() -> Result<VpnPageSnapshot, ServerFnError> {
 
     let state = leptos::context::use_context::<AppState>()
         .ok_or_else(|| ServerFnError::new("missing AppState context"))?;
-    let config = {
-        let settings = state
-            .settings
-            .lock()
-            .map_err(|_| ServerFnError::new("settings lock poisoned"))?;
-        settings
-            .load_config()
-            .map_err(|err| ServerFnError::new(err.to_string()))?
-    };
     let codename = {
         let settings = state
             .settings
@@ -43,18 +85,84 @@ pub async fn load_vpn_snapshot() -> Result<VpnPageSnapshot, ServerFnError> {
             .load_or_create_codename()
             .map_err(|err| ServerFnError::new(err.to_string()))?
     };
+    let paired_nodes = {
+        let settings = state
+            .settings
+            .lock()
+            .map_err(|_| ServerFnError::new("settings lock poisoned"))?;
+        settings.load_remote_paired().unwrap_or_default()
+    };
+    let tags = {
+        let settings = state
+            .settings
+            .lock()
+            .map_err(|_| ServerFnError::new("settings lock poisoned"))?;
+        settings.load_remote_tags().unwrap_or_default()
+    };
+
+    let mut vpn = match &state.vpn {
+        Some(vpn) => vpn.snapshot().await,
+        None => VpnSnapshot::default(),
+    };
+    // Same translation the websocket does: the page speaks identity hashes.
+    crate::state::present_uplink_peer(&state, &mut vpn);
+    crate::state::present_peer_names(&state, &mut vpn);
+
+    // Only paired nodes can join the VPN, so the picker is exactly the pairing
+    // list — joined to what each peer is offering right now.
+    let paired = paired_nodes
+        .into_iter()
+        .map(|node| {
+            // A node's VPN destination is derived from its identity, not equal
+            // to it, so the two lists join on the derived hash.
+            let vpn_hash = crate::remote::vpn_destination_hash(&node)
+                .map(|hash| hash.to_hex_string())
+                .unwrap_or_default();
+            let peer = vpn
+                .peers
+                .iter()
+                .find(|peer| peer.destination == vpn_hash);
+            PairedPeerDto {
+                tag: tags
+                    .iter()
+                    .find(|(hash, _)| *hash == node.identity_hash)
+                    .map(|(_, tag)| tag.clone())
+                    .unwrap_or_default(),
+                online: peer.is_some_and(|peer| peer.link_state == "active"),
+                routes: vpn
+                    .remote_routes
+                    .iter()
+                    .filter(|route| route.owner == vpn_hash)
+                    .map(|route| route.network.clone())
+                    .collect(),
+                identity_hash: node.identity_hash,
+                codename: node.codename,
+            }
+        })
+        .collect();
 
     Ok(VpnPageSnapshot {
         local_hash: state.vpn_hash.clone(),
         codename,
         wlan0_ip: read_interface_ipv4("wlan0"),
         usb0_ip: read_interface_ipv4("usb0"),
-        allow_all_peers: config.allow_all_peers,
-        allowed_peers: config.peers,
-        vpn: match &state.vpn {
-            Some(vpn) => vpn.snapshot().await,
-            None => VpnSnapshot::default(),
+        paired,
+        gateway: VpnGatewayDto {
+            enabled: vpn.gateway.enabled,
+            active: vpn.gateway.active,
+            routes: vpn.gateway.routes.clone(),
+            egress_interface: vpn.gateway.egress_interface.clone(),
+            detail: vpn.gateway.detail.clone(),
         },
+        uplink: VpnUplinkDto {
+            enabled: vpn.uplink.enabled,
+            active: vpn.uplink.active,
+            peer: vpn.uplink.peer.clone(),
+            routes: vpn.uplink.routes.clone(),
+            default_route: vpn.uplink.default_route,
+            detail: vpn.uplink.detail.clone(),
+        },
+        vpn,
     })
 }
 
@@ -102,15 +210,6 @@ fn format_bps(bps: u64) -> String {
     }
 }
 
-fn vpn_badge_class(value: &str) -> &'static str {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "running" | "active" | "ready" | "installed" | "yes" => "badge-ok",
-        "discovered" | "configured" | "pending" | "starting" => "badge-warn",
-        "error" | "closed" | "failed" | "no" | "drop" => "badge-err",
-        _ => "reticulum-badge-soft",
-    }
-}
-
 fn status_dot_class(status: &str) -> &'static str {
     match status.trim().to_ascii_lowercase().as_str() {
         "running" => "status-dot status-dot--ok",
@@ -128,17 +227,6 @@ fn banner_modifier(status: &str) -> &'static str {
     }
 }
 
-fn peer_dot_class(link_state: &str) -> &'static str {
-    match link_state.trim().to_ascii_lowercase().as_str() {
-        "active" => "status-dot status-dot--ok",
-        "pending" | "starting" | "configured" | "discovered" => "status-dot status-dot--warn",
-        "closed" | "error" | "failed" => "status-dot status-dot--err",
-        _ => "status-dot status-dot--idle",
-    }
-}
-
-/// Parse "alias/prefix -> local/prefix" route strings produced by the VPN.
-/// Returns (displayed_alias, Option<local_net>).
 fn parse_route_display(route: &str) -> (String, Option<String>) {
     if let Some(idx) = route.find(" -> ") {
         (
@@ -150,19 +238,6 @@ fn parse_route_display(route: &str) -> (String, Option<String>) {
     }
 }
 
-fn serial_test_ip(route: &str) -> Option<String> {
-    let network = route.split('/').next()?.trim();
-    let mut octets = network.split('.');
-    let a = octets.next()?;
-    let b = octets.next()?;
-    let c = octets.next()?;
-    let d = octets.next()?;
-    if octets.next().is_some() || d != "0" {
-        return None;
-    }
-    Some(format!("{a}.{b}.{c}.1"))
-}
-
 fn default_advertised_route_strings(routes: Vec<String>) -> Vec<String> {
     if routes.is_empty() {
         vec!["192.168.10.0/24".into()]
@@ -171,62 +246,24 @@ fn default_advertised_route_strings(routes: Vec<String>) -> Vec<String> {
     }
 }
 
-fn vpn_add_peer_url(hash: &str, codename: &str) -> String {
-    format!("https://192.168.10.1/vpn?vpn-add-peer={hash}&codename={codename}")
-}
-
-fn split_hash_rows(value: &str, row_len: usize) -> Vec<String> {
-    if row_len == 0 {
-        return vec![value.to_string()];
-    }
-    value
-        .as_bytes()
-        .chunks(row_len)
-        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
-        .collect()
-}
-
-fn render_hash_qr_svg(value: &str) -> Option<String> {
-    let qr = QrCode::encode_text(value, QrCodeEcc::Medium).ok()?;
-    let border = 2;
-    let size = qr.size();
-    let dimension = size + border * 2;
-    let mut svg = format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {dimension} {dimension}\" shape-rendering=\"crispEdges\" aria-hidden=\"true\">\
-         <rect width=\"100%\" height=\"100%\" fill=\"#ffffff\"/>"
-    );
-    for y in 0..size {
-        for x in 0..size {
-            if qr.get_module(x, y) {
-                let px = x + border;
-                let py = y + border;
-                svg.push_str(&format!(
-                    "<rect x=\"{px}\" y=\"{py}\" width=\"1\" height=\"1\" fill=\"#111827\"/>"
-                ));
-            }
-        }
-    }
-    svg.push_str("</svg>");
-    Some(svg)
-}
 
 // ── Page ──────────────────────────────────────────────────────────────────────
 
 #[component]
 pub fn VpnPage() -> impl IntoView {
     let snapshot = Resource::new(|| (), |_| load_vpn_snapshot());
-
     view! {
+        // Every page in the app sits in this container; it is what supplies the
+        // outer padding, so content must not be emitted outside it.
         <div class="page">
-            <PageTitle icon="🔐" title="VPN" />
-            <Suspense fallback=|| view! { <p class="loading">"Loading…"</p> }>
-                {move || match snapshot.get() {
-                    None => view! { <p class="loading">"Loading…"</p> }.into_any(),
-                    Some(Err(e)) => view! {
-                        <div class="error-banner">"Error: "{e.to_string()}</div>
+            <PageTitle title="VPN" icon="🔒"/>
+            <Suspense fallback=|| view! { <div class="card">"Loading…"</div> }>
+                {move || snapshot.get().map(|result| match result {
+                    Ok(snapshot) => view! { <VpnContent snapshot=snapshot/> }.into_any(),
+                    Err(err) => view! {
+                        <div class="card">"Failed to load VPN status: " {err.to_string()}</div>
                     }.into_any(),
-                    Some(Ok(snap)) => view! { <VpnContent snapshot=snap/> }.into_any(),
-                }}
+                })}
             </Suspense>
         </div>
     }
@@ -235,23 +272,19 @@ pub fn VpnPage() -> impl IntoView {
 #[component]
 fn VpnContent(snapshot: VpnPageSnapshot) -> impl IntoView {
     let vpn = &snapshot.vpn;
-
     let status = vpn.status.clone();
-    let peer_count = vpn.peers.len();
     let tunnel_ip = vpn.local_tunnel_ip.clone().unwrap_or_else(|| "—".into());
-    let wlan0_ip = snapshot.wlan0_ip.clone().unwrap_or_else(|| "—".into());
-    let usb0_ip = snapshot.usb0_ip.clone().unwrap_or_else(|| "—".into());
     let network = vpn.network.clone();
-    let tx_bytes = format_bytes(vpn.tx_bytes);
-    let rx_bytes = format_bytes(vpn.rx_bytes);
+    let peer_count = vpn.peers.len();
     let has_error = vpn.last_error.is_some();
     let last_error = vpn.last_error.clone().unwrap_or_default();
-
-    let installed_routes: Vec<&VpnRouteSnapshot> =
-        vpn.remote_routes.iter().filter(|r| r.installed).collect();
+    let paired_json = serde_json::to_string(&snapshot.paired).unwrap_or_else(|_| "[]".into());
+    let peers_json = serde_json::to_string(&snapshot.vpn.peers).unwrap_or_else(|_| "[]".into());
+    let gateway_json = serde_json::to_string(&snapshot.gateway).unwrap_or_else(|_| "{}".into());
+    let uplink_json = serde_json::to_string(&snapshot.uplink).unwrap_or_else(|_| "{}".into());
 
     view! {
-        // ── Connection banner ────────────────────────────────────────────────
+        // ── Status banner ────────────────────────────────────────────────────
         <div class=banner_modifier(&status) id="vpn-banner">
             <div class="vpn-banner-lead">
                 <span class=status_dot_class(&status) id="vpn-status-dot"></span>
@@ -263,41 +296,18 @@ fn VpnContent(snapshot: VpnPageSnapshot) -> impl IntoView {
                 <span class="vpn-banner-ip" id="vpn-local-ip">{tunnel_ip}</span>
             </div>
             <div class="vpn-banner-field">
-                <span class="vpn-banner-label">"wlan0 IP"</span>
-                <span class="vpn-banner-ip" id="vpn-wlan0-ip">{wlan0_ip}</span>
-            </div>
-            <div class="vpn-banner-field">
-                <span class="vpn-banner-label">"usb0 IP"</span>
-                <span class="vpn-banner-ip" id="vpn-usb0-ip">{usb0_ip}</span>
-            </div>
-            <div class="vpn-banner-field">
                 <span class="vpn-banner-label">"Network"</span>
                 <span class="vpn-banner-ip vpn-banner-net" id="vpn-network">{network}</span>
             </div>
-            <div class="vpn-banner-field vpn-banner-field--hash">
-                <span class="vpn-banner-label">"My hash"</span>
-                <code class="vpn-banner-ip vpn-banner-hash" id="vpn-my-hash">{snapshot.local_hash.clone()}</code>
+            <div class="vpn-banner-field">
+                <span class="vpn-banner-label">"Peers"</span>
+                <span class="vpn-banner-ip" id="vpn-peer-count">{peer_count}</span>
             </div>
             <div class="vpn-banner-field">
-                <span class="vpn-banner-label">"TX bytes"</span>
-                <span class="vpn-banner-ip" id="vpn-tx-bytes">{tx_bytes}</span>
+                <span class="vpn-banner-label">"Router"</span>
+                <span class="vpn-banner-ip" id="vpn-banner-router">"—"</span>
             </div>
-            <div class="vpn-banner-field">
-                <span class="vpn-banner-label">"TX packets"</span>
-                <span class="vpn-banner-ip" id="vpn-tx-packets">{vpn.tx_packets}</span>
-            </div>
-            <div class="vpn-banner-field">
-                <span class="vpn-banner-label">"RX bytes"</span>
-                <span class="vpn-banner-ip" id="vpn-rx-bytes">{rx_bytes}</span>
-            </div>
-            <div class="vpn-banner-field">
-                <span class="vpn-banner-label">"RX packets"</span>
-                <span class="vpn-banner-ip" id="vpn-rx-packets">{vpn.rx_packets}</span>
-            </div>
-            <div class="vpn-banner-field">
-                <span class="vpn-banner-label">"Drops"</span>
-                <span class="vpn-banner-ip" id="vpn-drop-packets">{vpn.drop_packets}</span>
-            </div>
+            <div class="vpn-banner-spacer"></div>
             <div class="vpn-banner-field feature-switches">
                 <span class="vpn-banner-label">"VPN"</span>
                 <div class="feature-switch-row">
@@ -308,14 +318,8 @@ fn VpnContent(snapshot: VpnPageSnapshot) -> impl IntoView {
                     </label>
                 </div>
             </div>
-            <div class="vpn-banner-spacer"></div>
-            <div class="vpn-banner-peers">
-                <span id="vpn-peer-count">{peer_count}</span>
-                " peer"{if peer_count == 1 { "" } else { "s" }}
-            </div>
         </div>
 
-        // ── Error bar (visible only when there's an active error) ────────────
         {if has_error {
             view! {
                 <div class="vpn-error-bar" id="vpn-error-bar">
@@ -326,170 +330,164 @@ fn VpnContent(snapshot: VpnPageSnapshot) -> impl IntoView {
             view! { <div id="vpn-error-bar" style="display:none"></div> }.into_any()
         }}
 
-        // ── Top grid: This Device + Laptop Setup ─────────────────────────────
-        <div class="vpn-twin-row">
-            <VpnThisDeviceCard
-                local_hash=snapshot.local_hash.clone()
-                codename=snapshot.codename.clone()
-                local_routes=vpn.local_routes.clone()
-                advertised_routes=vpn.advertised_routes.clone()
-                interface_name=vpn.interface_name.clone()
-                backend=vpn.backend.clone()
-            />
-            <VpnLaptopSetupCard
-                installed_routes=installed_routes.iter().map(|r| r.network.clone()).collect()
-            />
+        <div class="vpn-stack">
+            <div class="vpn-top-row">
+                <VpnTrafficCard vpn=snapshot.vpn.clone() />
+                <VpnDeviceCard
+                    local_hash=snapshot.local_hash.clone()
+                    local_routes=vpn.local_routes.clone()
+                    interface_name=vpn.interface_name.clone()
+                    backend=vpn.backend.clone()
+                    tunnel_ip=vpn.local_tunnel_ip.clone()
+                    network=vpn.network.clone()
+                    codename=snapshot.codename.clone()
+                    wlan0_ip=snapshot.wlan0_ip.clone()
+                    usb0_ip=snapshot.usb0_ip.clone()
+                />
+            </div>
+
+            <VpnPeersCard peers=snapshot.vpn.peers.clone() />
         </div>
 
-        <VpnAccessCard
-            allow_all_peers=snapshot.allow_all_peers
-            allowed_peers=snapshot.allowed_peers.clone()
-        />
-
-        // ── Peers ─────────────────────────────────────────────────────────────
-        <VpnPeersCard peers=vpn.peers.clone() />
-
-        // ── Advanced / Debug ──────────────────────────────────────────────────
-        <VpnDebugSection
-            local_hash=snapshot.local_hash.clone()
-            vpn=snapshot.vpn.clone()
-        />
-
-        // ── Route editor modal (shared, opened by the device card button) ─────
         <VpnRouteEditorModal
             advertised_routes=vpn.advertised_routes.clone()
         />
-        <VpnShortcutModal />
 
-        <script>{VPN_WS_JS}</script>
+        <script inner_html=format!(
+            "window.__vpn = {{ paired: {paired_json}, peers: {peers_json}, gateway: {gateway_json}, uplink: {uplink_json} }};"
+        )></script>
+        <script>{VPN_JS}</script>
     }
 }
 
-#[component]
-fn VpnAccessCard(allow_all_peers: bool, allowed_peers: Vec<String>) -> impl IntoView {
-    let peers_json = serde_json::to_string(&allowed_peers).unwrap_or_else(|_| "[]".into());
+// ── Traffic ───────────────────────────────────────────────────────────────────
 
+/// In and out over the tunnel, on the same chart the dashboard uses for the
+/// radios — the one place on this page where a graph beats a number, because
+/// what matters is whether traffic is flowing at all and in which direction.
+#[component]
+fn VpnTrafficCard(vpn: VpnSnapshot) -> impl IntoView {
     view! {
-        <div class="card vpn-access-card" id="vpn-access-card" data-allow-all=allow_all_peers.to_string() data-peers=peers_json>
+        <div class="card traffic-card">
             <div class="card-header">
-                <span class="card-title">"Peer Access"</span>
-                <span class=if allow_all_peers {
-                    "badge badge-ok"
-                } else {
-                    "badge badge-warn"
-                } id="vpn-access-mode-badge">
-                    {if allow_all_peers { "Allow all peers" } else { "Allowlist only" }}
+                <span class="card-title">"Tunnel Traffic"</span>
+                <span class="traffic-rssi" id="vpn-chart-scale">"scale 1 B/s"</span>
+                <span class="traffic-rssi" id="vpn-traffic-total">
+                    {format!("{} in / {} out", format_bytes(vpn.rx_bytes), format_bytes(vpn.tx_bytes))}
                 </span>
             </div>
-            <p class="card-body-text vpn-access-copy">
-                "Choose whether any discovered VPN peer may connect, or only peers whose destination hash is stored in the allowlist."
-            </p>
-            <label class="vpn-access-toggle">
-                <input type="checkbox" id="vpn-allow-all-toggle" checked=allow_all_peers />
-                <span>"Allow connections from any peer"</span>
-            </label>
-            <div class="vpn-access-row">
-                <input
-                    type="text"
-                    id="vpn-allowlist-input"
-                    class="field-input vpn-allowlist-input"
-                    placeholder="Destination hash"
-                    autocomplete="off"
-                    spellcheck="false"
-                    inputmode="text"
-                />
-                <button type="button" class="btn-secondary" id="vpn-allowlist-add">"Add"</button>
+            <div class="traffic-legend">
+                <div class="traffic-legend-item rx">
+                    <span class="traffic-arrow">"▲"</span>
+                    <span class="traffic-legend-label">"IN"</span>
+                    <span class="traffic-rate" id="vpn-rx-rate">"0 B/s"</span>
+                    <span class="traffic-peak" id="vpn-rx-peak">"peak 0 B/s"</span>
+                </div>
+                <div class="traffic-legend-item tx">
+                    <span class="traffic-arrow">"▼"</span>
+                    <span class="traffic-legend-label">"OUT"</span>
+                    <span class="traffic-rate" id="vpn-tx-rate">"0 B/s"</span>
+                    <span class="traffic-peak" id="vpn-tx-peak">"peak 0 B/s"</span>
+                </div>
             </div>
-            <p class="vpn-access-hint">
-                "Use the peer destination hash from another Kaonic device, or scan its QR code with an external camera app to open an add-peer shortcut."
-            </p>
-            <div class="vpn-access-status" id="vpn-access-status"></div>
-            <div class="vpn-access-table-wrap">
-                <table class="vpn-access-table">
+            <svg class="traffic-chart" id="vpn-chart" viewBox="0 0 600 160" preserveAspectRatio="none"></svg>
+            <div class="vpn-wire">
+                <div class="vpn-wire-head">
+                    <span class="vpn-section-title">"Live packets"</span>
+                    <label class="feature-switch vpn-wire-pause">
+                        <input type="checkbox" id="vpn-wire-pause"/>
+                        <span class="feature-switch-track"><span class="feature-switch-thumb"></span></span>
+                        <span class="feature-switch-label">"Hold"</span>
+                    </label>
+                </div>
+                <div class="vpn-wire-list" id="vpn-wire-list">
+                    <div class="vpn-wire-empty">"Waiting for traffic…"</div>
+                </div>
+            </div>
+            <div class="traffic-counters">
+                <div class="traffic-counter">
+                    <span class="metric-label">"Packets in"</span>
+                    <span class="metric-value stat-rx" id="vpn-rx-packets">{vpn.rx_packets}</span>
+                    <span class="traffic-sub" id="vpn-rx-bytes">{format_bytes(vpn.rx_bytes)}</span>
+                </div>
+                <div class="traffic-counter">
+                    <span class="metric-label">"Packets out"</span>
+                    <span class="metric-value stat-tx" id="vpn-tx-packets">{vpn.tx_packets}</span>
+                    <span class="traffic-sub" id="vpn-tx-bytes">{format_bytes(vpn.tx_bytes)}</span>
+                </div>
+            </div>
+        </div>
+    }
+}
+
+// ── Peers ─────────────────────────────────────────────────────────────────────
+
+/// Who is on the tunnel, at which address, and what you can do about it.
+///
+/// One row per peer with the route-through switch and a ping on it, because
+/// every question an operator has here is about a specific node: can I reach
+/// it, will it route for me, am I routing through it. Splitting those across
+/// separate cards made you hold a node in your head while you moved between
+/// them.
+#[component]
+fn VpnPeersCard(peers: Vec<kaonic_vpn::VpnPeerSnapshot>) -> impl IntoView {
+    let count = peers.len();
+    view! {
+        <div class="card">
+            <div class="card-header">
+                <span class="card-title">"Peers"</span>
+                <span class="card-body-text">
+                    <span id="vpn-peers-count">{count}</span>
+                    {if count == 1 { " node on the tunnel" } else { " nodes on the tunnel" }}
+                </span>
+            </div>
+            <div class="vpn-peers-wrap">
+                <table class="vpn-peers-table">
                     <thead>
                         <tr>
-                            <th>"Destination hash"</th>
-                            <th></th>
+                            <th>"Node"</th>
+                            <th>"Tunnel IP"</th>
+                            <th>"Link"</th>
+                            <th>"Offers"</th>
+                            <th>"Last seen"</th>
+                            <th>"Route through"</th>
+                            <th>"Reachable"</th>
                         </tr>
                     </thead>
-                    <tbody id="vpn-allowlist-table">
-                        {if allowed_peers.is_empty() {
-                            view! {
-                                <tr class="vpn-allowlist-empty-row" id="vpn-allowlist-empty-row">
-                                    <td colspan="2">"No allowlist entries saved."</td>
-                                </tr>
-                            }.into_any()
-                        } else {
-                            allowed_peers.into_iter().map(|peer| {
-                                let peer_attr = peer.clone();
-                                let peer_button = peer.clone();
-                                view! {
-                                    <tr data-vpn-allow-peer=peer_attr>
-                                        <td><code>{peer.clone()}</code></td>
-                                        <td class="vpn-access-actions">
-                                            <button type="button" class="btn-secondary vpn-allowlist-remove" data-vpn-remove-peer=peer_button>
-                                                "Remove"
-                                            </button>
-                                        </td>
-                                    </tr>
-                                }
-                            }).collect_view().into_any()
-                        }}
+                    <tbody id="vpn-peers-body">
+                        <tr><td colspan="7" class="vpn-peers-empty">"Loading…"</td></tr>
                     </tbody>
                 </table>
             </div>
+            <p class="vpn-note" id="vpn-uplink-detail"></p>
         </div>
     }
 }
 
-#[component]
-fn VpnShortcutModal() -> impl IntoView {
-    view! {
-        <div class="modal-backdrop" id="vpn-shortcut-modal" hidden>
-            <div class="modal-card vpn-shortcut-modal">
-                <div class="modal-header">
-                    <h2 class="modal-title">"Add VPN peer?"</h2>
-                    <button type="button" class="modal-close" data-close-vpn-shortcut>"×"</button>
-                </div>
-                <p class="card-body-text vpn-shortcut-copy">
-                    "This shortcut was opened from a scanned Kaonic QR code."
-                </p>
-                <div class="info-row vpn-shortcut-peer-row">
-                    <span class="info-label">"Peer hash"</span>
-                    <code class="info-value vpn-shortcut-peer" id="vpn-shortcut-peer">"—"</code>
-                </div>
-                <div class="info-row vpn-shortcut-peer-row" id="vpn-shortcut-codename-row" hidden>
-                    <span class="info-label">"Codename"</span>
-                    <code class="info-value vpn-shortcut-peer" id="vpn-shortcut-codename">"—"</code>
-                </div>
-                <div class="modal-actions">
-                    <button type="button" class="btn-secondary" data-close-vpn-shortcut>"Cancel"</button>
-                    <button type="button" class="btn-primary" id="vpn-shortcut-confirm">"Add peer"</button>
-                </div>
-            </div>
-        </div>
-    }
-}
+// ── This device ───────────────────────────────────────────────────────────────
 
-// ── This Device card ──────────────────────────────────────────────────────────
-
+/// Everything about *this* node, in one panel: what it is on the tunnel, what
+/// it offers, and whether it forwards for anyone.
+///
+/// These were two cards. They answered the same question from two sides — what
+/// this device is and what it gives out — and separating them meant reading
+/// half the story, scrolling, and reading the other half.
 #[component]
-fn VpnThisDeviceCard(
+fn VpnDeviceCard(
     local_hash: String,
-    codename: String,
     local_routes: Vec<String>,
-    advertised_routes: Vec<String>,
     interface_name: Option<String>,
     backend: String,
+    tunnel_ip: Option<String>,
+    network: String,
+    codename: String,
+    wlan0_ip: Option<String>,
+    usb0_ip: Option<String>,
 ) -> impl IntoView {
     let iface = interface_name.unwrap_or_else(|| "—".into());
-    let _ = advertised_routes;
-    let add_peer_url = vpn_add_peer_url(&local_hash, &codename);
-    let qr_svg = render_hash_qr_svg(&add_peer_url);
-    let hash_rows = split_hash_rows(&local_hash, 8);
-    let local_hash_display = local_hash.clone();
-    let local_hash_copy = local_hash.clone();
-    let codename_display = codename.clone();
+    let tunnel_ip = tunnel_ip.unwrap_or_else(|| "—".into());
+    let wlan0 = wlan0_ip.unwrap_or_else(|| "not connected".into());
+    let usb0 = usb0_ip.unwrap_or_else(|| "not connected".into());
     let backend_badge = format!(
         "badge {}",
         if backend == "linux" {
@@ -498,70 +496,59 @@ fn VpnThisDeviceCard(
             "reticulum-badge-soft"
         }
     );
+    let route_count = local_routes.len();
+
     view! {
-        <div class="card">
+        <div class="card vpn-device-card">
             <div class="card-header">
                 <span class="card-title">"This Device"</span>
-                <div style="display:flex;gap:8px;align-items:center;">
-                    <span class=backend_badge id="vpn-backend">{backend}</span>
-                    <button type="button" class="btn-secondary" style="padding:4px 12px;font-size:13px;" data-open-vpn-routes>
+                <span class=backend_badge id="vpn-backend">{backend}</span>
+            </div>
+
+            // ── Identity ────────────────────────────────────────────────────
+            <div class="vpn-section">
+                <div class="vpn-section-title">"Identity"</div>
+                <dl class="vpn-facts">
+                    <dt>"Codename"</dt><dd>{codename}</dd>
+                    <dt>"Node hash"</dt>
+                    <dd><code class="vpn-facts-mono">{local_hash.clone()}</code></dd>
+                </dl>
+            </div>
+
+            // ── Tunnel ──────────────────────────────────────────────────────
+            <div class="vpn-section">
+                <div class="vpn-section-title">"Tunnel"</div>
+                <dl class="vpn-facts">
+                    <dt>"Address"</dt>
+                    <dd><code class="vpn-facts-mono vpn-facts-accent">{tunnel_ip}</code></dd>
+                    <dt>"Network"</dt><dd><code class="vpn-facts-mono">{network}</code></dd>
+                    <dt>"Interface"</dt><dd><code class="vpn-facts-mono">{iface}</code></dd>
+                </dl>
+            </div>
+
+            // ── Local networks ──────────────────────────────────────────────
+            <div class="vpn-section">
+                <div class="vpn-section-title">"Local networks"</div>
+                <dl class="vpn-facts">
+                    <dt>"Wi-Fi"</dt><dd><code class="vpn-facts-mono">{wlan0}</code></dd>
+                    <dt>"USB"</dt><dd><code class="vpn-facts-mono">{usb0}</code></dd>
+                </dl>
+            </div>
+
+            // ── What peers can see ──────────────────────────────────────────
+            <div class="vpn-section">
+                <div class="vpn-section-title vpn-section-title--action">
+                    <span>"Offered to peers"</span>
+                    <button type="button" class="btn-secondary btn-small" data-open-vpn-routes>
                         "Advertise routes"
                     </button>
                 </div>
-            </div>
-
-            // Interface row
-            <div class="info-row">
-                <span class="info-label">"Interface"</span>
-                <span class="info-value" id="vpn-interface">{iface}</span>
-            </div>
-
-            // Identity
-            <div class="info-row">
-                <span class="info-label">"Identity"</span>
-                <code class="info-value vpn-hash-display" id="vpn-identity-short">
-                    {local_hash_display}
-                </code>
-            </div>
-
-            {qr_svg.map(|svg| view! {
-                <div class="vpn-hash-qr-block">
-                    <div class="vpn-hash-qr-side">
-                        <div class="vpn-hash-qr" inner_html=svg></div>
-                        <p class="vpn-hash-qr-caption">
-                            "Scan with a camera app to open an add-peer shortcut"
-                        </p>
-                    </div>
-                    <div class="vpn-hash-qr-meta">
-                        <div class="vpn-hash-qr-rows">
-                            {hash_rows.iter().map(|row| view! {
-                                <code class="vpn-hash-qr-row">{row.clone()}</code>
-                            }).collect_view()}
-                        </div>
-                        <div class="vpn-hash-qr-codename">{codename_display.clone()}</div>
-                        <button
-                            type="button"
-                            class="btn-secondary vpn-hash-qr-copy"
-                            data-vpn-copy=local_hash_copy.clone()
-                        >
-                            "Copy"
-                        </button>
-                    </div>
-                </div>
-            })}
-
-            // Advertised routes (alias → local)
-            <div style="margin-top:12px;">
-                <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--text-muted);margin-bottom:8px;">
-                    "Exported VPN aliases"
-                </div>
                 <div class="vpn-route-list" id="vpn-local-routes-list">
-                    {if local_routes.is_empty() {
+                    {if route_count == 0 {
                         view! {
                             <p class="vpn-setup-empty">
-                                "Nothing exported yet. Use "
-                                <em>"Advertise routes"</em>
-                                " to share a local subnet."
+                                "Nothing offered yet. " <em>"Advertise routes"</em>
+                                " shares a local subnet with paired nodes."
                             </p>
                         }.into_any()
                     } else {
@@ -579,304 +566,45 @@ fn VpnThisDeviceCard(
                     }}
                 </div>
             </div>
-        </div>
-    }
-}
 
-// ── Laptop Setup card ─────────────────────────────────────────────────────────
-
-#[component]
-fn VpnLaptopSetupCard(installed_routes: Vec<String>) -> impl IntoView {
-    let has_routes = !installed_routes.is_empty();
-    view! {
-        <div class="card">
-            <div class="card-header">
-                <span class="card-title">"Client Access"</span>
-            </div>
-            <p class="card-body-text" style="margin-bottom:12px;">
-                "Clients connected directly to this device's AP or USB network should reach remote VPN aliases automatically. Each remote Kaonic keeps its own local subnet unchanged."
-            </p>
-            <div class="vpn-setup-list" id="vpn-setup-commands">
-                {if !has_routes {
-                    view! {
-                        <p class="vpn-setup-empty">"Waiting for remote peer routes…"</p>
-                        <p class="vpn-setup-note">
-                            "Remote VPN aliases will appear here once a peer is connected and has advertised its local subnet."
-                        </p>
-                    }.into_any()
-                } else {
-                    installed_routes.into_iter().map(|net| {
-                        let wget_cmd = serial_test_ip(&net)
-                            .map(|ip| format!("wget -qO- http://{ip}/api/serial"));
-                        view! {
-                            {wget_cmd.map(|cmd| {
-                                let cmd_copy = cmd.clone();
-                                view! {
-                                    <div class="vpn-setup-cmd">
-                                        <span class="vpn-setup-cmd-text">{cmd}</span>
-                                        <button
-                                            type="button"
-                                            class="vpn-copy-btn"
-                                            data-vpn-copy=cmd_copy
-                                        >"Copy"</button>
-                                    </div>
-                                }.into_any()
-                            }).unwrap_or_else(|| view! { <span></span> }.into_any())}
-                        }
-                    }).collect_view().into_any()
-                }}
-            </div>
-        </div>
-    }
-}
-
-// ── Peers card ────────────────────────────────────────────────────────────────
-
-#[component]
-fn VpnPeersCard(peers: Vec<VpnPeerSnapshot>) -> impl IntoView {
-    let count = peers.len();
-    view! {
-        <div class="card" style="margin-bottom:18px;">
-            <div class="card-header">
-                <span class="card-title">"Connected Peers"</span>
-                <span class="badge reticulum-badge-soft" id="vpn-peers-badge">
-                    {count}" peer"{if count == 1 { "" } else { "s" }}
-                </span>
-            </div>
-            <div class="vpn-peers-list" id="vpn-peers">
-                {if peers.is_empty() {
-                    view! {
-                        <div class="vpn-empty-peers">
-                            <div style="font-size:28px;opacity:.4;margin-bottom:8px;">"📡"</div>
-                            <div style="font-weight:600;margin-bottom:6px;">"No peers discovered yet"</div>
-                            <div style="font-size:13px;max-width:340px;line-height:1.6;">
-                                "Peers appear automatically once a remote kaonic device is within radio range and running the same VPN network configuration."
-                            </div>
-                        </div>
-                    }.into_any()
-                } else {
-                    peers.into_iter().map(|peer| {
-                        let tunnel_ip = peer.tunnel_ip.clone().unwrap_or_else(|| "—".into());
-                        let has_ip = peer.tunnel_ip.is_some();
-                        let ip_class = if has_ip {
-                            "vpn-peer-ip"
-                        } else {
-                            "vpn-peer-ip vpn-peer-ip--none"
-                        };
-                        let hash_full = peer.destination.clone();
-                        let dot_class = peer_dot_class(&peer.link_state);
-                        let state_badge = format!("badge {}", vpn_badge_class(&peer.link_state));
-                        let last_seen = format_relative_time(peer.last_seen_ts);
-                        let ping_ip = peer.tunnel_ip.clone().unwrap_or_default();
-                        let ping_disabled = !has_ip;
-                        let speed_disabled = !has_ip;
-                        let tx_bps_str = format_bps(peer.tx_bps);
-                        let rx_bps_str = format_bps(peer.rx_bps);
-                        let tx_bytes_str = format_bytes(peer.tx_bytes);
-                        let rx_bytes_str = format_bytes(peer.rx_bytes);
-                        let tx_packets = peer.tx_packets;
-                        let rx_packets = peer.rx_packets;
-
-                        view! {
-                            <div class="vpn-peer-row">
-                                // Status dot + identity
-                                <div class="vpn-peer-left">
-                                    <span class=dot_class></span>
-                                    <div class="vpn-peer-ident">
-                                        <div class="vpn-peer-field">
-                                            <span class="vpn-peer-field-label">"Tunnel"</span>
-                                            <span class=ip_class>{tunnel_ip}</span>
-                                        </div>
-                                        <div class="vpn-peer-field">
-                                            <span class="vpn-peer-field-label">"Peer"</span>
-                                            <code class="vpn-peer-hash">{hash_full.clone()}</code>
-                                        </div>
-                                    </div>
-                                </div>
-
-                                // Announced route tags
-                                <div class="vpn-peer-routes">
-                                    <span class="vpn-peer-section-label">"Routes"</span>
-                                    <div class="vpn-peer-routes-list">
-                                        {if peer.announced_routes.is_empty() {
-                                            view! {
-                                                <span class="badge reticulum-badge-soft" style="opacity:.6;">"no routes"</span>
-                                            }.into_any()
-                                        } else {
-                                            peer.announced_routes.iter().map(|r| view! {
-                                                <span class="vpn-route-tag">{r.clone()}</span>
-                                            }).collect_view().into_any()
-                                        }}
-                                    </div>
-                                </div>
-
-                                // Traffic: tx/rx speed + totals
-                                <div class="vpn-peer-traffic">
-                                    <div class="vpn-peer-traffic-row">
-                                        <span class="vpn-peer-traffic-dir">"TX"</span>
-                                        <span class="vpn-peer-traffic-rate">{tx_bps_str}</span>
-                                        <span class="vpn-peer-traffic-total" title=format!("{tx_packets} packets")>
-                                            {tx_bytes_str}
-                                        </span>
-                                    </div>
-                                    <div class="vpn-peer-traffic-row">
-                                        <span class="vpn-peer-traffic-dir">"RX"</span>
-                                        <span class="vpn-peer-traffic-rate">{rx_bps_str}</span>
-                                        <span class="vpn-peer-traffic-total" title=format!("{rx_packets} packets")>
-                                            {rx_bytes_str}
-                                        </span>
-                                    </div>
-                                </div>
-
-                                // Meta: last seen + link state
-                                <div class="vpn-peer-meta">
-                                    <div class="vpn-peer-field vpn-peer-field--meta">
-                                        <span class="vpn-peer-field-label">"Seen"</span>
-                                        <span class="vpn-peer-lastseen">{last_seen}</span>
-                                    </div>
-                                    <div class="vpn-peer-field vpn-peer-field--meta">
-                                        <span class="vpn-peer-field-label">"State"</span>
-                                        <span class=state_badge>{peer.link_state.clone()}</span>
-                                    </div>
-                                </div>
-
-                                // Ping
-                                <div class="vpn-peer-actions">
-                                    <div class="vpn-peer-action-buttons">
-                                        <button
-                                            type="button"
-                                            class="btn-secondary vpn-ping-btn"
-                                            data-vpn-ping
-                                            data-peer-key=hash_full.clone()
-                                            data-peer-ip=ping_ip.clone()
-                                            disabled=ping_disabled
-                                        >"Ping"</button>
-                                        <button
-                                            type="button"
-                                            class="btn-secondary vpn-speed-btn"
-                                            data-vpn-speed-test
-                                            data-peer-key=hash_full.clone()
-                                            data-peer-ip=ping_ip
-                                            disabled=speed_disabled
-                                        >"Test speed"</button>
-                                    </div>
-                                    <div
-                                        class="vpn-ping-status"
-                                        data-vpn-ping-status=hash_full
-                                    ></div>
-                                    <div
-                                        class="vpn-ping-status"
-                                        data-vpn-speed-status=peer.destination.clone()
-                                    ></div>
-                                </div>
-                            </div>
-                        }
-                    }).collect_view().into_any()
-                }}
-            </div>
-        </div>
-    }
-}
-
-// ── Advanced / Debug section ──────────────────────────────────────────────────
-
-#[component]
-fn VpnDebugSection(local_hash: String, vpn: VpnSnapshot) -> impl IntoView {
-    view! {
-        <details class="vpn-advanced">
-            <summary>"Advanced / Debug"</summary>
-            <div class="vpn-advanced-body">
-                // Identity
-                <div>
-                    <div class="vpn-adv-stat-label" style="margin-bottom:6px;">"Full Identity Hash"</div>
-                    <code class="td-hex td-hash" style="font-size:12px;word-break:break-all;">
-                        {local_hash}
-                    </code>
+            // ── Acting as a router ──────────────────────────────────────────
+            <div class="vpn-section vpn-section--last">
+                <div class="vpn-section-title vpn-section-title--action">
+                    <span>"Share with peers"</span>
+                    <span class="badge" id="vpn-gateway-badge">"Off"</span>
                 </div>
-
-                // Route mapping table
-                <div>
-                    <div class="vpn-adv-stat-label" style="margin-bottom:8px;">"Local → VPN Alias Mapping"</div>
-                    <div class="reticulum-table-wrap">
-                        <table class="frames-table">
-                            <thead>
-                                <tr>
-                                    <th>"Local subnet"</th>
-                                    <th>"Tunnel IP"</th>
-                                    <th>"Exported VPN alias"</th>
-                                </tr>
-                            </thead>
-                            <tbody id="vpn-route-mappings">
-                                {if vpn.route_mappings.is_empty() {
-                                    view! {
-                                        <tr><td colspan="3" class="frames-empty">"No local route mappings yet"</td></tr>
-                                    }.into_any()
-                                } else {
-                                    vpn.route_mappings.into_iter().map(|mapping| {
-                                        view! {
-                                            <tr>
-                                                <td class="td-hex">{mapping.subnet}</td>
-                                                <td class="td-hex">{mapping.tunnel}</td>
-                                                <td class="td-hex">{mapping.mapped_subnet}</td>
-                                            </tr>
-                                        }
-                                    }).collect_view().into_any()
-                                }}
-                            </tbody>
-                        </table>
+                <p class="card-body-text">
+                    "Forward paired nodes' traffic onto a local network, or this device's whole internet connection."
+                </p>
+                <div class="vpn-share-controls">
+                    <label class="feature-switch">
+                        <input type="checkbox" id="vpn-gateway-toggle"/>
+                        <span class="feature-switch-track"><span class="feature-switch-thumb"></span></span>
+                        <span class="feature-switch-label">"Act as a router"</span>
+                    </label>
+                </div>
+                <div class="vpn-share-body">
+                    <label class="vpn-field-label" for="vpn-gateway-routes">"Networks to share"</label>
+                    <input
+                        type="text"
+                        id="vpn-gateway-routes"
+                        class="form-input"
+                        placeholder="192.168.5.0/24, or 0.0.0.0/0 for the whole connection"
+                    />
+                    <div class="vpn-share-presets">
+                        <button type="button" class="btn-secondary btn-small" data-vpn-preset="lan">"Local LAN"</button>
+                        <button type="button" class="btn-secondary btn-small" data-vpn-preset="internet">"Whole connection"</button>
                     </div>
+                    <button type="button" class="btn-primary btn-small" id="vpn-gateway-apply">
+                        "Apply"
+                    </button>
                 </div>
-
-                // Remote routes table
-                <div>
-                    <div class="vpn-adv-stat-label" style="margin-bottom:8px;">"Remote VPN Aliases"</div>
-                    <div class="reticulum-table-wrap">
-                        <table class="frames-table">
-                            <thead>
-                                <tr>
-                                    <th>"VPN alias"</th>
-                                    <th>"Owner"</th>
-                                    <th>"Status"</th>
-                                    <th>"Last seen"</th>
-                                    <th>"Installed"</th>
-                                </tr>
-                            </thead>
-                            <tbody id="vpn-routes">
-                                {if vpn.remote_routes.is_empty() {
-                                    view! {
-                                        <tr><td colspan="5" class="frames-empty">"No remote routes yet"</td></tr>
-                                    }.into_any()
-                                } else {
-                                    vpn.remote_routes.into_iter().map(|route| {
-                                        let state_class = format!("badge {}", vpn_badge_class(&route.status));
-                                        let installed_class = format!("badge {}", vpn_badge_class(if route.installed { "yes" } else { "no" }));
-                                        view! {
-                                            <tr>
-                                                <td class="td-hex">{route.network}</td>
-                                                <td class="td-hex td-hash" style="font-size:11px;">
-                                                    {truncate_hash(&route.owner)}
-                                                </td>
-                                                <td><span class=state_class>{route.status}</span></td>
-                                                <td class="td-time">{format_relative_time(route.last_seen_ts)}</td>
-                                                <td>
-                                                    <span class=installed_class>
-                                                        {if route.installed { "yes" } else { "no" }}
-                                                    </span>
-                                                </td>
-                                            </tr>
-                                        }
-                                    }).collect_view().into_any()
-                                }}
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
+                <p class="vpn-note" id="vpn-gateway-detail"></p>
             </div>
-        </details>
+        </div>
     }
 }
 
-// ── Route editor modal ────────────────────────────────────────────────────────
 
 #[component]
 fn VpnRouteEditorModal(advertised_routes: Vec<String>) -> impl IntoView {
@@ -913,906 +641,589 @@ fn VpnRouteEditorModal(advertised_routes: Vec<String>) -> impl IntoView {
 
 // ── WebSocket live-update script ──────────────────────────────────────────────
 
-const VPN_WS_JS: &str = r#"
-(function() {
-    var pingState = Object.create(null);
-    var speedState = Object.create(null);
-    var accessState = loadAccessState();
-    var shortcutState = { peer: '', codename: '' };
+const VPN_JS: &str = r#"
+(function () {
+    var state = window.__vpn || { paired: [], gateway: {}, uplink: {} };
+    var peers = state.peers || [];
+    var renderedKeys = null;
+    // True while a share change is in flight, so a status frame cannot yank
+    // the control out from under the request that is still being answered.
+    var shareBusy = false;
+    var shareError = false;
+    var HISTORY = 60;
+    var rx = [], tx = [], peakRx = 0, peakTx = 0;
+    var lastBytes = null, lastTs = 0;
 
-    // ── Utilities ──────────────────────────────────────────────────────────
-
-    function shouldPause() {
-        if (document.body.classList.contains('modal-open')) { return true; }
-        var a = document.activeElement;
-        if (a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.tagName === 'SELECT' || a.isContentEditable)) { return true; }
-        var sel = window.getSelection ? window.getSelection() : null;
-        return !!(sel && !sel.isCollapsed && String(sel).trim().length > 0);
-    }
-
+    function el(id) { return document.getElementById(id); }
+    function setText(id, text) { var e = el(id); if (e) { e.textContent = text; } }
     function esc(v) {
         return String(v == null ? '' : v)
             .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
             .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }
-
-    function setText(id, text) {
-        var el = document.getElementById(id);
-        if (el) el.textContent = text;
+    function fmtRate(bps) {
+        if (bps >= 1048576) { return (bps / 1048576).toFixed(1) + ' MB/s'; }
+        if (bps >= 1024) { return (bps / 1024).toFixed(1) + ' KB/s'; }
+        return Math.round(bps) + ' B/s';
+    }
+    function fmtBytes(n) {
+        n = Number(n) || 0;
+        if (n >= 1073741824) { return (n / 1073741824).toFixed(2) + ' GB'; }
+        if (n >= 1048576) { return (n / 1048576).toFixed(1) + ' MB'; }
+        if (n >= 1024) { return (n / 1024).toFixed(1) + ' KB'; }
+        return n + ' B';
     }
 
-    function fmtBytes(b) {
-        b = Number(b) || 0;
-        if (b >= 1048576) { return (b / 1048576).toFixed(1) + ' MB'; }
-        if (b >= 1024) { return (b / 1024).toFixed(1) + ' KB'; }
-        return b + ' B';
-    }
-
-    function fmtBps(b) {
-        b = Number(b) || 0;
-        if (b >= 1000000) { return (b / 1000000).toFixed(1) + ' Mbps'; }
-        if (b >= 1000)    { return (b / 1000).toFixed(1) + ' Kbps'; }
-        return b + ' bps';
-    }
-
-    function serialTestIp(route) {
-        var network = String(route || '').split('/')[0] || '';
-        var octets = network.trim().split('.');
-        if (octets.length !== 4 || octets[3] !== '0') { return ''; }
-        return octets[0] + '.' + octets[1] + '.' + octets[2] + '.1';
-    }
-
-    function loadAccessState() {
-        var root = document.getElementById('vpn-access-card');
-        if (!root) { return { allowAll: true, peers: [], saving: false }; }
-        var peers = [];
-        try { peers = JSON.parse(root.getAttribute('data-peers') || '[]') || []; } catch (_) {}
-        return {
-            allowAll: root.getAttribute('data-allow-all') === 'true',
-            peers: peers.filter(Boolean),
-            saving: false
-        };
-    }
-
-    function validPeerHash(value) {
-        return /^[0-9a-fA-F]{32}$/.test(String(value || '').trim());
-    }
-
-    function validCodename(value) {
-        return /^[a-z0-9]{8}$/.test(String(value || '').trim());
-    }
-
-    function setAccessStatus(text, kind) {
-        var el = document.getElementById('vpn-access-status');
-        if (!el) { return; }
-        el.textContent = text || '';
-        el.className = 'vpn-access-status' + (kind ? ' ' + kind : '');
-    }
-
-    function renderAccessTable() {
-        var body = document.getElementById('vpn-allowlist-table');
-        var toggle = document.getElementById('vpn-allow-all-toggle');
-        var badge = document.getElementById('vpn-access-mode-badge');
-        if (!(body instanceof HTMLElement)) { return; }
-        if (toggle instanceof HTMLInputElement) {
-            toggle.checked = !!accessState.allowAll;
+    // ── Traffic chart ──────────────────────────────────────────────────────
+    // Same shape as the dashboard's radio charts: in above the line, out
+    // below, so direction reads without a legend.
+    function draw(inRate, outRate) {
+        var svg = el('vpn-chart');
+        if (!svg) { return; }
+        var W = 600, H = 160, mid = H / 2, pad = 6;
+        var max = 1;
+        for (var i = 0; i < rx.length; i++) { max = Math.max(max, rx[i], tx[i]); }
+        var step = Math.pow(2, Math.ceil(Math.log(max) / Math.log(2)));
+        var scale = (mid - pad) / step;
+        function path(series, dir) {
+            var n = HISTORY, d = '', x0 = 0;
+            var start = n - series.length;
+            d += 'M' + ((start / (n - 1)) * W).toFixed(1) + ',' + mid;
+            for (var i = 0; i < series.length; i++) {
+                var x = ((start + i) / (n - 1)) * W;
+                d += 'L' + x.toFixed(1) + ',' + (mid - dir * series[i] * scale).toFixed(1);
+                x0 = x;
+            }
+            return d + 'L' + x0.toFixed(1) + ',' + mid + 'Z';
         }
-        if (badge) {
-            badge.textContent = accessState.allowAll ? 'Allow all peers' : 'Allowlist only';
-            badge.className = accessState.allowAll ? 'badge badge-ok' : 'badge badge-warn';
+        var grid = '';
+        for (var g = 1; g <= 3; g++) {
+            var gy = (mid - pad) * g / 4;
+            grid += '<line class="tg-grid" x1="0" x2="' + W + '" y1="' + (mid - gy).toFixed(1) + '" y2="' + (mid - gy).toFixed(1) + '"/>';
+            grid += '<line class="tg-grid" x1="0" x2="' + W + '" y1="' + (mid + gy).toFixed(1) + '" y2="' + (mid + gy).toFixed(1) + '"/>';
         }
-        body.innerHTML = accessState.peers.length
-            ? accessState.peers.map(function(peer) {
-                return '<tr data-vpn-allow-peer="' + esc(peer) + '">'
-                    + '<td><code>' + esc(peer) + '</code></td>'
-                    + '<td class="vpn-access-actions"><button type="button" class="btn-secondary vpn-allowlist-remove" data-vpn-remove-peer="' + esc(peer) + '">Remove</button></td>'
-                    + '</tr>';
-            }).join('')
-            : '<tr class="vpn-allowlist-empty-row" id="vpn-allowlist-empty-row"><td colspan="2">No allowlist entries saved.</td></tr>';
+        svg.innerHTML =
+            '<defs><linearGradient id="vpn-g-rx" x1="0" y1="0" x2="0" y2="1">' +
+            '<stop offset="0%" stop-color="rgba(52,208,88,.85)"/><stop offset="100%" stop-color="rgba(52,208,88,.08)"/></linearGradient>' +
+            '<linearGradient id="vpn-g-tx" x1="0" y1="0" x2="0" y2="1">' +
+            '<stop offset="0%" stop-color="rgba(13,203,240,.08)"/><stop offset="100%" stop-color="rgba(13,203,240,.85)"/></linearGradient></defs>' +
+            grid +
+            '<path class="tg-area tg-rx" fill="url(#vpn-g-rx)" d="' + path(rx, 1) + '"/>' +
+            '<path class="tg-area tg-tx" fill="url(#vpn-g-tx)" d="' + path(tx, -1) + '"/>' +
+            '<line class="tg-mid" x1="0" x2="' + W + '" y1="' + mid + '" y2="' + mid + '"/>';
+        // The viewBox is stretched to the card width, so anything drawn inside
+        // it is stretched too. Areas survive that; letterforms do not, so the
+        // scale is reported in HTML beside the title instead.
+        setText('vpn-chart-scale', '\u00b1' + fmtRate(step) + ' full scale');
+        setText('vpn-rx-rate', fmtRate(inRate));
+        setText('vpn-tx-rate', fmtRate(outRate));
+        setText('vpn-rx-peak', 'peak ' + fmtRate(peakRx));
+        setText('vpn-tx-peak', 'peak ' + fmtRate(peakTx));
     }
 
-    function saveAccessState(successText) {
-        accessState.saving = true;
-        setAccessStatus('Saving…', '');
-        return fetch('/api/vpn/access', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                allow_all_peers: !!accessState.allowAll,
-                peers: accessState.peers.slice()
-            })
-        }).then(function(resp) {
-            return resp.text().then(function(t) {
-                var d = {};
-                try { d = t ? JSON.parse(t) : {}; } catch (_) { d = {}; }
-                if (!resp.ok) {
-                    throw new Error((d && d.status) || (d && d.error) || t || 'Failed to save');
-                }
-                accessState.allowAll = !!d.allow_all_peers;
-                accessState.peers = Array.isArray(d.peers) ? d.peers.slice() : accessState.peers;
-                renderAccessTable();
-                setAccessStatus(successText || d.status || 'Saved', 'flash-ok');
-            });
-        }).catch(function(err) {
-            renderAccessTable();
-            setAccessStatus(err && err.message ? err.message : 'Failed to save', 'flash-err');
-        }).finally(function() {
-            accessState.saving = false;
-        });
+    // A short scroll of what is actually crossing the tunnel. Summaries only —
+    // no payloads are captured — but enough to answer "is my traffic going
+    // over the radio, and what is it" without reaching for tcpdump.
+    function renderWire(recent) {
+        var list = el('vpn-wire-list');
+        var pause = el('vpn-wire-pause');
+        if (!list || (pause && pause.checked)) { return; }
+        if (!recent || !recent.length) {
+            if (!list.querySelector('.vpn-wire-empty')) {
+                list.innerHTML = '<div class="vpn-wire-empty">Waiting for traffic…</div>';
+            }
+            return;
+        }
+        list.innerHTML = recent.map(function (p) {
+            var t = new Date((p.ts || 0) * 1000);
+            var stamp = String(t.getHours()).padStart(2, '0') + ':' +
+                String(t.getMinutes()).padStart(2, '0') + ':' +
+                String(t.getSeconds()).padStart(2, '0') + '.' +
+                String(p.ms || 0).padStart(3, '0');
+            var out = p.dir === 'tx';
+            // The port is what separates one flow from another on the same
+            // pair of hosts, so it belongs with the address, not in a column
+            // of its own that would be empty for ICMP.
+            function endpoint(addr, port) {
+                return esc(addr) + (port == null ? '' : '<span class="vpn-wire-port">:' + port + '</span>');
+            }
+            return '<div class="vpn-wire-row ' + (out ? 'is-tx' : 'is-rx') + '">' +
+                '<span class="vpn-wire-time">' + stamp + '</span>' +
+                '<span class="vpn-wire-dir">' + (out ? '\u25b2' : '\u25bc') + '</span>' +
+                '<span class="vpn-wire-addr">' + endpoint(p.src, p.sport) + '</span>' +
+                '<span class="vpn-wire-arrow">\u2192</span>' +
+                '<span class="vpn-wire-addr">' + endpoint(p.dst, p.dport) + '</span>' +
+                '<span class="vpn-wire-proto">' + esc(p.proto) + '</span>' +
+                '<span class="vpn-wire-len">' + (p.len || 0) + ' B</span>' +
+                '</div>';
+        }).join('');
     }
 
-    function fmtRelative(ts) {
+    function sampleTraffic(snap) {
+        var now = Date.now();
+        var inRate = 0, outRate = 0;
+        if (lastBytes) {
+            var dt = Math.max(0.25, (now - lastTs) / 1000);
+            inRate = Math.max(0, snap.rx_bytes - lastBytes.rx) / dt;
+            outRate = Math.max(0, snap.tx_bytes - lastBytes.tx) / dt;
+        }
+        lastBytes = { rx: snap.rx_bytes || 0, tx: snap.tx_bytes || 0 };
+        lastTs = now;
+        rx.push(inRate); tx.push(outRate);
+        if (rx.length > HISTORY) { rx.shift(); tx.shift(); }
+        peakRx = Math.max(peakRx, inRate); peakTx = Math.max(peakTx, outRate);
+        draw(inRate, outRate);
+        setText('vpn-rx-packets', String(snap.rx_packets || 0));
+        setText('vpn-tx-packets', String(snap.tx_packets || 0));
+        setText('vpn-rx-bytes', fmtBytes(snap.rx_bytes));
+        setText('vpn-tx-bytes', fmtBytes(snap.tx_bytes));
+        setText('vpn-traffic-total', fmtBytes(snap.rx_bytes) + ' in / ' + fmtBytes(snap.tx_bytes) + ' out');
+        setText('vpn-peer-count', String((snap.peers || []).length));
+        if (snap.local_tunnel_ip) { setText('vpn-local-ip', snap.local_tunnel_ip); }
+    }
+
+    // ── Route through ──────────────────────────────────────────────────────
+
+    // ── Peer table ─────────────────────────────────────────────────────────
+
+    function peerName(peer) {
+        return peer.tag || peer.codename || (peer.destination || '').slice(0, 8);
+    }
+
+    function ago(ts) {
         if (!ts) { return 'never'; }
-        var diff = Math.floor(Date.now() / 1000) - Number(ts);
-        if (diff < 3)    { return 'just now'; }
-        if (diff < 60)   { return diff + 's ago'; }
-        if (diff < 3600) { return Math.floor(diff / 60) + 'm ago'; }
-        return Math.floor(diff / 3600) + 'h ago';
+        var secs = Math.max(0, Math.floor(Date.now() / 1000) - ts);
+        if (secs < 5) { return 'just now'; }
+        if (secs < 60) { return secs + ' sec ago'; }
+        if (secs < 3600) { return Math.floor(secs / 60) + ' min ago'; }
+        if (secs < 86400) { return Math.floor(secs / 3600) + ' hr ago'; }
+        return Math.floor(secs / 86400) + ' d ago';
     }
 
-    function vpnBadgeClass(v) {
-        v = String(v || '').trim().toLowerCase();
-        if (v === 'running' || v === 'active' || v === 'ready' || v === 'installed' || v === 'yes') { return 'badge-ok'; }
-        if (v === 'discovered' || v === 'configured' || v === 'pending' || v === 'starting') { return 'badge-warn'; }
-        if (v === 'error' || v === 'closed' || v === 'failed' || v === 'no' || v === 'drop') { return 'badge-err'; }
-        return 'reticulum-badge-soft';
-    }
-
-    function statusDotClass(s) {
-        s = String(s || '').toLowerCase().trim();
-        if (s === 'running') { return 'status-dot status-dot--ok'; }
-        if (s === 'error')   { return 'status-dot status-dot--err'; }
-        if (s === 'mock')    { return 'status-dot status-dot--idle'; }
-        return 'status-dot status-dot--warn';
-    }
-
-    function bannerClass(s) {
-        s = String(s || '').toLowerCase().trim();
-        if (s === 'running') { return 'vpn-banner vpn-banner--ok'; }
-        if (s === 'error')   { return 'vpn-banner vpn-banner--err'; }
-        return 'vpn-banner vpn-banner--idle';
-    }
-
-    function peerDotClass(s) {
-        s = String(s || '').trim().toLowerCase();
-        if (s === 'active') { return 'status-dot status-dot--ok'; }
-        if (s === 'pending' || s === 'starting' || s === 'configured' || s === 'discovered') { return 'status-dot status-dot--warn'; }
-        if (s === 'closed' || s === 'error' || s === 'failed') { return 'status-dot status-dot--err'; }
+    function linkDot(linkState) {
+        if (linkState === 'active') { return 'status-dot status-dot--ok'; }
+        if (linkState === 'pending') { return 'status-dot status-dot--warn'; }
         return 'status-dot status-dot--idle';
     }
 
-    function flashCopyButton(btn, label) {
-        if (!btn) { return; }
-        btn.textContent = label;
-        btn.classList.add('copied');
-        setTimeout(function() {
-            btn.textContent = 'Copy';
-            btn.classList.remove('copied');
-        }, 1800);
+    // Rows are built once and then patched in place. Replacing the tbody on
+    // every socket frame reflowed the table under the pointer and threw away
+    // whatever a ping had just written into it — which is what made clicking
+    // Ping feel like the table jumped away from you.
+    function rowKeys() {
+        return peers.map(function (p) { return p.destination; }).join('|');
     }
 
-    function fallbackCopyText(text) {
-        var input = document.createElement('textarea');
-        input.value = text;
-        input.setAttribute('readonly', '');
-        input.style.position = 'fixed';
-        input.style.top = '-1000px';
-        input.style.left = '-1000px';
-        document.body.appendChild(input);
-        input.focus();
-        input.select();
-        var ok = false;
-        try { ok = document.execCommand('copy'); } catch (_) {}
-        document.body.removeChild(input);
-        return ok;
-    }
-
-    function copyText(text) {
-        if (!text) { return Promise.resolve(false); }
-        if (navigator.clipboard && window.isSecureContext) {
-            return navigator.clipboard.writeText(text).then(function() { return true; }).catch(function() {
-                return fallbackCopyText(text);
-            });
-        }
-        return Promise.resolve(fallbackCopyText(text));
-    }
-
-    function shortHash(h) {
-        var c = String(h || '').replace(/\s+/g, '');
-        return c.length > 16 ? c.substring(0, 16) + '\u2026' : c;
-    }
-
-    function isModalOpen(id) {
-        var modal = document.getElementById(id);
-        return !!(modal instanceof HTMLElement) && !modal.hidden;
-    }
-
-    function syncModalOpenClass() {
-        if (!document.body) { return; }
-        if (isModalOpen('vpn-routes-modal') || isModalOpen('vpn-shortcut-modal')) {
-            document.body.classList.add('modal-open');
-        } else {
-            document.body.classList.remove('modal-open');
-        }
-    }
-
-    function clearAddPeerShortcutParam() {
-        try {
-            var url = new URL(window.location.href);
-            if (!url.searchParams.has('vpn-add-peer')) { return; }
-            url.searchParams.delete('vpn-add-peer');
-            url.searchParams.delete('codename');
-            var next = url.pathname + (url.search ? url.search : '') + (url.hash ? url.hash : '');
-            window.history.replaceState({}, '', next || '/vpn');
-        } catch (_) {}
-    }
-
-    function addPeerToAllowlist(peer, successText) {
-        var normalized = String(peer || '').trim().toLowerCase();
-        if (!validPeerHash(normalized)) {
-            setAccessStatus('Enter a valid destination hash.', 'flash-err');
-            return false;
-        }
-        if (accessState.peers.indexOf(normalized) !== -1) {
-            setAccessStatus('Peer is already in the allowlist.', 'flash-err');
-            return false;
-        }
-        accessState.peers.push(normalized);
-        accessState.peers.sort();
-        renderAccessTable();
-        saveAccessState(successText || 'Peer added');
-        return true;
-    }
-
-    function closeShortcutModal(cancelled) {
-        var modal = document.getElementById('vpn-shortcut-modal');
-        if (!(modal instanceof HTMLElement)) { return; }
-        modal.hidden = true;
-        shortcutState.peer = '';
-        shortcutState.codename = '';
-        syncModalOpenClass();
-        if (cancelled) {
-            setAccessStatus('Peer add cancelled.', '');
-        }
-    }
-
-    function confirmShortcutPeer() {
-        var peer = shortcutState.peer;
-        closeShortcutModal(false);
-        if (!peer) { return; }
-        addPeerToAllowlist(peer, 'Peer added from shortcut');
-    }
-
-    function openShortcutModal(peer, codename) {
-        var modal = document.getElementById('vpn-shortcut-modal');
-        var peerEl = document.getElementById('vpn-shortcut-peer');
-        var codenameEl = document.getElementById('vpn-shortcut-codename');
-        var codenameRow = document.getElementById('vpn-shortcut-codename-row');
-        var confirmBtn = document.getElementById('vpn-shortcut-confirm');
-        if (!(modal instanceof HTMLElement) || !(peerEl instanceof HTMLElement)) { return; }
-        shortcutState.peer = peer;
-        shortcutState.codename = codename || '';
-        peerEl.textContent = peer;
-        if (codenameEl instanceof HTMLElement) {
-            codenameEl.textContent = shortcutState.codename || '—';
-        }
-        if (codenameRow instanceof HTMLElement) {
-            codenameRow.hidden = !shortcutState.codename;
-        }
-        modal.hidden = false;
-        syncModalOpenClass();
-        if (confirmBtn instanceof HTMLButtonElement) {
-            window.setTimeout(function() { confirmBtn.focus(); }, 0);
-        }
-    }
-
-    function maybeHandleAddPeerShortcut() {
-        var params;
-        try {
-            params = new URLSearchParams(window.location.search || '');
-        } catch (_) {
+    function buildRows() {
+        var body = el('vpn-peers-body');
+        if (!body) { return; }
+        if (!peers.length) {
+            body.innerHTML = '<tr><td colspan="7" class="vpn-peers-empty">' +
+                'No peers yet. Only paired nodes join the VPN \u2014 pair one on the Remote page.' +
+                '</td></tr>';
             return;
         }
-        if (!params.has('vpn-add-peer')) { return; }
-        var peer = String(params.get('vpn-add-peer') || '').trim().toLowerCase();
-        var codename = String(params.get('codename') || '').trim().toLowerCase();
-        if (!validPeerHash(peer)) {
-            clearAddPeerShortcutParam();
-            setAccessStatus('Shortcut did not contain a valid destination hash.', 'flash-err');
-            return;
-        }
-        if (codename && !validCodename(codename)) {
-            codename = '';
-        }
-        clearAddPeerShortcutParam();
-        openShortcutModal(peer, codename);
-    }
-
-    // ── Banner + error bar ──────────────────────────────────────────────────
-
-    function updateBanner(vpn) {
-        var banner = document.getElementById('vpn-banner');
-        if (banner) { banner.className = bannerClass(vpn.status || ''); }
-
-        var dot = document.getElementById('vpn-status-dot');
-        if (dot) { dot.className = statusDotClass(vpn.status || ''); }
-
-        setText('vpn-status-text', vpn.status || '—');
-        setText('vpn-local-ip',    vpn.local_tunnel_ip || '—');
-        setText('vpn-network',     vpn.network || '—');
-
-        var peerCount = (vpn.peers || []).length;
-        setText('vpn-peer-count', String(peerCount));
-        var badge = document.getElementById('vpn-peers-badge');
-        if (badge) { badge.textContent = peerCount + ' peer' + (peerCount === 1 ? '' : 's'); }
-
-        var errBar = document.getElementById('vpn-error-bar');
-        if (errBar) { errBar.hidden = !vpn.last_error; }
-        setText('vpn-error-msg', vpn.last_error || '');
-    }
-
-    // ── This Device card ────────────────────────────────────────────────────
-
-    function renderLocalRoutesList(routes) {
-        var el = document.getElementById('vpn-local-routes-list');
-        if (!el) { return; }
-        if (!routes || routes.length === 0) {
-            el.innerHTML = '<p class="vpn-setup-empty">Nothing advertised yet. Use <em>Advertise routes</em> to share a local subnet.</p>';
-            return;
-        }
-        el.innerHTML = routes.map(function(route) {
-            var parts = route.split(' -> ');
-            var alias = (parts[0] || '').trim();
-            var local = parts.length > 1 ? (parts[1] || '').trim() : null;
-            return '<div class="vpn-route-item">'
-                + '<span class="vpn-route-alias">' + esc(alias) + '</span>'
-                + (local ? '<span class="vpn-route-local">\u2192 your ' + esc(local) + '</span>' : '')
-                + '</div>';
+        body.innerHTML = peers.map(function (peer) {
+            var key = esc(peer.destination);
+            return '<tr data-peer="' + key + '">' +
+                '<td><span class="status-dot" data-cell="dot"></span>' +
+                    '<span class="vpn-peers-name" data-cell="name"></span>' +
+                    '<span class="vpn-peers-sub" data-cell="sub"></span>' +
+                '</td>' +
+                '<td class="vpn-peers-ip" data-cell="ip"></td>' +
+                '<td data-cell="link"></td>' +
+                '<td class="vpn-peers-routes" data-cell="offers"></td>' +
+                '<td class="vpn-peers-seen" data-cell="seen"></td>' +
+                '<td data-cell="route"></td>' +
+                '<td class="vpn-peers-ping" data-cell="ping"></td>' +
+                '</tr>';
         }).join('');
+        renderedKeys = rowKeys();
     }
 
-    function setAdvertisedRoutes(routes) {
-        var input = document.getElementById('vpn-routes-editor-input');
-        if (!input || document.body.classList.contains('modal-open')) { return; }
-        routes = Array.isArray(routes) ? routes.filter(function(route) {
-            return String(route || '').trim().length > 0;
-        }) : [];
-        if (routes.length === 0) { routes = ['192.168.10.0/24']; }
-        input.value = routes.join('\n');
-    }
+    function renderPeers() {
+        var body = el('vpn-peers-body');
+        if (!body) { return; }
+        setText('vpn-peers-count', String(peers.length));
+        if (rowKeys() !== renderedKeys) { buildRows(); }
 
-    // ── Laptop setup card ───────────────────────────────────────────────────
-
-    function renderSetupCommands(remoteRoutes) {
-        var el = document.getElementById('vpn-setup-commands');
-        if (!el) { return; }
-        var installed = (remoteRoutes || []).filter(function(r) { return r.installed; });
-        if (installed.length === 0) {
-            el.innerHTML = '<p class="vpn-setup-empty">Waiting for remote peer routes\u2026</p>'
-                + '<p class="vpn-setup-note">Remote VPN aliases will appear here once a peer is connected and has advertised its local subnet.</p>';
-            return;
+        var selected = state.uplink.enabled ? (state.uplink.peer || '') : '';
+        var banner = el('vpn-banner-router');
+        if (banner) {
+            var chosen = peers.find(function (p) { return p.identity_hash === selected; });
+            banner.textContent = selected
+                ? (chosen ? peerName(chosen) : selected.slice(0, 8))
+                : '\u2014';
         }
-        el.innerHTML = installed.map(function(r) {
-            var network = r.network || '';
-            var wgetIp = serialTestIp(network);
-            var html = '';
-            if (wgetIp) {
-                var wgetCmd = 'wget -qO- http://' + wgetIp + '/api/serial';
-                html += '<div class="vpn-setup-cmd">'
-                    + '<span class="vpn-setup-cmd-text">' + esc(wgetCmd) + '</span>'
-                    + '<button type="button" class="vpn-copy-btn" data-vpn-copy="' + esc(wgetCmd) + '">Copy</button>'
-                    + '</div>';
+
+        peers.forEach(function (peer) {
+            var row = body.querySelector('[data-peer="' + peer.destination + '"]');
+            if (!row) { return; }
+            function cell(name) { return row.querySelector('[data-cell="' + name + '"]'); }
+            function put(name, text) {
+                var c = cell(name);
+                if (c && c.textContent !== text) { c.textContent = text; }
             }
-            return html;
-        }).join('')
-        + '<p class="vpn-setup-note" style="margin-top:10px;">The wget example reads the remote Kaonic serial from <code style="font-family:monospace;font-size:11px;">/api/serial</code>.</p>';
-    }
 
-    // ── Peers card ──────────────────────────────────────────────────────────
+            cell('dot').className = linkDot(peer.link_state);
+            put('name', peerName(peer));
+            put('sub', peer.codename && peer.tag ? peer.codename : '');
+            put('ip', peer.tunnel_ip || '\u2014');
+            put('link', peer.link_state || 'unknown');
+            put('offers', (peer.announced_routes || []).join(', ') || '\u2014');
+            put('seen', ago(peer.last_seen_ts));
 
-        function renderPeers(peers) {
-        var el = document.getElementById('vpn-peers');
-        if (!el) { return; }
+            // The route control: only rebuilt when its shape changes, so the
+            // switch never re-renders under a finger mid-toggle.
+            var id = peer.identity_hash || '';
+            var isSelected = !!id && id === selected;
+            var canRoute = !!peer.is_gateway;
+            var shape = !id ? 'none' : (!canRoute && !isSelected) ? 'blocked' : 'switch';
+            var routeCell = cell('route');
+            if (routeCell.getAttribute('data-shape') !== shape) {
+                routeCell.setAttribute('data-shape', shape);
+                if (shape === 'none') {
+                    routeCell.innerHTML = '<span class="vpn-peers-muted">not paired here</span>';
+                } else if (shape === 'blocked') {
+                    routeCell.innerHTML = '<span class="vpn-peers-muted" ' +
+                        'title="This node is not sharing a network. Turn on Share with peers there.">' +
+                        'not sharing</span>';
+                } else {
+                    routeCell.innerHTML =
+                        '<label class="feature-switch vpn-route-switch">' +
+                        '<input type="checkbox" data-router="' + esc(id) + '"/>' +
+                        '<span class="feature-switch-track"><span class="feature-switch-thumb"></span></span>' +
+                        '</label>';
+                }
+            }
+            var box = routeCell.querySelector('[data-router]');
+            if (box && box.checked !== isSelected && document.activeElement !== box) {
+                box.checked = isSelected;
+            }
 
-        if (!peers || peers.length === 0) {
-            el.innerHTML = '<div class="vpn-empty-peers">'
-                + '<div style="font-size:28px;opacity:.4;margin-bottom:8px;">\uD83D\uDCE1</div>'
-                + '<div style="font-weight:600;margin-bottom:6px;">No peers discovered yet</div>'
-                + '<div style="font-size:13px;max-width:340px;line-height:1.6;">Peers appear automatically once a remote kaonic device is within radio range and running the same VPN network configuration.</div>'
-                + '</div>';
-            return;
+            // The ping cell is left alone once built: it holds a result the
+            // operator asked for, and no status frame should erase it.
+            var pingCell = cell('ping');
+            var ip = peer.tunnel_ip || '';
+            if (pingCell.getAttribute('data-ip') !== ip) {
+                pingCell.setAttribute('data-ip', ip);
+                pingCell.innerHTML = ip
+                    ? '<button type="button" class="btn-secondary btn-small" data-ping="' + esc(ip) + '">Ping</button>' +
+                      '<span class="vpn-ping-result"></span>'
+                    : '<span class="vpn-peers-muted">\u2014</span>';
+            }
+        });
+
+        var detail = el('vpn-uplink-detail');
+        if (detail) {
+            if (state.uplink.detail) {
+                detail.textContent = state.uplink.detail;
+            } else if (state.uplink.active) {
+                detail.textContent = 'Reaching ' + state.uplink.routes.join(', ') +
+                    (state.uplink.default_route ? ' \u2014 all traffic goes over the radio.' : '.');
+            } else {
+                detail.textContent = '';
+            }
         }
-
-        el.innerHTML = peers.map(function(peer) {
-            var ip   = peer.tunnel_ip || '\u2014';
-            var hasIp = !!peer.tunnel_ip;
-            var ipCls = hasIp ? 'vpn-peer-ip' : 'vpn-peer-ip vpn-peer-ip--none';
-            var hash = String(peer.destination || '');
-            var routes = peer.announced_routes || [];
-            var routeHtml = routes.length > 0
-                ? routes.map(function(r) { return '<span class="vpn-route-tag">' + esc(r) + '</span>'; }).join('')
-                : '<span class="badge reticulum-badge-soft" style="opacity:.6">no routes</span>';
-            var pingKey = hash;
-            var ps  = pingState[pingKey] || {};
-            var ss  = speedState[pingKey] || {};
-            var pingBusy = !!ps.busy;
-            var speedBusy = !!ss.busy;
-            var pingDisabled = !hasIp || pingBusy;
-            var speedDisabled = !hasIp || speedBusy;
-            var pingStatusCls = 'vpn-ping-status' + (ps.kind ? ' ' + ps.kind : '');
-            var speedStatusCls = 'vpn-ping-status' + (ss.kind ? ' ' + ss.kind : '');
-            var stateBadgeCls = 'badge ' + vpnBadgeClass(peer.link_state || '\u2014');
-
-            var txBps   = fmtBps(peer.tx_bps);
-            var rxBps   = fmtBps(peer.rx_bps);
-            var txBytes = fmtBytes(peer.tx_bytes);
-            var rxBytes = fmtBytes(peer.rx_bytes);
-            var txPkts  = Number(peer.tx_packets) || 0;
-            var rxPkts  = Number(peer.rx_packets) || 0;
-
-            return '<div class="vpn-peer-row">'
-                + '<div class="vpn-peer-left">'
-                    + '<span class="' + peerDotClass(peer.link_state) + '"></span>'
-                    + '<div class="vpn-peer-ident">'
-                        + '<div class="vpn-peer-field">'
-                            + '<span class="vpn-peer-field-label">Tunnel</span>'
-                            + '<span class="' + ipCls + '">' + esc(ip) + '</span>'
-                        + '</div>'
-                        + '<div class="vpn-peer-field">'
-                            + '<span class="vpn-peer-field-label">Peer</span>'
-                            + '<code class="vpn-peer-hash">' + esc(hash || '\u2014') + '</code>'
-                        + '</div>'
-                    + '</div>'
-                + '</div>'
-                + '<div class="vpn-peer-routes">'
-                    + '<span class="vpn-peer-section-label">Routes</span>'
-                    + '<div class="vpn-peer-routes-list">' + routeHtml + '</div>'
-                + '</div>'
-                + '<div class="vpn-peer-traffic">'
-                    + '<div class="vpn-peer-traffic-row">'
-                        + '<span class="vpn-peer-traffic-dir">TX</span>'
-                        + '<span class="vpn-peer-traffic-rate">' + esc(txBps) + '</span>'
-                        + '<span class="vpn-peer-traffic-total" title="' + txPkts + ' packets">' + esc(txBytes) + '</span>'
-                    + '</div>'
-                    + '<div class="vpn-peer-traffic-row">'
-                        + '<span class="vpn-peer-traffic-dir">RX</span>'
-                        + '<span class="vpn-peer-traffic-rate">' + esc(rxBps) + '</span>'
-                        + '<span class="vpn-peer-traffic-total" title="' + rxPkts + ' packets">' + esc(rxBytes) + '</span>'
-                    + '</div>'
-                + '</div>'
-                + '<div class="vpn-peer-meta">'
-                    + '<div class="vpn-peer-field vpn-peer-field--meta">'
-                        + '<span class="vpn-peer-field-label">Seen</span>'
-                        + '<span class="vpn-peer-lastseen">' + esc(fmtRelative(peer.last_seen_ts)) + '</span>'
-                    + '</div>'
-                    + '<div class="vpn-peer-field vpn-peer-field--meta">'
-                        + '<span class="vpn-peer-field-label">State</span>'
-                        + '<span class="' + stateBadgeCls + '">' + esc(peer.link_state || '\u2014') + '</span>'
-                    + '</div>'
-                + '</div>'
-                + '<div class="vpn-peer-actions">'
-                    + '<div class="vpn-peer-action-buttons">'
-                        + '<button type="button" class="btn-secondary vpn-ping-btn" data-vpn-ping'
-                            + ' data-peer-key="' + esc(pingKey) + '"'
-                            + ' data-peer-ip="' + esc(peer.tunnel_ip || '') + '"'
-                            + (pingDisabled ? ' disabled' : '') + '>'
-                        + esc(pingBusy ? 'Pinging\u2026' : 'Ping')
-                        + '</button>'
-                        + '<button type="button" class="btn-secondary vpn-speed-btn" data-vpn-speed-test'
-                            + ' data-peer-key="' + esc(pingKey) + '"'
-                            + ' data-peer-ip="' + esc(peer.tunnel_ip || '') + '"'
-                            + (speedDisabled ? ' disabled' : '') + '>'
-                        + esc(speedBusy ? 'Testing\u2026' : 'Test speed')
-                        + '</button>'
-                    + '</div>'
-                    + '<div class="' + pingStatusCls + '" data-vpn-ping-status="' + esc(pingKey) + '">'
-                    + esc(ps.text || '')
-                    + '</div>'
-                    + '<div class="' + speedStatusCls + '" data-vpn-speed-status="' + esc(pingKey) + '">'
-                    + esc(ss.text || '')
-                    + '</div>'
-                + '</div>'
-                + '</div>';
-        }).join('');
     }
 
-    // ── Debug section ───────────────────────────────────────────────────────
-
-    function renderDebugRoutes(routes) {
-        var tbody = document.getElementById('vpn-routes');
-        if (!tbody) { return; }
-        if (!routes || routes.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="5" class="frames-empty">No remote routes yet</td></tr>';
-            return;
+    async function selectRouter(hash, on) {
+        var body = on ? { enabled: true, peer: hash } : { enabled: false };
+        try {
+            var resp = await fetch('/api/vpn/uplink', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+            if (!resp.ok) { throw new Error(await resp.text()); }
+            await refresh();
+        } catch (err) {
+            var detail = el('vpn-uplink-detail');
+            if (detail) { detail.textContent = String(err.message || err); }
         }
-        tbody.innerHTML = routes.map(function(r) {
-            var sc = 'badge ' + vpnBadgeClass(r.status || '');
-            var ic = 'badge ' + vpnBadgeClass(r.installed ? 'yes' : 'no');
-            var ownerShort = (r.owner||'').replace(/\s+/g,'').substring(0,16)
-                + ((r.owner||'').replace(/\s+/g,'').length > 16 ? '\u2026' : '');
-            return '<tr>'
-                + '<td class="td-hex">' + esc(r.network||'\u2014') + '</td>'
-                + '<td class="td-hex td-hash" style="font-size:11px;" title="' + esc(r.owner||'') + '">' + esc(ownerShort) + '</td>'
-                + '<td><span class="' + sc + '">' + esc(r.status||'\u2014') + '</span></td>'
-                + '<td class="td-time">' + esc(fmtRelative(r.last_seen_ts)) + '</td>'
-                + '<td><span class="' + ic + '">' + (r.installed ? 'yes' : 'no') + '</span></td>'
-                + '</tr>';
-        }).join('');
     }
 
-    function renderRouteMappings(mappings) {
-        var tbody = document.getElementById('vpn-route-mappings');
-        if (!tbody) { return; }
-        if (!mappings || mappings.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="3" class="frames-empty">No local route mappings yet</td></tr>';
-            return;
+    // ── Share with peers ───────────────────────────────────────────────────
+
+    // The server owns this switch. An optimistic local flag here was the bug:
+    // flipping the toggle changed nothing on the device, and the next status
+    // frame — one second later — put the checkbox back, so it could never be
+    // turned on at all.
+    function renderShare() {
+        var toggle = el('vpn-gateway-toggle');
+        var input = el('vpn-gateway-routes');
+        // Never move a control the operator is currently using.
+        if (toggle && document.activeElement !== toggle && !shareBusy) {
+            toggle.checked = !!state.gateway.enabled;
         }
-        tbody.innerHTML = mappings.map(function(m) {
-            return '<tr>'
-                + '<td class="td-hex">' + esc(m.subnet || '\u2014') + '</td>'
-                + '<td class="td-hex">' + esc(m.tunnel || '\u2014') + '</td>'
-                + '<td class="td-hex">' + esc(m.mapped_subnet || '\u2014') + '</td>'
-                + '</tr>';
-        }).join('');
+        if (input && document.activeElement !== input && !shareBusy) {
+            input.value = (state.gateway.routes || []).join(', ');
+        }
+        var badge = el('vpn-gateway-badge');
+        if (badge) {
+            var on = state.gateway.enabled;
+            badge.textContent = on ? (state.gateway.active ? 'Active' : 'Waiting') : 'Off';
+            badge.className = 'badge ' + (on ? (state.gateway.active ? 'badge-ok' : 'badge-warn') : '');
+        }
+        var detail = el('vpn-gateway-detail');
+        if (detail && !shareError) {
+            if (state.gateway.detail) {
+                detail.textContent = state.gateway.detail;
+                detail.className = 'vpn-note';
+            } else if (state.gateway.active) {
+                detail.textContent = 'Forwarding out ' + (state.gateway.egress_interface || 'the default route') + '.';
+                detail.className = 'vpn-note is-ok';
+            } else {
+                detail.textContent = '';
+                detail.className = 'vpn-note';
+            }
+        }
     }
 
-    // ── WebSocket ───────────────────────────────────────────────────────────
+    async function applyShare(enabled, routes) {
+        var detail = el('vpn-gateway-detail');
+        shareBusy = true;
+        shareError = false;
+        try {
+            var resp = await fetch('/api/vpn/gateway', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enabled: enabled, routes: routes })
+            });
+            if (!resp.ok) {
+                var text = await resp.text();
+                throw new Error(text || ('HTTP ' + resp.status));
+            }
+            shareBusy = false;
+            await refresh();
+        } catch (err) {
+            shareBusy = false;
+            shareError = true;
+            if (detail) {
+                detail.textContent = String(err.message || err);
+                detail.className = 'vpn-note is-err';
+            }
+            // Put the switch back to whatever the device actually did.
+            await refresh();
+        }
+    }
 
+    function routesFromInput() {
+        var input = el('vpn-gateway-routes');
+        if (!input) { return []; }
+        return input.value.split(/[\s,]+/).filter(function (v) { return v.length; });
+    }
+
+    /// Pings a peer's tunnel address. This is the question "does the VPN
+    /// actually carry traffic to that node", which no amount of status text
+    /// answers as well as trying it.
+    async function runPing(address, button) {
+        var out = button.parentElement.querySelector('.vpn-ping-result');
+        if (out) { out.textContent = '…'; out.className = 'vpn-ping-result'; }
+        if (button) { button.disabled = true; }
+        try {
+            var resp = await fetch('/api/vpn/ping', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ address: address })
+            });
+            var body = await resp.json();
+            if (out) {
+                if (body.ok) {
+                    out.textContent = body.latency ? body.latency : 'ok';
+                    out.className = 'vpn-ping-result is-ok';
+                } else {
+                    out.textContent = 'no reply';
+                    out.className = 'vpn-ping-result is-err';
+                }
+            }
+        } catch (err) {
+            if (out) { out.textContent = 'failed'; out.className = 'vpn-ping-result is-err'; }
+        } finally {
+            if (button) { button.disabled = false; }
+        }
+    }
+
+    // ── Refresh ────────────────────────────────────────────────────────────
+
+    async function refresh() {
+        try {
+            var [gw, up] = await Promise.all([
+                fetch('/api/vpn/gateway').then(function (r) { return r.json(); }),
+                fetch('/api/vpn/uplink').then(function (r) { return r.json(); })
+            ]);
+            state.gateway = gw;
+            state.uplink = up;
+            renderPeers();
+            renderShare();
+        } catch (err) { /* transient; the next tick tries again */ }
+    }
+
+    // The gateway already publishes a VPN snapshot on the status socket, once
+    // a second. Polling a second endpoint for the same numbers would only add
+    // load to a single-core board.
     function connect() {
         var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
         var ws = new WebSocket(proto + '//' + location.host + '/api/ws/status');
-
-        ws.onmessage = function(ev) {
+        ws.onmessage = function (event) {
             try {
-                if (shouldPause()) { return; }
-                var msg = JSON.parse(ev.data) || {};
-                if (msg.type === 'interfaces') {
-                    var interfaces = msg.data || {};
-                    setText('vpn-wlan0-ip', interfaces.wlan0_ip || '\u2014');
-                    setText('vpn-usb0-ip', interfaces.usb0_ip || '\u2014');
-                    return;
-                }
+                var msg = JSON.parse(event.data) || {};
                 if (msg.type !== 'vpn') { return; }
                 var vpn = msg.data || {};
-                updateBanner(vpn);
-                renderLocalRoutesList(vpn.local_routes || []);
-                setAdvertisedRoutes(vpn.advertised_routes || []);
-                renderSetupCommands(vpn.remote_routes || []);
-                renderPeers(vpn.peers || []);
-                setText('vpn-interface', vpn.interface_name || '\u2014');
-                var backendEl = document.getElementById('vpn-backend');
-                if (backendEl) {
-                    backendEl.textContent = vpn.backend || '\u2014';
-                    backendEl.className = 'badge ' + (vpn.backend === 'linux' ? 'reticulum-badge-kind-data' : 'reticulum-badge-soft');
+                sampleTraffic(vpn);
+                renderWire(vpn.recent);
+                var dot = el('vpn-status-dot');
+                var text = el('vpn-status-text');
+                if (text && vpn.status) { text.textContent = vpn.status; }
+                if (dot && vpn.status) {
+                    var kind = vpn.status === 'running' ? 'ok'
+                        : vpn.status === 'error' ? 'err'
+                        : vpn.status === 'mock' ? 'idle' : 'warn';
+                    dot.className = 'status-dot status-dot--' + kind;
                 }
-                setText('vpn-tx-packets', String(vpn.tx_packets || 0));
-                setText('vpn-tx-bytes',   fmtBytes(vpn.tx_bytes || 0));
-                setText('vpn-rx-packets', String(vpn.rx_packets || 0));
-                setText('vpn-rx-bytes',   fmtBytes(vpn.rx_bytes || 0));
-                setText('vpn-drop-packets', String(vpn.drop_packets || 0));
-                renderRouteMappings(vpn.route_mappings || []);
-                renderDebugRoutes(vpn.remote_routes || []);
-            } catch (e) {}
+                if (vpn.network) { setText('vpn-network', vpn.network); }
+                if (vpn.interface_name) { setText('vpn-interface', vpn.interface_name); }
+                var bar = el('vpn-error-bar');
+                if (bar) {
+                    if (vpn.last_error) {
+                        bar.style.display = '';
+                        bar.className = 'vpn-error-bar';
+                        bar.textContent = '\u26a0 ' + vpn.last_error;
+                    } else {
+                        bar.style.display = 'none';
+                    }
+                }
+                // The peer list and both cards come from the same snapshot, so
+                // the router picker follows link state without another request.
+                if (Array.isArray(vpn.peers)) { peers = vpn.peers; }
+                if (vpn.gateway) { state.gateway = vpn.gateway; renderShare(); }
+                if (vpn.uplink) { state.uplink = vpn.uplink; }
+                renderPeers();
+            } catch (err) { /* a malformed frame is not worth tearing down for */ }
         };
-
-        ws.onclose = function() { setTimeout(connect, 3000); };
-        ws.onerror = function() { ws.close(); };
+        ws.onclose = function () { setTimeout(connect, 3000); };
+        ws.onerror = function () { ws.close(); };
     }
 
-    // ── Ping handler ────────────────────────────────────────────────────────
 
-    document.addEventListener('click', function(ev) {
-        var target = ev.target;
-        if (!(target instanceof HTMLElement)) { return; }
+    // ── Wiring ─────────────────────────────────────────────────────────────
 
-        // Copy to clipboard
-        var copyBtn = target.closest('[data-vpn-copy]');
-        if (copyBtn) {
-            var text = copyBtn.getAttribute('data-vpn-copy') || '';
-            copyText(text).then(function(ok) {
-                flashCopyButton(copyBtn, ok ? 'Copied!' : 'Copy failed');
-            });
+    document.addEventListener('change', function (event) {
+        var box = event.target.closest('[data-router]');
+        if (box) { selectRouter(box.getAttribute('data-router'), box.checked); }
+    });
+
+    document.addEventListener('click', function (event) {
+        var ping = event.target.closest('[data-ping]');
+        if (ping) { runPing(ping.getAttribute('data-ping'), ping); return; }
+        var preset = event.target.closest('[data-vpn-preset]');
+        if (preset) {
+            var input = el('vpn-gateway-routes');
+            if (input) {
+                input.value = preset.getAttribute('data-vpn-preset') === 'internet'
+                    ? '0.0.0.0/0'
+                    : (window.__vpnLan || '192.168.0.0/24');
+            }
             return;
         }
-
-        // Open route editor
-        if (target.closest('[data-open-vpn-routes]')) {
-            openRouteEditor();
-            return;
-        }
-
-        if (target.id === 'vpn-allowlist-add') {
-            var input = document.getElementById('vpn-allowlist-input');
-            if (!(input instanceof HTMLInputElement)) { return; }
-            var peer = String(input.value || '').trim().toLowerCase();
-            var added = addPeerToAllowlist(peer, 'Peer added');
-            if (!added) {
-                input.focus();
-                input.select();
+        if (event.target.closest('#vpn-gateway-apply')) {
+            var routes = routesFromInput();
+            if (!routes.length) {
+                var d = el('vpn-gateway-detail');
+                if (d) {
+                    d.textContent = 'List at least one network, or 0.0.0.0/0 to share the whole connection.';
+                    d.className = 'vpn-note is-err';
+                }
+                shareError = true;
                 return;
             }
-            input.value = '';
-            return;
+            applyShare(true, routes);
         }
+    });
 
-        var removePeerBtn = target.closest('[data-vpn-remove-peer]');
-        if (removePeerBtn) {
-            var removePeer = String(removePeerBtn.getAttribute('data-vpn-remove-peer') || '');
-            accessState.peers = accessState.peers.filter(function(peer) { return peer !== removePeer; });
-            renderAccessTable();
-            saveAccessState('Peer removed');
-            return;
-        }
-
-        // Ping
-        var pingBtn = target.closest('[data-vpn-ping]');
-        if (pingBtn) {
-            var key = pingBtn.getAttribute('data-peer-key') || '';
-            var ip  = pingBtn.getAttribute('data-peer-ip') || '';
-            if (!key || !ip || ip === '\u2014') { return; }
-
-            pingState[key] = { text: 'Pinging\u2026', kind: 'pending', busy: true };
-            pingBtn.disabled = true;
-            pingBtn.textContent = 'Pinging\u2026';
-            var statusEl = document.querySelector('[data-vpn-ping-status="' + key + '"]');
-            if (statusEl) {
-                statusEl.textContent = 'Pinging\u2026';
-                statusEl.className = 'vpn-ping-status pending';
+    var toggle = el('vpn-gateway-toggle');
+    if (toggle) {
+        toggle.addEventListener('change', function () {
+            if (!toggle.checked) {
+                applyShare(false, []);
+                return;
             }
-
-            fetch('/api/vpn/ping', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ address: ip })
-            }).then(function(resp) {
-                return resp.text().then(function(t) {
-                    var d = {};
-                    try { d = JSON.parse(t); } catch (_) { d = {}; }
-                    if (!resp.ok) { throw new Error('failed'); }
-                    return d;
-                });
-            }).then(function(d) {
-                var ok = !!(d && d.ok);
-                var latency = d && d.latency;
-                pingState[key] = {
-                    text: ok ? (latency || 'passed') : 'failed',
-                    kind: ok ? 'ok' : 'err',
-                    busy: false
-                };
-            }).catch(function(err) {
-                pingState[key] = {
-                    text: 'failed',
-                    kind: 'err',
-                    busy: false
-                };
-            }).finally(function() {
-                var btn = document.querySelector('[data-vpn-ping][data-peer-key="' + key + '"]');
-                var st  = document.querySelector('[data-vpn-ping-status="' + key + '"]');
-                if (btn) { btn.disabled = false; btn.textContent = 'Ping'; }
-                if (st) {
-                    st.textContent = pingState[key].text || '';
-                    st.className = 'vpn-ping-status' + (pingState[key].kind ? ' ' + pingState[key].kind : '');
+            var routes = routesFromInput();
+            if (!routes.length) {
+                // Nothing to share yet: say so rather than sending a request
+                // the device will refuse, and leave the switch off.
+                toggle.checked = false;
+                var detail = el('vpn-gateway-detail');
+                if (detail) {
+                    detail.textContent = 'List a network to share first — or use one of the buttons below.';
+                    detail.className = 'vpn-note is-err';
                 }
-            });
-            return;
-        }
-
-        // Speed test
-        var speedBtn = target.closest('[data-vpn-speed-test]');
-        if (speedBtn) {
-            var speedKey = speedBtn.getAttribute('data-peer-key') || '';
-            var speedIp  = speedBtn.getAttribute('data-peer-ip') || '';
-            if (!speedKey || !speedIp || speedIp === '\u2014') { return; }
-
-            speedState[speedKey] = { text: 'Testing\u2026', kind: 'pending', busy: true };
-            speedBtn.disabled = true;
-            speedBtn.textContent = 'Testing\u2026';
-            var speedStatusEl = document.querySelector('[data-vpn-speed-status="' + speedKey + '"]');
-            if (speedStatusEl) {
-                speedStatusEl.textContent = 'Testing\u2026';
-                speedStatusEl.className = 'vpn-ping-status pending';
+                shareError = true;
+                return;
             }
-
-            fetch('/api/vpn/speed-test', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ address: speedIp })
-            }).then(function(resp) {
-                return resp.text().then(function(t) {
-                    var d = {};
-                    try { d = JSON.parse(t); } catch (_) { d = {}; }
-                    if (!resp.ok) {
-                        throw new Error((d && d.error) || 'failed');
-                    }
-                    return d;
-                });
-            }).then(function(d) {
-                var bytes = Number(d && d.bytes) || 0;
-                var durationMs = Number(d && d.duration_ms) || 0;
-                var bps = Number(d && d.bps) || 0;
-                speedState[speedKey] = {
-                    text: fmtBytes(bytes) + ' in ' + durationMs + ' ms · ' + fmtBps(bps),
-                    kind: d && d.ok ? 'ok' : 'err',
-                    busy: false
-                };
-            }).catch(function() {
-                speedState[speedKey] = {
-                    text: 'failed',
-                    kind: 'err',
-                    busy: false
-                };
-            }).finally(function() {
-                var btn = document.querySelector('[data-vpn-speed-test][data-peer-key="' + speedKey + '"]');
-                var st  = document.querySelector('[data-vpn-speed-status="' + speedKey + '"]');
-                if (btn) { btn.disabled = false; btn.textContent = 'Test speed'; }
-                if (st) {
-                    st.textContent = speedState[speedKey].text || '';
-                    st.className = 'vpn-ping-status' + (speedState[speedKey].kind ? ' ' + speedState[speedKey].kind : '');
-                }
-            });
-            return;
-        }
-
-        // Close route editor
-        if (target.closest('[data-close-vpn-routes]') || target.id === 'vpn-routes-modal') {
-            closeRouteEditor();
-            return;
-        }
-
-        if (target.closest('[data-close-vpn-shortcut]') || target.id === 'vpn-shortcut-modal') {
-            closeShortcutModal(true);
-            return;
-        }
-
-        if (target.id === 'vpn-shortcut-confirm') {
-            confirmShortcutPeer();
-            return;
-        }
-    });
-
-    document.addEventListener('keydown', function(ev) {
-        if (ev.key === 'Escape') {
-            closeRouteEditor();
-            if (isModalOpen('vpn-shortcut-modal')) {
-                closeShortcutModal(true);
-            }
-        }
-    });
-
-    document.addEventListener('change', function(ev) {
-        var target = ev.target;
-        if (!(target instanceof HTMLInputElement) || target.id !== 'vpn-allow-all-toggle') { return; }
-        accessState.allowAll = !!target.checked;
-        renderAccessTable();
-        saveAccessState(accessState.allowAll ? 'Allow-all mode enabled' : 'Allowlist-only mode enabled');
-    });
-
-    document.addEventListener('keydown', function(ev) {
-        var target = ev.target;
-        if (!(target instanceof HTMLInputElement) || target.id !== 'vpn-allowlist-input') { return; }
-        if (ev.key !== 'Enter') { return; }
-        ev.preventDefault();
-        var addBtn = document.getElementById('vpn-allowlist-add');
-        if (addBtn instanceof HTMLButtonElement) { addBtn.click(); }
-    });
-
-    // ── Route editor ────────────────────────────────────────────────────────
-
-    function setRouteEditorStatus(text, kind) {
-        var el = document.getElementById('vpn-route-editor-status');
-        if (el) { el.textContent = text; el.className = kind || ''; }
-    }
-
-    function openRouteEditor() {
-        var modal = document.getElementById('vpn-routes-modal');
-        if (!modal) { return; }
-        setRouteEditorStatus('', '');
-        modal.hidden = false;
-        syncModalOpenClass();
-        var input = document.getElementById('vpn-routes-editor-input');
-        if (input) { input.focus(); input.select(); }
-    }
-
-    function closeRouteEditor() {
-        var modal = document.getElementById('vpn-routes-modal');
-        if (!modal) { return; }
-        modal.hidden = true;
-        syncModalOpenClass();
-    }
-
-    document.addEventListener('submit', function(ev) {
-        var form = ev.target;
-        if (!(form instanceof HTMLFormElement) || form.id !== 'vpn-routes-form') { return; }
-        ev.preventDefault();
-        var input  = document.getElementById('vpn-routes-editor-input');
-        var submit = document.getElementById('vpn-routes-save');
-        if (!(input instanceof HTMLTextAreaElement) || !(submit instanceof HTMLButtonElement)) { return; }
-        var routes = input.value
-            .split(/\r?\n/)
-            .map(function(v) { return v.trim(); })
-            .filter(Boolean);
-        submit.disabled = true;
-        setRouteEditorStatus('Saving\u2026', '');
-        fetch('/api/vpn/routes', {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ routes: routes })
-        }).then(function(resp) {
-            return resp.text().then(function(t) {
-                var d = t ? JSON.parse(t) : {};
-                if (!resp.ok) { throw new Error((d && d.status) || t || 'Failed to save'); }
-                return d;
-            });
-        }).then(function(d) {
-            setRouteEditorStatus((d && d.status) || 'Saved', 'flash-ok');
-            setTimeout(closeRouteEditor, 250);
-        }).catch(function(err) {
-            setRouteEditorStatus(err && err.message ? err.message : 'Failed to save routes', 'flash-err');
-        }).finally(function() {
-            submit.disabled = false;
+            applyShare(true, routes);
         });
-    });
-
-    connect();
-    renderAccessTable();
-    maybeHandleAddPeerShortcut();
-
-  // ── Feature switch ────────────────────────────────────────────────────────
-  (function() {
-    var box = document.getElementById('feature-vpn');
-    if (!box) { return; }
-    var label = document.getElementById('feature-vpn-label');
-    var current = {};
-    function paint(f) {
-      current = f || {};
-      if (document.activeElement !== box) { box.checked = f.vpn_enabled !== false; }
-      if (label) {
-        label.textContent = f.vpn_enabled
-          ? (f.restart_required ? 'Restart to apply' : 'Running')
-          : (f.restart_required ? 'Restart to stop' : 'Disabled');
-      }
-      var banner = document.getElementById('vpn-banner');
-      if (banner) { banner.classList.toggle('remote-banner--restart', !!f.restart_required); }
     }
-    function refresh() {
-      fetch('/api/system/features').then(function(r) { return r.json(); }).then(paint).catch(function() {});
-    }
-    box.addEventListener('change', function() {
-      fetch('/api/system/features', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          vpn_enabled: box.checked,
-          remote_enabled: current.remote_enabled !== false,
-          shell_enabled: !!current.shell_enabled,
-          restart_required: false
-        })
-      }).then(function(r) { return r.json(); }).then(function(f) {
-        paint(f);
-        if (f.restart_required) {
-          var status = document.getElementById('vpn-access-status');
-          if (status) {
-            status.textContent = 'Saved — restart the gateway to apply';
-            status.className = 'vpn-access-status warn';
-          }
+
+    // ── VPN feature switch ─────────────────────────────────────────────────
+    // Enabling or disabling the VPN is a service-level change, like the shell
+    // switch: it is saved immediately and takes effect on the next start, so
+    // the label says which of those two states you are looking at.
+    (function () {
+        var box = el('feature-vpn');
+        if (!box) { return; }
+        var label = el('feature-vpn-label');
+        var current = {};
+
+        function paint(features) {
+            current = features || {};
+            if (document.activeElement !== box) {
+                box.checked = current.vpn_enabled !== false;
+            }
+            if (label) {
+                label.textContent = current.vpn_enabled
+                    ? (current.restart_required ? 'Restart to apply' : 'Running')
+                    : (current.restart_required ? 'Restart to stop' : 'Disabled');
+            }
+            var banner = el('vpn-banner');
+            if (banner) {
+                banner.classList.toggle('remote-banner--restart', !!current.restart_required);
+            }
         }
-      }).catch(function() { refresh(); });
-    });
-    refresh();
-    setInterval(refresh, 10000);
-  })();
+
+        function refresh() {
+            fetch('/api/system/features')
+                .then(function (r) { return r.json(); })
+                .then(paint)
+                .catch(function () { /* transient */ });
+        }
+
+        box.addEventListener('change', function () {
+            fetch('/api/system/features', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    vpn_enabled: box.checked,
+                    // The other switches are sent back unchanged; this endpoint
+                    // takes the whole set, and omitting one would clear it.
+                    remote_enabled: current.remote_enabled !== false,
+                    shell_enabled: !!current.shell_enabled,
+                    restart_required: false
+                })
+            })
+                .then(function (r) { return r.json(); })
+                .then(paint)
+                .catch(refresh);
+        });
+
+        refresh();
+        setInterval(refresh, 10000);
+    })();
+
+    renderPeers();
+    renderShare();
+    connect();
+    // Relative times go stale on their own even when nothing arrives.
+    setInterval(renderPeers, 5000);
 })();
 "#;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn builds_shortcut_url_for_external_scanner() {
-        assert_eq!(
-            vpn_add_peer_url("0123456789abcdef0123456789abcdef", "abcd1234"),
-            "https://192.168.10.1/vpn?vpn-add-peer=0123456789abcdef0123456789abcdef&codename=abcd1234"
-        );
-    }
-}

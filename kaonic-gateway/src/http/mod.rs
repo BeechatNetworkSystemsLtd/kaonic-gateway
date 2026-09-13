@@ -1,5 +1,6 @@
 pub(crate) mod handlers;
 mod installer;
+mod plugin_api;
 mod remote_api;
 pub(crate) mod ws;
 
@@ -37,6 +38,12 @@ pub async fn serve(state: AppState, http_addr: SocketAddr, https_addr: SocketAdd
         .site_pkg_dir("pkg")
         .site_addr(https_addr)
         .build();
+
+    // The plugin API is deliberately not part of the router below: that one
+    // answers on every interface, including the VPN. It gets its own listener
+    // bound to loopback.
+    plugin_api::serve_local(state.clone());
+    kaonic_gateway::remote::spawn_service_directory_sync(state.clone());
 
     ws::spawn_status_publishers(state.clone());
 
@@ -84,6 +91,14 @@ pub async fn serve(state: AppState, http_addr: SocketAddr, https_addr: SocketAdd
         .route(
             "/api/vpn/routes",
             get(handlers::get_vpn_routes).put(handlers::put_vpn_routes),
+        )
+        .route(
+            "/api/vpn/uplink",
+            get(handlers::get_vpn_uplink).put(handlers::put_vpn_uplink),
+        )
+        .route(
+            "/api/vpn/gateway",
+            get(handlers::get_vpn_gateway).put(handlers::put_vpn_gateway),
         )
         .route("/api/vpn/access", post(handlers::put_vpn_access))
         .route("/api/vpn/ping", post(handlers::post_vpn_ping))
@@ -156,6 +171,7 @@ pub async fn serve(state: AppState, http_addr: SocketAddr, https_addr: SocketAdd
             "/api/remote/nodes/{hash}/media/{stream}",
             delete(remote_api::delete_media),
         )
+        .route("/api/remote/nodes/add", post(remote_api::post_add_node))
         .route("/api/remote/nodes/{hash}/pair", post(remote_api::post_pair))
         .route("/api/remote/nodes/{hash}/cancel", post(remote_api::post_cancel))
         .route("/api/remote/nodes/{hash}/approve", post(remote_api::post_approve))

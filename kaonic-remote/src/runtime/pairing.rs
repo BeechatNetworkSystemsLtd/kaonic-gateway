@@ -37,6 +37,35 @@ pub(super) struct OutgoingRequest {
 impl RemoteRuntime {
     // ── Pairing (controller side) ────────────────────────────────────────────
 
+    /// Adds a node from its public keys rather than from an announce, and
+    /// starts pairing with it.
+    ///
+    /// The normal path is: hear an announce, then pair. That fails exactly
+    /// when it is most needed — a node that is out of range, powered off, or
+    /// simply has not announced yet cannot be queued up. A scanned code
+    /// carries the peer's public keys, which is everything needed to address
+    /// it, so the node can be added now and the request delivered whenever it
+    /// comes within reach.
+    ///
+    /// This adds a *pending* relationship, not a trusted one: pairing still
+    /// requires the operator on the other device to approve, so a scanned code
+    /// grants nothing on its own.
+    pub async fn add_node_from_identity(
+        self: &Arc<Self>,
+        identity: Identity,
+        codename: &str,
+    ) -> Result<AddressHash, RemoteError> {
+        let hash = identity.address_hash;
+        if hash == self.identity_hash() {
+            return Err(RemoteError::bad_request("that code is this device's own"));
+        }
+        self.nodes.seed(identity, codename);
+        if !codename.is_empty() {
+            self.nodes.update_codename(&hash, codename);
+        }
+        Ok(hash)
+    }
+
     pub async fn request_pairing(
         self: &Arc<Self>,
         node: AddressHash,

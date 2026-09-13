@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -70,12 +70,31 @@ const RPC_ATTEMPTS: u32 = 3;
 /// lost approval notification heals without operator action.
 const PAIR_RETRY_SECS: u64 = 120;
 const PAIR_RETRY_LIMIT: u32 = 20;
+/// Back-off after a failed automatic link attempt: doubles from here, capped
+/// at [`AUTO_LINK_BACKOFF_MAX_SECS`]. A peer that announces but cannot be
+/// linked (out of link range, asymmetric radio) is retried, not hammered.
+const AUTO_LINK_BACKOFF_SECS: u64 = 30;
+const AUTO_LINK_BACKOFF_MAX_SECS: u64 = 300;
+/// An in-link whose initiator has not identified within this long is closed.
+/// Identify is a single unacknowledged packet, so a lost one would otherwise
+/// leave an anonymous link that keep-alives hold open indefinitely; closing
+/// it makes the initiator re-link, and identify again.
+const IDENTIFY_GRACE_SECS: u64 = 30;
+/// How long a request on a not-yet-identified in-link waits for the identify
+/// packet that may have been reordered behind it.
+const IDENTIFY_WAIT: Duration = Duration::from_millis(1500);
 
 #[derive(Debug, Clone)]
 pub struct RemoteConfig {
     pub announce_secs: u32,
     pub spool_dir: PathBuf,
     pub accept_pairing: bool,
+    /// Keep a link up to every paired node that is online, so commands are
+    /// instant and "link active" on the map is a live reachability signal.
+    /// One link per pair: the node with the lower identity hash initiates,
+    /// the other side sees it as an in-link. Costs one keep-alive exchange
+    /// per link per keep-alive period while idle.
+    pub auto_link: bool,
     /// Idle out-links are closed after this many seconds without RPC traffic.
     pub link_idle_close_secs: u64,
     pub rpc_timeout: Duration,
@@ -90,6 +109,7 @@ impl Default for RemoteConfig {
             announce_secs: 20,
             spool_dir: std::env::temp_dir().join("kaonic-remote"),
             accept_pairing: true,
+            auto_link: true,
             link_idle_close_secs: 45,
             rpc_timeout: Duration::from_secs(12),
             link_timeout: Duration::from_secs(25),
@@ -103,6 +123,8 @@ pub struct LocalInfo {
     pub codename: String,
     pub gateway_version: String,
     pub serial: String,
+    /// See [`proto::services_digest`]; advertised in every announce.
+    pub services_digest: u32,
 }
 
 mod bulk;
@@ -151,6 +173,8 @@ pub struct RemoteRuntime {
     chunk_gap_ms: AtomicU32,
     /// Parity shards per 16-chunk bulk block (0 = no outer code).
     bulk_parity: AtomicU32,
+    /// Live copy of [`RemoteConfig::auto_link`].
+    auto_link: AtomicBool,
     media: MediaHub,
 }
 
@@ -173,6 +197,7 @@ impl RemoteRuntime {
         let (changed, _) = broadcast::channel(16);
 
         let chunk_gap_ms = config.chunk_gap.as_millis() as u32;
+        let auto_link = config.auto_link;
         let runtime = Arc::new(Self {
             identity_hash: *identity.address_hash(),
             identity,
@@ -197,6 +222,7 @@ impl RemoteRuntime {
             changed,
             chunk_gap_ms: AtomicU32::new(chunk_gap_ms),
             bulk_parity: AtomicU32::new(u32::from(proto::BULK_BLOCK_M)),
+            auto_link: AtomicBool::new(auto_link),
             media: MediaHub::default(),
         });
 
@@ -369,9 +395,44 @@ impl RemoteRuntime {
         self.bulk_parity.load(Ordering::Relaxed)
     }
 
+    /// Switch automatic links to paired nodes on or off (live). Turning it
+    /// off lets existing links close when they go idle.
+    pub fn set_auto_link(&self, enabled: bool) {
+        self.auto_link.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn auto_link(&self) -> bool {
+        self.auto_link.load(Ordering::Relaxed)
+    }
+
+    /// One automatic link per pair: the lower identity hash initiates.
+    pub(super) fn initiates_link_to(&self, peer: &AddressHash) -> bool {
+        self.identity_hash.as_slice() < peer.as_slice()
+    }
+
+    /// True when this node is responsible for keeping a link to `peer` up.
+    pub(super) fn keeps_link_to(&self, peer: &AddressHash, now: u64) -> bool {
+        self.auto_link()
+            && self.initiates_link_to(peer)
+            && self.paired.read().contains_key(peer)
+            && self
+                .nodes
+                .get(peer)
+                .map(|entry| entry.online(now))
+                .unwrap_or(false)
+    }
+
     pub fn set_codename(&self, codename: &str) {
         self.local.write().codename = codename.to_string();
         self.notify_changed();
+    }
+
+    /// Advertise a new plugin service directory digest. Peers compare it with
+    /// what they have cached and ask for the directory only when it differs,
+    /// so a changed directory costs one request per peer instead of a
+    /// periodic poll from every node in the mesh.
+    pub fn set_services_digest(&self, digest: u32) {
+        self.local.write().services_digest = digest;
     }
 
     /// Feed raw radio RX metrics (called from the interface RX observer).
@@ -423,6 +484,14 @@ impl RemoteRuntime {
             .iter()
             .map(|(dest, session)| (*dest, session.state))
             .collect();
+        // A link the peer opened to us is just as much a link: with one
+        // automatic link per pair, half the nodes only ever see the in-link.
+        let linked_in: std::collections::HashSet<AddressHash> = self
+            .in_sessions
+            .lock()
+            .values()
+            .filter_map(|session| session.remote.as_ref().map(|id| id.address_hash))
+            .collect();
 
         let mut nodes: Vec<NodeDto> = self
             .nodes
@@ -453,11 +522,17 @@ impl RemoteRuntime {
                     paired: paired_node.is_some(),
                     pairing,
                     pairing_detail,
-                    link: links.get(&entry.destination).copied().unwrap_or_default(),
+                    link: match links.get(&entry.destination).copied().unwrap_or_default() {
+                        LinkState::None if linked_in.contains(&entry.identity_hash) => {
+                            LinkState::Active
+                        }
+                        state => state,
+                    },
                     sas: sas_code(&self.identity_hash, &entry.identity_hash),
                     permissions: paired_node.map(|node| node.permissions).unwrap_or(0),
                     accepts_pairing: entry.flags & FLAG_ACCEPTS_PAIRING != 0,
                     fec_capable: entry.flags & FLAG_FEC_SELECT != 0,
+                    services_digest: entry.services_digest,
                     // Filled in by the host, which knows the local database
                     // and the VPN.
                     tag: String::new(),
@@ -506,6 +581,7 @@ impl RemoteRuntime {
         RemoteSnapshot {
             local: LocalNodeDto {
                 identity_hash: self.identity_hash.to_hex_string(),
+                identity_hex: self.identity.as_identity().to_hex_string(),
                 destination_hash: self.destination_hash.to_hex_string(),
                 codename: local.codename,
                 gateway_version: local.gateway_version,
@@ -558,6 +634,7 @@ impl RemoteRuntime {
             codename: local.codename.clone(),
             gateway_version: proto::parse_version(&local.gateway_version),
             announce_secs: self.config.announce_secs.min(255) as u8,
+            services_digest: local.services_digest,
         }
     }
 }

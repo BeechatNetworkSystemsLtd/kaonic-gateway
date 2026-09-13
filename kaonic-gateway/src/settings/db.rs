@@ -10,7 +10,10 @@ use crate::radio::{HardwareRadioConfig, RadioModuleConfig};
 const DEFAULT_NETWORK: &str = "10.20.0.0/16";
 const DEFAULT_ANNOUNCE_FREQ_SECS: u32 = 5;
 const DEFAULT_ADVERTISED_ROUTES: &str = "[\"192.168.10.0/24\"]";
-const DEFAULT_ALLOW_ALL_PEERS: bool = true;
+/// Off. A node that has never been configured must not accept every peer that
+/// can reach it over the radio — VPN membership comes from pairing, or from an
+/// explicit list. Nodes with a stored value keep it.
+const DEFAULT_ALLOW_ALL_PEERS: bool = false;
 
 pub struct Database {
     conn: Connection,
@@ -50,6 +53,19 @@ impl Database {
                 priority   INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL DEFAULT 0,
                 last_used  INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS plugin_store (
+                plugin     TEXT NOT NULL,
+                key        TEXT NOT NULL,
+                value      TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (plugin, key)
+            );
+            CREATE TABLE IF NOT EXISTS plugin_services (
+                service     TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                updated_at  INTEGER NOT NULL,
+                PRIMARY KEY (service)
             );
             CREATE TABLE IF NOT EXISTS remote_pairing_requests (
                 identity_hash TEXT NOT NULL,
@@ -244,6 +260,98 @@ impl Database {
             params![ssid, when as i64],
         )?;
         Ok(())
+    }
+
+    // ── Plugin store ─────────────────────────────────────────────────────────
+
+    /// Reads one value a plugin persisted. Values are opaque to the gateway.
+    pub fn plugin_get(&self, plugin: &str, key: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value FROM plugin_store WHERE plugin = ?1 AND key = ?2")?;
+        let mut rows = stmt.query(params![plugin, key])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn plugin_set(&self, plugin: &str, key: &str, value: &str, when: u64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO plugin_store (plugin, key, value, updated_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(plugin, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            params![plugin, key, value, when as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn plugin_delete(&self, plugin: &str, key: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM plugin_store WHERE plugin = ?1 AND key = ?2",
+            params![plugin, key],
+        )?;
+        Ok(())
+    }
+
+    /// Every key a plugin has stored, for listing and for wiping on uninstall.
+    pub fn plugin_keys(&self, plugin: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key FROM plugin_store WHERE plugin = ?1 ORDER BY key")?;
+        let rows = stmt.query_map(params![plugin], |row| row.get(0))?;
+        rows.collect()
+    }
+
+    // ── Local service directory ──────────────────────────────────────────────
+
+    /// Records the Reticulum destination a locally installed plugin serves, so
+    /// it can be advertised to paired peers.
+    pub fn set_local_service(&self, service: &str, destination: &str, when: u64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO plugin_services (service, destination, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(service) DO UPDATE SET destination = excluded.destination, updated_at = excluded.updated_at",
+            params![service, destination, when as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_local_services(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT service, destination FROM plugin_services ORDER BY service")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
+    }
+
+    // ── VPN gateway mode ─────────────────────────────────────────────────────
+
+    /// Kept under its own key rather than inside `GatewayConfig`: that struct
+    /// is the settings page's payload, and a page that does not know about
+    /// gateway mode would otherwise switch it off every time it saved.
+    pub fn load_vpn_gateway(&self) -> Result<kaonic_vpn::VpnGatewayConfig> {
+        let raw = self.get_setting("vpn_gateway")?;
+        Ok(raw
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default())
+    }
+
+    pub fn save_vpn_gateway(&self, gateway: &kaonic_vpn::VpnGatewayConfig) -> Result<()> {
+        let encoded = serde_json::to_string(gateway).unwrap_or_else(|_| "{}".into());
+        self.set_setting("vpn_gateway", &encoded)
+    }
+
+    /// The node this one routes through. Its own key, for the same reason the
+    /// gateway settings have one.
+    pub fn load_vpn_uplink(&self) -> Result<kaonic_vpn::VpnUplinkConfig> {
+        let raw = self.get_setting("vpn_uplink")?;
+        Ok(raw
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default())
+    }
+
+    pub fn save_vpn_uplink(&self, uplink: &kaonic_vpn::VpnUplinkConfig) -> Result<()> {
+        let encoded = serde_json::to_string(uplink).unwrap_or_else(|_| "{}".into());
+        self.set_setting("vpn_uplink", &encoded)
     }
 
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {

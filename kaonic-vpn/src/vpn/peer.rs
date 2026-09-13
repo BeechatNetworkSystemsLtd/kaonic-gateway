@@ -46,6 +46,9 @@ pub struct Peer {
     pub desc: RwLock<Option<DestinationDesc>>,
     pub link_state: RwLock<LinkState>,
     pub routes: RwLock<Vec<Ipv4Cidr>>,
+    /// The peer says it forwards traffic for its advertised networks. Nodes
+    /// that predate the flag report false, which is the safe reading.
+    pub gateway: std::sync::atomic::AtomicBool,
     pub last_seen_ts: AtomicU64,
     pub route_expires_ts: AtomicU64,
     pub last_tx_ts: AtomicU64,
@@ -74,6 +77,7 @@ impl Peer {
             desc: RwLock::new(None),
             link_state: RwLock::new(state),
             routes: RwLock::new(Vec::new()),
+            gateway: std::sync::atomic::AtomicBool::new(false),
             last_seen_ts: AtomicU64::new(0),
             route_expires_ts: AtomicU64::new(0),
             last_tx_ts: AtomicU64::new(0),
@@ -151,6 +155,15 @@ impl Peer {
 
     pub fn routes_clone(&self) -> Vec<Ipv4Cidr> {
         self.routes.read().clone()
+    }
+
+    pub fn is_gateway(&self) -> bool {
+        self.gateway.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_gateway(&self, gateway: bool) {
+        self.gateway
+            .store(gateway, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn set_routes(&self, routes: Vec<Ipv4Cidr>) {

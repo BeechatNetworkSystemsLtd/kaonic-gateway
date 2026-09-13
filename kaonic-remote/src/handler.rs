@@ -8,7 +8,9 @@ use std::pin::Pin;
 
 use reticulum::hash::AddressHash;
 
-use crate::protocol::{op, status, InfoBody, PluginInfoWire, RadioConfigWire, ShellResultBody};
+use crate::protocol::{
+    op, status, InfoBody, PluginInfoWire, RadioConfigWire, ServicesBody, ShellResultBody,
+};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -17,6 +19,8 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub enum Command {
     Ping,
     Info,
+    /// Which plugin destinations this node serves.
+    Services,
     RadioGet {
         module: u8,
     },
@@ -53,6 +57,7 @@ impl Command {
         match self {
             Command::Ping => op::PING,
             Command::Info => op::INFO,
+            Command::Services => op::SERVICES,
             Command::RadioGet { .. } => op::RADIO_GET,
             Command::RadioSet(_) => op::RADIO_SET,
             Command::PluginList => op::PLUGIN_LIST,
@@ -71,6 +76,7 @@ pub enum Reply {
     Empty,
     Detail(String),
     Info(InfoBody),
+    Services(ServicesBody),
     Radio(RadioConfigWire),
     Plugins(Vec<PluginInfoWire>),
     Shell(ShellResultBody),

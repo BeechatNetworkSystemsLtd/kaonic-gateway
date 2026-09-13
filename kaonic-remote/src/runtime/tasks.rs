@@ -276,18 +276,27 @@ fn spawn_out_link_events(runtime: Arc<RemoteRuntime>, cancel: CancellationToken)
                                 }
                             }
                             LinkEvent::Closed => {
-                                log::debug!("remote: out-link to {dest} closed");
                                 if let Some(policy) = runtime.link_policy.read().clone() {
                                     policy.clear(&event.id);
                                     policy.clear(&dest);
                                 }
-                                if let Some(session) = runtime.out_sessions.lock().get_mut(&dest) {
-                                    session.state = LinkState::None;
-                                    session.identified = false;
-                                    session.link_id = None;
-                                    session.fail_waiters();
+                                // The transport reports a close twice (once
+                                // from link_close, once from its sweep); only
+                                // the first one changes anything worth a push.
+                                let changed = match runtime.out_sessions.lock().get_mut(&dest) {
+                                    Some(session) if session.state != LinkState::None || session.link_id.is_some() => {
+                                        session.state = LinkState::None;
+                                        session.identified = false;
+                                        session.link_id = None;
+                                        session.fail_waiters();
+                                        true
+                                    }
+                                    _ => false,
+                                };
+                                if changed {
+                                    log::debug!("remote: out-link to {dest} closed");
+                                    runtime.notify_changed();
                                 }
-                                runtime.notify_changed();
                             }
                             LinkEvent::Proof(_) | LinkEvent::RemoteIdentified(_) => {}
                         }
@@ -345,7 +354,8 @@ fn spawn_watchdog(runtime: Arc<RemoteRuntime>, cancel: CancellationToken) {
                 _ = interval.tick() => {
                     let now = now_secs();
 
-                    // Close idle out-links so the radio stays quiet.
+                    // Close idle out-links so the radio stays quiet — except
+                    // the ones this node keeps up on purpose (see auto_link).
                     let idle: Vec<AddressHash> = runtime
                         .out_sessions
                         .lock()
@@ -359,8 +369,64 @@ fn spawn_watchdog(runtime: Arc<RemoteRuntime>, cancel: CancellationToken) {
                         .map(|(dest, _)| *dest)
                         .collect();
                     for dest in idle {
+                        let kept = runtime
+                            .nodes
+                            .identity_for_destination(&dest)
+                            .map(|id| runtime.keeps_link_to(&id, now))
+                            .unwrap_or(false);
+                        if kept {
+                            continue;
+                        }
                         log::debug!("remote: closing idle link to {dest}");
                         runtime.close_out_link(&dest).await;
+                    }
+
+                    // Bring up the automatic links this node is responsible
+                    // for: paired, online, lower-hash side, not already up,
+                    // and past its back-off. One attempt per tick, so a node
+                    // that just came up does not fire a request at every
+                    // peer in the same instant.
+                    if runtime.auto_link() {
+                        let candidate = {
+                            let paired: Vec<AddressHash> = runtime.paired.read().keys().copied().collect();
+                            let sessions = runtime.out_sessions.lock();
+                            paired
+                                .into_iter()
+                                .filter(|node| runtime.keeps_link_to(node, now))
+                                .filter_map(|node| runtime.nodes.get(&node).map(|entry| (node, entry.destination)))
+                                .filter(|(_, dest)| match sessions.get(dest) {
+                                    Some(s) => s.state == LinkState::None && s.auto_next_ts <= now,
+                                    None => true,
+                                })
+                                .min_by_key(|(_, dest)| sessions.get(dest).map(|s| s.auto_next_ts).unwrap_or(0))
+                        };
+                        if let Some((node, dest)) = candidate {
+                            // Park the session until this attempt is over so
+                            // the next ticks do not queue duplicates behind it.
+                            runtime
+                                .out_sessions
+                                .lock()
+                                .entry(dest)
+                                .or_insert_with(|| OutSession::new(now))
+                                .auto_next_ts = now + runtime.config.link_timeout.as_secs() + WATCHDOG_SECS;
+                            let runtime = runtime.clone();
+                            tokio::spawn(async move {
+                                runtime.auto_link_attempt(node).await;
+                            });
+                        }
+                    }
+
+                    // Close in-links nobody identified on (see IDENTIFY_GRACE_SECS).
+                    let anonymous: Vec<LinkId> = runtime
+                        .in_sessions
+                        .lock()
+                        .iter()
+                        .filter(|(_, s)| s.remote.is_none() && now.saturating_sub(s.created_ts) >= IDENTIFY_GRACE_SECS)
+                        .map(|(id, _)| *id)
+                        .collect();
+                    for link_id in anonymous {
+                        log::info!("remote: closing in-link {link_id}: not identified within {IDENTIFY_GRACE_SECS}s");
+                        runtime.close_in_link(&link_id).await;
                     }
 
                     // Expire stale incoming pairing requests.

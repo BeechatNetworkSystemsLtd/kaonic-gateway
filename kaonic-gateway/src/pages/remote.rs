@@ -1,4 +1,5 @@
 use leptos::prelude::*;
+use qrcodegen::{QrCode, QrCodeEcc};
 
 use super::PageTitle;
 use kaonic_remote::RemoteSnapshot;
@@ -19,7 +20,7 @@ pub async fn load_remote_snapshot() -> Result<Option<RemoteSnapshot>, ServerFnEr
 
 const REMOTE_JS: &str = r##"
 (function() {
-    var state = { snapshot: null, selected: null, tab: 'overview', radio: {}, plugins: null, info: null, rtts: [], jobRates: {}, media: null, shell: {}, shellBusy: {}, shellHistory: [], shellHistoryPos: 0, termFull: false, hovered: null, mapPositions: {}, mapCenter: null };
+    var state = { snapshot: null, selected: null, tab: 'overview', radio: {}, plugins: null, info: null, rtts: [], jobRates: {}, media: null, shell: {}, shellBusy: {}, shellHistory: [], shellHistoryPos: 0, termFull: false, hovered: null, mapPositions: {}, mapCenter: null, loading: {} };
     var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
 
     function $(id) { return document.getElementById(id); }
@@ -108,6 +109,11 @@ const REMOTE_JS: &str = r##"
         var v = (rssi + 100) / 70; // -100 dBm → 0, -30 dBm → 1
         return Math.max(0, Math.min(1, v));
     }
+    /// Leading hex of the Reticulum identity hash, shown next to the codename
+    /// so two nodes with the same tag (or a renamed one) can be told apart.
+    function hashSuffix(hash) {
+        return hash ? '<tspan class="rm-hash"> ' + esc(String(hash).slice(0, 6)) + '</tspan>' : '';
+    }
     function renderMap(snap) {
         var svg = $('remote-map');
         if (!svg) { return; }
@@ -117,15 +123,25 @@ const REMOTE_JS: &str = r##"
         snap.nodes.forEach(function(n) { if (n.hops != null && n.hops > maxHops) { maxHops = n.hops; } });
         var unknown = snap.nodes.some(function(n) { return n.hops == null; });
         var rings = Math.min(5, Math.max(2, maxHops + (unknown ? 1 : 0)));
+        // The centre bubble is a 30 px halo plus two lines of text below it,
+        // and every peer carries a 24 px halo plus two lines of its own, so
+        // the first band starts far enough out that neither can touch the
+        // other whatever the angle.
+        var inner = 96;
         var outer = Math.min(W, H) / 2 - 40;
-        var step = outer / rings;
+        var step = (outer - inner) / rings;
         var out = [];
         var positions = {};
         state.mapCenter = { x: cx, y: cy };
         out.push('<defs><radialGradient id="rm-glow"><stop offset="0%" stop-color="rgba(13,203,240,.35)"/><stop offset="100%" stop-color="rgba(13,203,240,0)"/></radialGradient></defs>');
         out.push('<circle cx="' + cx + '" cy="' + cy + '" r="' + (outer + 20) + '" fill="url(#rm-glow)"/>');
+        // Radar pings: two staggered rings travelling out from this node to
+        // the edge of the map. Purely decorative, drawn under the rings and
+        // nodes; CSS drives it so it costs nothing here.
+        out.push('<g class="rm-radar" transform="translate(' + cx + ',' + cy + ')">' +
+            '<circle class="rm-ping" r="30"/><circle class="rm-ping rm-ping--late" r="30"/></g>');
         for (var r = 1; r <= rings; r++) {
-            var rad = r * step;
+            var rad = inner + r * step;
             var label = (unknown && r === rings) ? 'hops ?' : (r + ' hop' + (r > 1 ? 's' : ''));
             out.push('<circle class="rm-ring" cx="' + cx + '" cy="' + cy + '" r="' + rad + '"/>');
             out.push('<text class="rm-ring-label" x="' + (cx + 6) + '" y="' + (cy - rad + 14) + '">' + esc(label) + '</text>');
@@ -140,10 +156,11 @@ const REMOTE_JS: &str = r##"
             var count = list.length;
             list.forEach(function(n, i) {
                 // Each level occupies the band between its inner and outer
-                // ring; level 1 starts clear of the centre bubble. Stronger
-                // RSSI pulls the node toward the inner edge of its band.
-                var lo = (level - 1) * step + (Number(level) === 1 ? 62 : 18);
-                var hi = Math.max(lo + 4, level * step - 18);
+                // ring; level 1 starts at the clearance radius around the
+                // centre. Stronger RSSI pulls the node toward the inner edge
+                // of its band.
+                var lo = inner + (level - 1) * step + (Number(level) === 1 ? 0 : 18);
+                var hi = Math.max(lo + 4, inner + level * step - 18);
                 var rad = lo + (1 - rssiNorm(n.rssi)) * (hi - lo);
                 var angle = -Math.PI / 2 + (i / count) * Math.PI * 2 + (count > 1 ? Math.PI / count / 2 : 0) + (level % 2 ? 0 : Math.PI / 6);
                 var x = cx + Math.cos(angle) * rad, y = cy + Math.sin(angle) * rad;
@@ -163,7 +180,7 @@ const REMOTE_JS: &str = r##"
                 out.push('<circle class="rm-dot" r="12"/>');
                 if (n.paired) { out.push('<circle class="rm-paired-ring" r="16"/>'); }
                 if (n.pairing === 'incoming') { out.push('<text class="rm-flag" y="-20">wants to pair</text>'); }
-                out.push('<text class="rm-label" y="31">' + esc(n.tag || n.codename) + '</text>');
+                out.push('<text class="rm-label" y="31">' + esc(n.tag || n.codename) + hashSuffix(n.identity_hash) + '</text>');
                 var meta = (n.rssi != null ? n.rssi + ' dBm' : '') + (n.hops != null ? (n.rssi != null ? ' · ' : '') + n.hops + 'h' : '');
                 if (meta) { out.push('<text class="rm-meta" y="44">' + esc(meta) + '</text>'); }
                 out.push('</g>');
@@ -171,7 +188,7 @@ const REMOTE_JS: &str = r##"
         });
         out.push('<g class="rm-self" transform="translate(' + cx + ',' + cy + ')"><title>this node</title>');
         out.push('<circle class="rm-self-halo" r="30"/><circle class="rm-self-dot" r="16"/>');
-        out.push('<text class="rm-label rm-self-label" y="38">' + esc(snap.local.codename) + '</text>');
+        out.push('<text class="rm-label rm-self-label" y="38">' + esc(snap.local.codename) + hashSuffix(snap.local.identity_hash) + '</text>');
         out.push('<text class="rm-meta" y="51">this node</text></g>');
         // Layer the hover link + callout above the nodes.
         out.push('<line class="rm-hover-link" id="rm-hover-link" x1="0" y1="0" x2="0" y2="0" style="display:none"/>');
@@ -353,12 +370,35 @@ const REMOTE_JS: &str = r##"
 
     // ── Detail panel ─────────────────────────────────────────────────────────
     function select(hash) {
-        if (state.selected !== hash) { state.plugins = null; state.info = null; state.radio = {}; state.rtts = []; state.tab = 'overview'; }
+        if (state.selected !== hash) { state.plugins = null; state.info = null; state.radio = {}; state.rtts = []; state.tab = 'overview'; state.loading = {}; }
         state.selected = hash;
         render();
         loadTabData(state.tab);
         var panel = $('remote-detail-card');
         if (panel && window.innerWidth < 1100) { panel.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+    }
+    /// One radio round trip per fetch, at most. renderDetail() runs on every
+    /// pushed snapshot — and the request itself changes link state, which
+    /// pushes a snapshot — so without this guard each push during the
+    /// seconds a request takes over the radio would queue another copy of it.
+    /// A failed fetch is not retried either; the operator has "Fetch info" /
+    /// "Load" buttons for that.
+    function fetchOnce(key, path, done, fail) {
+        if (state.loading[key]) { return; }
+        var hash = state.selected;
+        state.loading[key] = 'pending';
+        api('GET', nodeUrl(path))
+            .then(function(d) {
+                if (state.selected !== hash) { return; }
+                state.loading[key] = 'done';
+                done(d);
+                renderDetail();
+            })
+            .catch(function(e) {
+                if (state.selected !== hash) { return; }
+                state.loading[key] = 'failed';
+                if (fail) { fail(e); }
+            });
     }
     /// Fetch what a tab shows the first time it is opened, so the operator
     /// does not have to press "Load" on every panel.
@@ -368,22 +408,16 @@ const REMOTE_JS: &str = r##"
         if (tab === 'radio') {
             [0, 1].forEach(function(m) {
                 if (state.radio[m]) { return; }
-                api('GET', nodeUrl('/radio/' + m))
-                    .then(function(d) { if (state.selected === node.identity_hash) { state.radio[m] = d; renderDetail(); } })
-                    .catch(function(e) { flash('Radio ' + (m ? 'B' : 'A') + ': ' + e.message, 'err'); });
+                fetchOnce('radio' + m, '/radio/' + m, function(d) { state.radio[m] = d; }, function(e) { flash('Radio ' + (m ? 'B' : 'A') + ': ' + e.message, 'err'); });
             });
         } else if (tab === 'plugins') {
             if (state.plugins) { return; }
-            api('GET', nodeUrl('/plugins'))
-                .then(function(d) { if (state.selected === node.identity_hash) { state.plugins = d; renderDetail(); } })
-                .catch(function(e) { flash('Plugins: ' + e.message, 'err'); });
+            fetchOnce('plugins', '/plugins', function(d) { state.plugins = d; }, function(e) { flash('Plugins: ' + e.message, 'err'); });
         } else if (tab === 'media') {
             refreshMedia().then(function() { if (state.tab === 'media') { renderDetail(); } });
         } else if (tab === 'overview') {
             if (state.info) { return; }
-            api('GET', nodeUrl('/info'))
-                .then(function(d) { if (state.selected === node.identity_hash) { state.info = d; renderDetail(); } })
-                .catch(function() {});
+            fetchOnce('info', '/info', function(d) { state.info = d; });
         }
     }
     function tabButton(id, label, enabled) {
@@ -883,10 +917,11 @@ const REMOTE_JS: &str = r##"
             $('remote-set-gap').value = s.chunk_gap_ms;
             $('remote-set-parity').value = s.bulk_parity;
             $('remote-set-pairing').checked = !!s.accept_pairing;
+            $('remote-set-autolink').checked = s.auto_link !== false;
         }).catch(function() {});
         save.addEventListener('click', function() {
             save.disabled = true;
-            api('PUT', '/api/remote/settings', { announce_secs: num('remote-set-announce'), chunk_gap_ms: num('remote-set-gap'), bulk_parity: num('remote-set-parity'), accept_pairing: $('remote-set-pairing').checked })
+            api('PUT', '/api/remote/settings', { announce_secs: num('remote-set-announce'), chunk_gap_ms: num('remote-set-gap'), bulk_parity: num('remote-set-parity'), accept_pairing: $('remote-set-pairing').checked, auto_link: $('remote-set-autolink').checked })
                 .then(function(d) { flash(d.detail, 'ok'); })
                 .catch(function(e) { flash(e.message, 'err'); })
                 .then(function() { save.disabled = false; });
@@ -928,8 +963,176 @@ const REMOTE_JS: &str = r##"
     setInterval(function() {
         api('GET', '/api/remote/snapshot').then(function(d) { state.snapshot = d; if (!shouldPause()) { render(); } }).catch(function() {});
     }, 30000);
+
+  // ── Pairing by code ──────────────────────────────────────────────────────
+  // A scanned or pasted code carries the peer's public keys, so a node can be
+  // put on the list before it has ever announced — which is the case the old
+  // announce-then-pair flow could not handle at all.
+  (function() {
+    var input = document.getElementById('remote-pair-input');
+    var status = document.getElementById('remote-pair-status');
+    if (!input) { return; }
+
+    function say(text, kind) {
+      if (!status) { return; }
+      status.textContent = text;
+      status.className = 'vpn-note' + (kind ? ' is-' + kind : '');
+    }
+
+    // KP1:<identity hex>:<codename>. Anything else is rejected here rather
+    // than sent to the gateway to be puzzled over.
+    function parse(raw) {
+      var text = String(raw || '').trim();
+      if (!text) { return null; }
+      var parts = text.split(':');
+      if (parts.length < 2 || parts[0] !== 'KP1') { return null; }
+      var hex = (parts[1] || '').trim().toLowerCase();
+      if (!/^[0-9a-f]{32,}$/.test(hex)) { return null; }
+      return { identity_hex: hex, codename: (parts[2] || '').trim() };
+    }
+
+    function add(pair) {
+      var parsed = parse(input.value);
+      if (!parsed) {
+        say('That does not look like a pairing code. It starts with KP1:', 'err');
+        return;
+      }
+      parsed.pair = !!pair;
+      say('Adding…');
+      fetch('/api/remote/nodes/add', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(parsed)
+      }).then(function(r) {
+        return r.json().then(function(body) { return { ok: r.ok, body: body }; });
+      }).then(function(res) {
+        if (!res.ok) { throw new Error(res.body.detail || 'could not add that node'); }
+        say(res.body.detail || 'Added.', 'ok');
+        input.value = '';
+        if (typeof refresh === 'function') { refresh(); }
+      }).catch(function(err) {
+        say(String(err.message || err), 'err');
+      });
+    }
+
+    var addBtn = document.getElementById('remote-pair-add');
+    if (addBtn) { addBtn.addEventListener('click', function() { add(true); }); }
+    var addOnly = document.getElementById('remote-pair-add-only');
+    if (addOnly) { addOnly.addEventListener('click', function() { add(false); }); }
+
+    document.addEventListener('click', function(event) {
+      var copy = event.target.closest('[data-pair-copy]');
+      if (!copy) { return; }
+      var value = copy.getAttribute('data-pair-copy');
+      if (navigator.clipboard) {
+        navigator.clipboard.writeText(value).then(function() {
+          copy.textContent = 'Copied';
+          setTimeout(function() { copy.textContent = 'Copy my code'; }, 1500);
+        }).catch(function() {});
+      }
+    });
+  })();
+
 })();
 "##;
+
+/// Renders `value` as an SVG QR code.
+///
+/// Drawn as one rect per module rather than a path so it stays crisp at any
+/// size, and inlined so the page needs no image request and works with no
+/// network at all — which is the situation a pairing code is usually used in.
+fn render_qr_svg(value: &str) -> Option<String> {
+    let qr = QrCode::encode_text(value, QrCodeEcc::Medium).ok()?;
+    let border = 2;
+    let size = qr.size();
+    let dimension = size + border * 2;
+    let mut svg = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {dimension} {dimension}\" \
+         shape-rendering=\"crispEdges\" aria-hidden=\"true\">\
+         <rect width=\"100%\" height=\"100%\" fill=\"#ffffff\"/>"
+    );
+    for y in 0..size {
+        for x in 0..size {
+            if qr.get_module(x, y) {
+                let px = x + border;
+                let py = y + border;
+                svg.push_str(&format!(
+                    "<rect x=\"{px}\" y=\"{py}\" width=\"1\" height=\"1\" fill=\"#111827\"/>"
+                ));
+            }
+        }
+    }
+    svg.push_str("</svg>");
+    Some(svg)
+}
+
+/// The payload a pairing code carries.
+///
+/// Version-tagged and compact: the keys are the bulk of it, and a QR that has
+/// to be read off a screen in poor light should hold no more than it must.
+/// Deliberately *not* a URL — this is scanned by the Kaonic UI, and a code that
+/// opens a browser somewhere is a phishing surface, not a convenience.
+fn pairing_code(identity_hex: &str, codename: &str) -> String {
+    format!("KP1:{identity_hex}:{codename}")
+}
+
+/// Pairing: this device's code to be scanned, and a field for someone else's.
+///
+/// Both halves live here because pairing is one job with two sides, and having
+/// it in one place is the point — a node is added here or not at all.
+#[component]
+fn RemotePairingCard(identity_hex: String, identity_hash: String, codename: String) -> impl IntoView {
+    let code = pairing_code(&identity_hex, &codename);
+    let qr = render_qr_svg(&code);
+    let short = identity_hash.chars().take(16).collect::<String>();
+    view! {
+        <div class="card remote-pair-card">
+            <div class="card-header">
+                <span class="card-title">"Pair a node"</span>
+                <span class="card-body-text">"scan, or paste a code"</span>
+            </div>
+            <div class="remote-pair-body">
+                <div class="remote-pair-mine">
+                    {match qr {
+                        Some(svg) => view! {
+                            <div class="remote-pair-qr" inner_html=svg></div>
+                        }.into_any(),
+                        None => view! {
+                            <div class="remote-pair-qr remote-pair-qr--empty">"no code"</div>
+                        }.into_any(),
+                    }}
+                    <div class="remote-pair-mine-meta">
+                        <span class="remote-pair-codename">{codename.clone()}</span>
+                        <code class="remote-pair-hash">{short}"…"</code>
+                        <button type="button" class="btn-secondary btn-small" data-pair-copy=code.clone()>
+                            "Copy my code"
+                        </button>
+                    </div>
+                </div>
+                <div class="remote-pair-add">
+                    <label class="vpn-field-label" for="remote-pair-input">"Their code"</label>
+                    <textarea
+                        id="remote-pair-input"
+                        class="field-input remote-pair-input"
+                        rows="3"
+                        placeholder="KP1:…  — paste what the other device shows"
+                    ></textarea>
+                    <div class="remote-pair-actions">
+                        <button type="button" class="btn-primary" id="remote-pair-add">
+                            "Add and request pairing"
+                        </button>
+                        <button type="button" class="btn-secondary" id="remote-pair-add-only">
+                            "Add only"
+                        </button>
+                    </div>
+                    <p class="vpn-note" id="remote-pair-status">
+                        "A node added here appears in the list straight away, before it has announced. Pairing still needs the other operator to approve."
+                    </p>
+                </div>
+            </div>
+        </div>
+    }
+}
 
 #[component]
 pub fn RemotePage() -> impl IntoView {
@@ -1029,6 +1232,12 @@ fn RemoteContent(snapshot: RemoteSnapshot) -> impl IntoView {
             </div>
         </div>
 
+        <RemotePairingCard
+            identity_hex=snapshot.local.identity_hex.clone()
+            identity_hash=snapshot.local.identity_hash.clone()
+            codename=snapshot.local.codename.clone()
+        />
+
         <div class="remote-grid remote-grid--secondary remote-grid--three">
             <div class="card">
                 <div class="card-header">
@@ -1059,6 +1268,10 @@ fn RemoteContent(snapshot: RemoteSnapshot) -> impl IntoView {
                     <div class="form-group remote-check">
                         <label class="form-label" for="remote-set-pairing">"Accept pairing requests"</label>
                         <input id="remote-set-pairing" type="checkbox" checked=snapshot.local.accepts_pairing/>
+                    </div>
+                    <div class="form-group remote-check">
+                        <label class="form-label" for="remote-set-autolink" title="Keep a link up to every paired node that is online, so commands are instant and the map shows live link state. One keep-alive exchange per link while idle.">"Keep links to paired nodes"</label>
+                        <input id="remote-set-autolink" type="checkbox" checked=true/>
                     </div>
                 </div>
                 <div class="remote-actions"><button class="btn-apply" id="remote-settings-save">"Save"</button></div>

@@ -107,6 +107,75 @@ pub async fn put_node_tag(
 
 // ── Pairing ───────────────────────────────────────────────────────────────────
 
+/// A scanned pairing code: the peer's public keys, plus what to call it.
+///
+/// Carrying the keys — not just the hash — is what lets a node be added before
+/// it has ever announced. The hash alone would leave nothing to address.
+#[derive(Deserialize)]
+pub struct AddNodeRequest {
+    /// Hex public + verifying key, as printed in this device's own code.
+    pub identity_hex: String,
+    #[serde(default)]
+    pub codename: String,
+    /// Send a pairing request straight away. The far operator still has to
+    /// approve it, so this only saves a second click here.
+    #[serde(default)]
+    pub pair: bool,
+}
+
+#[derive(Serialize)]
+pub struct AddNodeResponse {
+    pub identity_hash: String,
+    pub codename: String,
+    pub pairing: String,
+    pub detail: String,
+}
+
+/// Adds a node from a scanned code, with no announce required.
+pub async fn post_add_node(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(request): Json<AddNodeRequest>,
+) -> Result<Json<AddNodeResponse>, ApiError> {
+    deny_mesh_client(&state, peer)?;
+    let runtime = runtime(&state)?;
+
+    let identity_hex = request.identity_hex.trim().to_lowercase();
+    let identity = reticulum::identity::Identity::new_from_hex_string(&identity_hex)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "that code is not a valid node key"))?;
+
+    let codename = kaonic_gateway::settings::normalize_codename(request.codename.trim())
+        .unwrap_or_else(|_| request.codename.trim().to_string());
+
+    let hash = runtime
+        .add_node_from_identity(identity, &codename)
+        .await
+        .map_err(remote_error)?;
+
+    let mut pairing = "none".to_string();
+    let mut detail = format!("{} added", if codename.is_empty() { hash.to_hex_string() } else { codename.clone() });
+    if request.pair {
+        match runtime.request_pairing(hash).await {
+            Ok(state) => {
+                pairing = format!("{state:?}").to_lowercase();
+                detail = "pairing requested; the other operator has to approve it".into();
+            }
+            Err(err) => {
+                // The node is on the list either way, which is the point: the
+                // request can be retried when it comes within reach.
+                detail = format!("added, but the request did not go out yet: {}", err.detail);
+            }
+        }
+    }
+
+    Ok(Json(AddNodeResponse {
+        identity_hash: hash.to_hex_string(),
+        codename,
+        pairing,
+        detail,
+    }))
+}
+
 pub async fn post_pair(
     State(state): State<AppState>,
     Path(hash): Path<String>,
@@ -531,10 +600,17 @@ pub async fn delete_media(
 pub struct RemoteSettings {
     pub announce_secs: u32,
     pub accept_pairing: bool,
+    /// Keep links to paired nodes up (live setting).
+    #[serde(default = "default_true")]
+    pub auto_link: bool,
     #[serde(default = "default_chunk_gap")]
     pub chunk_gap_ms: u32,
     #[serde(default = "default_bulk_parity")]
     pub bulk_parity: u32,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_bulk_parity() -> u32 {
@@ -550,6 +626,11 @@ pub async fn get_settings(State(state): State<AppState>) -> Result<Json<RemoteSe
     Ok(Json(RemoteSettings {
         announce_secs: config.announce_secs,
         accept_pairing: config.accept_pairing,
+        auto_link: state
+            .remote
+            .as_ref()
+            .map(|r| r.auto_link())
+            .unwrap_or(config.auto_link),
         chunk_gap_ms: state
             .remote
             .as_ref()
@@ -569,22 +650,25 @@ pub async fn put_settings(
 ) -> impl IntoResponse {
     let announce_secs = request.announce_secs.clamp(5, 255);
     let chunk_gap_ms = request.chunk_gap_ms.clamp(0, 500);
-    // Chunk pacing applies immediately; announce/pairing need a restart.
+    // Chunk pacing and auto-link apply immediately; announce/pairing need a
+    // restart.
     let bulk_parity = request.bulk_parity.min(8);
     if let Some(remote) = state.remote.as_ref() {
         remote.set_chunk_gap_ms(chunk_gap_ms);
         remote.set_bulk_parity(bulk_parity);
+        remote.set_auto_link(request.auto_link);
     }
     let settings = state.settings.lock().unwrap_or_else(|e| e.into_inner());
     let result = settings
         .set_setting("remote_announce_secs", &announce_secs.to_string())
         .and_then(|_| settings.set_setting("remote_accept_pairing", &request.accept_pairing.to_string()))
+        .and_then(|_| settings.set_setting(kaonic_gateway::remote::SETTING_AUTO_LINK, &request.auto_link.to_string()))
         .and_then(|_| settings.set_setting(kaonic_gateway::remote::SETTING_CHUNK_GAP_MS, &chunk_gap_ms.to_string()))
         .and_then(|_| settings.set_setting(kaonic_gateway::remote::SETTING_BULK_PARITY, &bulk_parity.to_string()));
     match result {
         Ok(()) => (
             StatusCode::OK,
-            Json(json!({ "detail": "Saved. Chunk pacing applies now; announce settings apply after the gateway restarts." })),
+            Json(json!({ "detail": "Saved. Chunk pacing and paired-node links apply now; announce settings apply after the gateway restarts." })),
         ),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,

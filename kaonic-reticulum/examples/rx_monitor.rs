@@ -49,7 +49,7 @@ async fn main() {
                 let ts = start.elapsed().as_millis();
                 if decode {
                     match net.receive(ts, &frame) {
-                        Ok(()) => {
+                        Ok(_) => {
                             ok += 1;
                             while net.process(ts, &mut seg).is_ok() {}
                         }

@@ -11,10 +11,13 @@ use kaonic_remote::handler::{
     BoxFuture, Command, CommandHandler, LinkClass, LinkPolicy, Reply, RemoteError,
 };
 use kaonic_reticulum::{FecSelector, TrafficClass};
+use kaonic_remote::protocol as proto;
 use kaonic_remote::protocol::{
     blob, mod_kind, plugin_action, InfoBody, PluginInfoWire, RadioConfigWire, ShellResultBody,
     PROTOCOL_VERSION, SHELL_MAX_OUTPUT, SHELL_SLICE,
 };
+use reticulum::destination::DestinationName;
+use reticulum::hash::AddressHash;
 use kaonic_remote::trust::{PairedNode, PairingDirection, PairingRecord, TrustStore};
 use kaonic_remote::{LocalInfo, RemoteConfig, RemoteRuntime};
 use radio_common::modulation::{
@@ -37,6 +40,7 @@ pub type SharedRemote = Arc<RemoteRuntime>;
 const INSTALLER_BASE: &str = "http://127.0.0.1:8682";
 const SETTING_ANNOUNCE_SECS: &str = "remote_announce_secs";
 const SETTING_ACCEPT_PAIRING: &str = "remote_accept_pairing";
+pub const SETTING_AUTO_LINK: &str = "remote_auto_link";
 pub const SETTING_CHUNK_GAP_MS: &str = "remote_chunk_gap_ms";
 pub const SETTING_BULK_PARITY: &str = "remote_bulk_parity";
 /// Remote shell runs unsandboxed as root, so the device owner must opt in.
@@ -57,6 +61,9 @@ const SPOOL_DIR: &str = "/var/tmp/kaonic-remote";
 /// wire-compatible robust code, whatever the class.
 pub struct GatewayLinkPolicy {
     pub fec: Arc<FecSelector>,
+    /// When Reticulum runs over a channel, the code is chosen in the daemon:
+    /// class changes are forwarded there as well.
+    pub channel: Option<kaonic_reticulum::channel::ChannelTx>,
 }
 
 impl LinkPolicy for GatewayLinkPolicy {
@@ -71,10 +78,20 @@ impl LinkPolicy for GatewayLinkPolicy {
             }
         };
         self.fec.set_class(destination, traffic);
+        if let Some(channel) = self.channel.as_ref() {
+            channel.observe_peer(kaonic_reticulum::channel::peer_key(&destination), None, Some(traffic));
+        }
     }
 
     fn clear(&self, destination: &reticulum::hash::AddressHash) {
         self.fec.clear_class(destination);
+        if let Some(channel) = self.channel.as_ref() {
+            channel.observe_peer(
+                kaonic_reticulum::channel::peer_key(destination),
+                None,
+                Some(self.fec.default_class()),
+            );
+        }
     }
 
     fn link_rssi(&self, destination: &reticulum::hash::AddressHash) -> Option<i8> {
@@ -216,6 +233,12 @@ pub fn load_remote_config(settings: &SharedSettings) -> RemoteConfig {
         .flatten()
         .and_then(|v| v.parse::<bool>().ok())
         .unwrap_or(true);
+    let auto_link = settings
+        .get_setting(SETTING_AUTO_LINK)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<bool>().ok())
+        .unwrap_or(true);
     let chunk_gap_ms = settings
         .get_setting(SETTING_CHUNK_GAP_MS)
         .ok()
@@ -226,6 +249,7 @@ pub fn load_remote_config(settings: &SharedSettings) -> RemoteConfig {
     RemoteConfig {
         announce_secs,
         accept_pairing,
+        auto_link,
         spool_dir: PathBuf::from(SPOOL_DIR),
         chunk_gap: std::time::Duration::from_millis(u64::from(chunk_gap_ms)),
         ..RemoteConfig::default()
@@ -295,6 +319,7 @@ pub async fn start_remote(
         .ok()
         .and_then(|s| s.get_setting(SETTING_BULK_PARITY).ok().flatten())
         .and_then(|v| v.parse::<u32>().ok());
+    let services_digest = local_services_digest(&settings);
     let store = Arc::new(SqliteTrustStore::new(settings));
     let shell = handler.clone();
     let runtime = RemoteRuntime::start(
@@ -304,6 +329,7 @@ pub async fn start_remote(
             codename,
             gateway_version: env!("CARGO_PKG_VERSION").to_string(),
             serial,
+            services_digest,
         },
         transport,
         handler,
@@ -354,6 +380,7 @@ impl CommandHandler for GatewayCommandHandler {
             match command {
                 Command::Ping => Ok(Reply::Empty),
                 Command::Info => Ok(Reply::Info(self.info())),
+                Command::Services => Ok(Reply::Services(self.services())),
                 Command::RadioGet { module } => self.radio_get(module),
                 Command::RadioSet(config) => self.radio_set(config).await,
                 Command::PluginList => plugin_list().await,
@@ -398,6 +425,25 @@ impl CommandHandler for GatewayCommandHandler {
 }
 
 impl GatewayCommandHandler {
+    /// The plugin destinations this node serves, as its plugins registered
+    /// them on the local API. Sending it to a paired peer is what lets that
+    /// peer's plugins know which links they may create: the pairing already
+    /// authenticated the node, and this binds its plugin identities to it.
+    fn services(&self) -> proto::ServicesBody {
+        let entries = self
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .load_local_services()
+            .unwrap_or_default();
+        proto::ServicesBody {
+            services: entries
+                .into_iter()
+                .take(proto::MAX_SERVICES)
+                .map(|(name, destination)| proto::ServiceEntry { name, destination })
+                .collect(),
+        }
+    }
     fn info(&self) -> InfoBody {
         let codename = self
             .settings
@@ -865,5 +911,246 @@ mod tests {
         wire.mod_a = 0;
         wire.freq_hz = 0;
         assert!(from_wire(&wire).is_err());
+    }
+}
+
+// ── Plugin service directory ──────────────────────────────────────────────────
+
+/// Reserved plugin name the peer directories are cached under in the plugin
+/// store; must match the reader in `http::plugin_api`.
+pub const PEER_SERVICE_PLUGIN: &str = "@peers";
+
+/// Reserved plugin name the announced digest of each cached directory is
+/// kept under, so a restart does not re-fetch directories that have not
+/// changed.
+const PEER_SERVICE_DIGEST_PLUGIN: &str = "@peers.digest";
+
+/// How often the cache is compared with what peers announce. This is a local
+/// check — it costs no radio time — so it can be frequent.
+const SERVICE_SYNC_POLL: Duration = Duration::from_secs(15);
+/// After a failed fetch, a peer is left alone for this long. The announce
+/// keeps carrying the digest, so nothing is lost by waiting.
+const SERVICE_SYNC_RETRY: Duration = Duration::from_secs(300);
+
+/// Digest of this node's own service directory, as advertised in announces.
+pub fn local_services_digest(settings: &SharedSettings) -> u32 {
+    let entries = settings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .load_local_services()
+        .unwrap_or_default();
+    proto::services_digest(
+        entries
+            .iter()
+            .map(|(name, destination)| (name.as_str(), destination.as_str())),
+    )
+}
+
+/// Re-read the local directory and advertise its digest. Called when a plugin
+/// registers a service, so peers learn about it on the next announce.
+pub fn refresh_local_services_digest(state: &crate::state::AppState) {
+    if let Some(remote) = state.remote.as_ref() {
+        remote.set_services_digest(local_services_digest(&state.settings));
+    }
+}
+
+/// Keeps every paired peer's plugin service directory in the local store.
+///
+/// This is the second half of "pair once, then plugins know each other": the
+/// remote feature decides *which nodes* are trusted, each node's plugins
+/// register *where they listen*, and this carries the second across the link
+/// the first authenticated. A plugin then reads `/api/plugin/v1/contacts` and
+/// finds, per contact, exactly the destinations it is entitled to link to.
+///
+/// The directory is fetched only when a peer's announce carries a digest that
+/// differs from the cached one. Directories change when a plugin is installed,
+/// which is rare; polling them would have cost every node a link handshake
+/// to every other node on each round — traffic that grows with the square of
+/// the mesh size and collides with the operator's own commands on a
+/// half-duplex radio. One peer is synced per tick, so even a digest change
+/// heard by the whole mesh at once does not turn into a burst of link
+/// requests at the node that changed.
+pub fn spawn_service_directory_sync(state: crate::state::AppState) {
+    let Some(remote) = state.remote.clone() else {
+        return;
+    };
+    tokio::spawn(async move {
+        let mut failed_at: std::collections::HashMap<String, std::time::Instant> =
+            std::collections::HashMap::new();
+        // Spread the first tick out so co-located nodes do not all sync in
+        // the same second after a fleet-wide restart.
+        tokio::time::sleep(Duration::from_millis(5000 + rand::random::<u64>() % 10_000)).await;
+        loop {
+            let due = {
+                let settings = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+                remote
+                    .snapshot()
+                    .nodes
+                    .into_iter()
+                    .filter(|node| node.paired && node.online && node.services_digest != 0)
+                    .filter(|node| {
+                        let cached = settings
+                            .plugin_get(PEER_SERVICE_DIGEST_PLUGIN, &node.identity_hash)
+                            .ok()
+                            .flatten()
+                            .and_then(|raw| raw.parse::<u32>().ok());
+                        cached != Some(node.services_digest)
+                    })
+                    .find(|node| {
+                        failed_at
+                            .get(&node.identity_hash)
+                            .map(|at| at.elapsed() >= SERVICE_SYNC_RETRY)
+                            .unwrap_or(true)
+                    })
+            };
+            if let Some(node) = due {
+                let Ok(hash) = AddressHash::new_from_hex_string(&node.identity_hash) else {
+                    tokio::time::sleep(SERVICE_SYNC_POLL).await;
+                    continue;
+                };
+                match remote.services(hash).await {
+                    Ok(body) => {
+                        failed_at.remove(&node.identity_hash);
+                        let map: std::collections::BTreeMap<String, String> = body
+                            .services
+                            .into_iter()
+                            .filter(|entry| valid_service_entry(entry))
+                            .map(|entry| (entry.name, entry.destination.to_lowercase()))
+                            .collect();
+                        if let Ok(encoded) = serde_json::to_string(&map) {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            let settings = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+                            let stored = settings
+                                .plugin_set(PEER_SERVICE_PLUGIN, &node.identity_hash, &encoded, now)
+                                .and_then(|_| {
+                                    settings.plugin_set(
+                                        PEER_SERVICE_DIGEST_PLUGIN,
+                                        &node.identity_hash,
+                                        &node.services_digest.to_string(),
+                                        now,
+                                    )
+                                });
+                            match stored {
+                                Ok(()) => log::info!(
+                                    "service directory from {} ({}): {} entries",
+                                    node.codename,
+                                    node.identity_hash,
+                                    map.len()
+                                ),
+                                Err(err) => log::warn!(
+                                    "cache service directory for {}: {err}",
+                                    node.identity_hash
+                                ),
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        // A gateway older than the op answers `unsupported`;
+                        // that is a normal state in a mixed mesh, not a fault.
+                        log::debug!(
+                            "service directory from {}: {}",
+                            node.identity_hash,
+                            err.detail
+                        );
+                        failed_at.insert(node.identity_hash.clone(), std::time::Instant::now());
+                    }
+                }
+            }
+            tokio::time::sleep(SERVICE_SYNC_POLL).await;
+        }
+    });
+}
+
+/// A peer controls both fields, so both are checked before they are stored and
+/// handed to a plugin as something to link to.
+fn valid_service_entry(entry: &proto::ServiceEntry) -> bool {
+    let name_ok = !entry.name.is_empty()
+        && entry.name.len() <= 64
+        && entry
+            .name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
+    let dest = entry.destination.trim();
+    name_ok && dest.len() == 32 && dest.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+// ── VPN membership ────────────────────────────────────────────────────────────
+
+/// Makes VPN membership follow the operator's pairing decision.
+///
+/// Without this the VPN would need its own allowlist, maintained separately
+/// from the pairing the operator already did — two lists that drift apart, and
+/// the weaker one wins. Here there is one decision: pair a node, and it may
+/// join the VPN; unpair it, and it may not.
+pub struct PairedPeerAuthority {
+    settings: SharedSettings,
+}
+
+impl PairedPeerAuthority {
+    pub fn new(settings: SharedSettings) -> Self {
+        Self { settings }
+    }
+}
+
+/// The VPN aspect every node's tunnel destination is built under. Must match
+/// what `VpnRuntime::start` registers.
+const VPN_DESTINATION: (&str, &str) = ("kaonic", "vpn");
+
+/// The VPN destination hash a paired node will announce from.
+///
+/// A node's VPN destination is *not* its identity hash — it is a hash of the
+/// identity together with the destination name. The pairing record stores the
+/// peer's public keys precisely so it can be addressed without waiting for an
+/// announce, so the hash is derived here rather than learned over the air.
+/// Deriving it also means an attacker cannot get in by announcing a VPN
+/// destination that merely claims a paired identity.
+pub fn vpn_destination_hash(node: &PairedNode) -> Option<AddressHash> {
+    let identity = node.identity()?;
+    Some(
+        reticulum::destination::SingleOutputDestination::new(
+            identity,
+            DestinationName::new(VPN_DESTINATION.0, VPN_DESTINATION.1),
+        )
+        .desc
+        .address_hash,
+    )
+}
+
+/// Maps an operator-facing identity hash to the VPN hash the tunnel uses.
+/// The two identifiers exist for different layers and must not be confused.
+pub fn vpn_hash_for_identity(settings: &SharedSettings, identity_hash: &str) -> Option<String> {
+    let paired = settings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .load_remote_paired()
+        .ok()?;
+    paired
+        .iter()
+        .find(|node| node.identity_hash == identity_hash)
+        .and_then(vpn_destination_hash)
+        .map(|hash| hash.to_hex_string())
+}
+
+impl PairedPeerAuthority {
+    fn vpn_hash(node: &PairedNode) -> Option<AddressHash> {
+        vpn_destination_hash(node)
+    }
+}
+
+impl kaonic_vpn::PeerAuthority for PairedPeerAuthority {
+    fn is_trusted(&self, hash: &reticulum::hash::AddressHash) -> bool {
+        let paired = self
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .load_remote_paired()
+            .unwrap_or_default();
+        paired
+            .iter()
+            .filter_map(Self::vpn_hash)
+            .any(|candidate| candidate == *hash)
     }
 }

@@ -27,6 +27,18 @@ impl RemoteRuntime {
         decode_body(&body).map_err(RemoteError::error)
     }
 
+    /// The peer's plugin service directory. `UNSUPPORTED` from a gateway that
+    /// predates the op is a normal answer, not a fault.
+    pub async fn services(
+        self: &Arc<Self>,
+        node: AddressHash,
+    ) -> Result<proto::ServicesBody, RemoteError> {
+        let body = self.call_ok(node, op::SERVICES, Vec::new(), None).await?;
+        let mut body: proto::ServicesBody = decode_body(&body).map_err(RemoteError::error)?;
+        body.services.truncate(proto::MAX_SERVICES);
+        Ok(body)
+    }
+
     pub async fn radio_get(
         self: &Arc<Self>,
         node: AddressHash,

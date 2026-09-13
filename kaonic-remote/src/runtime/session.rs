@@ -59,6 +59,7 @@ impl RpcOptions {
 
 pub(super) struct InSession {
     pub(super) remote: Option<Identity>,
+    pub(super) created_ts: u64,
     /// Recently answered requests, keyed by (request id, op) so a reused id
     /// with a different opcode never replays the wrong body.
     pub(super) responses: VecDeque<((u16, u8), u8, Vec<u8>)>,
@@ -71,6 +72,7 @@ impl InSession {
     pub(super) fn new() -> Self {
         Self {
             remote: None,
+            created_ts: now_secs(),
             responses: VecDeque::new(),
             unauthorized_strikes: 0,
             pair_attempts: 0,
@@ -107,6 +109,10 @@ pub(super) struct OutSession {
     pub(super) rtt_ms: u64,
     /// Link class currently requested from the host's link policy.
     pub(super) class: LinkClass,
+    /// Consecutive failed automatic link attempts (drives the back-off).
+    pub(super) auto_failures: u32,
+    /// No automatic link attempt before this time.
+    pub(super) auto_next_ts: u64,
 }
 
 impl OutSession {
@@ -122,6 +128,8 @@ impl OutSession {
             busy: 0,
             rtt_ms: 0,
             class: LinkClass::Control,
+            auto_failures: 0,
+            auto_next_ts: 0,
         }
     }
 
@@ -270,11 +278,14 @@ impl RemoteRuntime {
                     }
                     if code == status::UNAUTHORIZED && attempt == 0 {
                         // Our identify packet may not have been processed yet
-                        // (or the link was re-established); identify again.
+                        // (or the link was re-established); identify again —
+                        // after a pause, so the retry does not overtake the
+                        // identify the same way the first request did.
                         if let Some(session) = self.out_sessions.lock().get_mut(&dest) {
                             session.identified = false;
                         }
                         last_err = RemoteError::new(code, detail_of(&resp));
+                        tokio::time::sleep(Duration::from_millis(rtt_ms.max(500))).await;
                         continue;
                     }
                     return Ok((code, resp));
@@ -343,7 +354,17 @@ impl RemoteRuntime {
                 None => (None, 0),
             };
             match status {
-                Some(LinkStatus::Active) | Some(LinkStatus::Stale) => break,
+                Some(LinkStatus::Active) => break,
+                Some(LinkStatus::Stale) => {
+                    // Thirty seconds of unanswered keep-alives: the peer has
+                    // torn down (or is about to tear down) its in-link, so a
+                    // request here would only time out and re-link anyway.
+                    // Re-handshake now — two frames instead of two timeouts.
+                    log::info!("remote: link to {dest} is stale; re-establishing");
+                    let _ = self.transport.lock().await.link_close(dest).await;
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    requested = false;
+                }
                 Some(LinkStatus::Pending) | Some(LinkStatus::Handshake)
                     if age < LINK_PENDING_TIMEOUT_SECS =>
                 {
@@ -373,6 +394,10 @@ impl RemoteRuntime {
                 }
             }
             if tokio::time::Instant::now() >= deadline {
+                // Leave nothing behind: a pending out-link the transport
+                // still holds would re-send its request every few seconds
+                // until something closes it.
+                let _ = self.transport.lock().await.link_close(dest).await;
                 self.set_link_state(&dest, LinkState::None, None);
                 return Err(RemoteError::error("link setup timeout"));
             }
@@ -410,6 +435,52 @@ impl RemoteRuntime {
             log::debug!("remote: identified on link {link_id} to {dest}");
         }
         Ok(())
+    }
+
+    /// One automatic link attempt to a paired peer; bookkeeping for the
+    /// watchdog's back-off lives on the session.
+    pub(super) async fn auto_link_attempt(self: &Arc<Self>, node: AddressHash) {
+        let Ok(desc) = self.desc_for(&node) else {
+            return;
+        };
+        let dest = desc.address_hash;
+        // A link is only useful once the peer knows who opened it, and the
+        // identify packet is not acknowledged. The ping proves it landed —
+        // and if it did not, the RPC path answers UNAUTHORIZED by
+        // identifying again, so this both verifies and repairs.
+        let result = match self.ensure_link(desc).await {
+            Ok(()) => self
+                .call_desc(desc, op::PING, Vec::new(), None)
+                .await
+                .and_then(|(code, body)| match code {
+                    status::OK => Ok(()),
+                    code => Err(RemoteError::new(code, detail_of(&body))),
+                }),
+            Err(err) => Err(err),
+        };
+        match result {
+            Ok(()) => {
+                log::info!("remote: auto-linked to {node}");
+                if let Some(session) = self.out_sessions.lock().get_mut(&dest) {
+                    session.auto_failures = 0;
+                    session.auto_next_ts = 0;
+                }
+            }
+            Err(err) => {
+                let mut sessions = self.out_sessions.lock();
+                let session = sessions
+                    .entry(dest)
+                    .or_insert_with(|| OutSession::new(now_secs()));
+                session.auto_failures = session.auto_failures.saturating_add(1);
+                let backoff = (AUTO_LINK_BACKOFF_SECS << session.auto_failures.min(4))
+                    .min(AUTO_LINK_BACKOFF_MAX_SECS);
+                session.auto_next_ts = now_secs() + backoff;
+                log::info!(
+                    "remote: auto-link to {node} failed ({}); next try in {backoff}s",
+                    err.detail
+                );
+            }
+        }
     }
 
     pub(super) fn set_link_state(
